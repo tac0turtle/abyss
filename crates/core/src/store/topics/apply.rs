@@ -10,7 +10,7 @@ use super::stamp::{FetchSeq, Verdict};
 use super::{
     ByIdSnapshot, FirstPage, ListChange, PageKind, PageSnapshot, Paging, Replay, TopicList,
 };
-use crate::model::{Topic, TopicId, TopicOrder, TopicSnapshot, Visibility};
+use crate::model::{Topic, TopicGone, TopicId, TopicOrder, TopicSnapshot, Visibility};
 use crate::store::{Rest, Stale};
 
 /// What happens to retained topics a first page doesn't contain.
@@ -36,8 +36,8 @@ enum News {
 struct Emitted(Vec<ListChange>);
 
 impl Emitted {
-    fn removed(&mut self, id: TopicId) {
-        self.0.push(ListChange::Removed(id));
+    fn removed(&mut self, id: TopicId, reason: TopicGone) {
+        self.0.push(ListChange::Removed(id, reason));
     }
 
     fn appended(&mut self, topic: Topic) {
@@ -97,6 +97,9 @@ impl TopicList {
         // Kept entries whose activity the page couldn't set: their rank
         // comes from newer live activity, not from the page's position.
         let mut keep_rank = Vec::new();
+        // Topics the page hid (or an open one it brought in hidden): the
+        // reset alone would not say why they left.
+        let mut hidden = Emitted::default();
         for snap in page.topics {
             let id = snap.topic.id;
             if list.iter().any(|e| e.id() == id) {
@@ -104,7 +107,11 @@ impl TopicList {
             }
             if let Some(at) = old.iter().position(|e| e.id() == id) {
                 let mut entry = old.remove(at);
+                let was_shown = entry.shown();
                 let merged = entry.merge(snap, seq, Source::Page);
+                if was_shown && !entry.shown() {
+                    hidden.removed(id, TopicGone::Hidden);
+                }
                 if merged.conflict() {
                     entry.owe(now);
                 }
@@ -113,6 +120,7 @@ impl TopicList {
                 }
                 list.push(entry);
             } else if let Some(entry) = self.admit_new(snap, seq, now) {
+                self.note_new_hidden(&entry, &mut hidden);
                 list.push(entry);
             }
         }
@@ -148,7 +156,9 @@ impl TopicList {
         }
         self.paging = paging_after(page.rest);
         self.enforce_cap();
-        vec![self.reset()]
+        // Absence from the reset says nothing more: no deletion is inferred.
+        hidden.0.push(self.reset());
+        hidden.0
     }
 
     fn apply_next(&mut self, seq: FetchSeq, page: PageSnapshot, now: Instant) -> Vec<ListChange> {
@@ -182,6 +192,7 @@ impl TopicList {
                     if entry.shown() {
                         out.appended(entry.topic.clone());
                     }
+                    self.note_new_hidden(&entry, &mut out);
                     self.entries.push(entry);
                 }
             } else {
@@ -197,7 +208,7 @@ impl TopicList {
             };
         }
         for id in self.enforce_cap() {
-            out.removed(id);
+            out.removed(id, TopicGone::Evicted);
         }
         // A later page is placed in server order, which the consumer's rank
         // rule may not reproduce: a deliberate reset then.
@@ -296,27 +307,28 @@ impl TopicList {
             if entry.shown() {
                 out.appended(entry.topic.clone());
             }
+            self.note_new_hidden(&entry, out);
             order::insert_ranked(&mut self.entries, self.order, entry);
             for gone in self.enforce_cap() {
-                out.removed(gone);
+                out.removed(gone, TopicGone::Evicted);
             }
         }
     }
 
     fn apply_deleted(&mut self, seq: FetchSeq, id: TopicId, now: Instant, out: &mut Emitted) {
         let Some(at) = self.position(id) else {
-            // Nothing newer is known about it: block older results.
+            // Nothing newer is known about it: block older results. Unlisted
+            // (never listed, or just evicted by this result) it is still
+            // gone, which the consumer's other state needs to know.
             self.tombstone(id, seq);
-            if self.open == Some(id) {
-                out.removed(id);
-            }
+            out.removed(id, TopicGone::Deleted);
             return;
         };
         match self.entries.get(at).map(|e| e.meta.judge(seq)) {
             Some(Verdict::Apply) => {
                 self.entries.remove(at);
                 self.tombstone(id, seq);
-                out.removed(id);
+                out.removed(id, TopicGone::Deleted);
             }
             Some(Verdict::Stale | Verdict::Conflict) => self.settle_or_back_off(id, seq, now),
             None => {}
@@ -331,6 +343,15 @@ impl TopicList {
             self.settle(id, seq);
         } else {
             self.back_off(id, now);
+        }
+    }
+
+    /// A topic new to the list that arrives hidden (General) and is the
+    /// open one: the consumer showing it must learn it is hidden, though
+    /// it never saw it shown.
+    fn note_new_hidden(&self, entry: &TopicEntry, out: &mut Emitted) {
+        if !entry.shown() && self.open == Some(entry.id()) {
+            out.removed(entry.id(), TopicGone::Hidden);
         }
     }
 
@@ -393,7 +414,7 @@ fn classify(entry: Option<&TopicEntry>, was: &Topic, was_vis: Visibility, out: &
         return;
     };
     match (was_vis == Visibility::Shown, entry.shown()) {
-        (true, false) => out.removed(entry.id()),
+        (true, false) => out.removed(entry.id(), TopicGone::Hidden),
         (false, true) => out.appended(entry.topic.clone()),
         (true, true) if entry.topic != *was => out.appended(entry.topic.clone()),
         _ => {}

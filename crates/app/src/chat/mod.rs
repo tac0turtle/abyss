@@ -8,6 +8,7 @@ mod commands;
 pub(crate) mod copy;
 #[cfg(feature = "fake")]
 pub(crate) mod demo;
+pub(crate) mod discarded;
 pub(crate) mod drafts;
 pub(crate) mod format;
 pub(crate) mod list;
@@ -15,14 +16,17 @@ pub(crate) mod messages;
 pub(crate) mod retry;
 pub(crate) mod rich;
 pub(crate) mod sends;
+pub(crate) mod topics;
 pub(crate) mod viewport;
 
 use std::collections::HashSet;
 use std::time::Instant;
 
 use abyss_core::api::{ConnState, Event, LoadTarget, UserError, WindowState};
-use abyss_core::model::{ChatId, ChatKind, ChatSummary, Message, MsgId, ThreadKey};
-use abyss_core::store::ViewGen;
+use abyss_core::model::{
+    ChatId, ChatKind, ChatSummary, Message, MsgId, ThreadKey, TopicGone, TopicId,
+};
+use abyss_core::store::{ForumStatus, ViewGen};
 use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, Task, px};
 
 pub(crate) use self::commands::{Admit, Refused};
@@ -30,6 +34,7 @@ use self::list::ChatList;
 use self::messages::{Applied, Batch, MessageWindow, RowOp};
 use self::retry::{Backoff, earliest};
 use self::sends::{Echo, Echoes};
+use self::topics::TopicList;
 use self::viewport::Seen;
 
 /// Rows rendered beyond the viewport, so scrolling doesn't pop in.
@@ -54,9 +59,67 @@ impl Row<'_> {
     }
 }
 
+/// What the chat pane shows (plan section 8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Pane {
+    #[default]
+    Empty,
+    /// A chat that is not a forum.
+    Thread(ThreadKey),
+    /// A forum: its topic list, or one of its topics (`open`).
+    Forum { chat: ChatId, open: Option<TopicId> },
+}
+
+/// Why the pane must change on its own (`ChatShell::stale_pane`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stale {
+    /// The chat became a forum, or stopped being one (its summary's kind,
+    /// which core sends after `ForumInvalidated`): it is shown the other
+    /// way, with `to` its thread afterwards.
+    Kind { to: Option<ThreadKey> },
+    /// The open topic was deleted or hidden (the reason): back to the
+    /// topic list. The cap never cuts the open topic.
+    TopicRemoved(TopicGone),
+}
+
+impl Pane {
+    pub(crate) fn chat(self) -> Option<ChatId> {
+        match self {
+            Self::Empty => None,
+            Self::Thread(t) => Some(t.chat),
+            Self::Forum { chat, .. } => Some(chat),
+        }
+    }
+
+    /// The thread the pane shows messages of: none for a topic list.
+    pub(crate) fn thread(self) -> Option<ThreadKey> {
+        match self {
+            Self::Empty | Self::Forum { open: None, .. } => None,
+            Self::Thread(t) => Some(t),
+            Self::Forum {
+                chat,
+                open: Some(topic),
+            } => Some(ThreadKey {
+                chat,
+                topic: Some(topic),
+            }),
+        }
+    }
+}
+
 pub(crate) struct ChatShell {
     pub(crate) list: ChatList,
-    selected: Option<ThreadKey>,
+    pane: Pane,
+    /// The forum's topic list while the pane shows a forum (`Pane::Forum`).
+    topics: Option<TopicList>,
+    /// Core removed the open topic (`TopicRemoved`): the pane goes back to
+    /// the list ([`Self::stale_pane`]).
+    open_removed: Option<(TopicId, TopicGone)>,
+    /// The kind core last announced for the pane's chat (`KindChanged`),
+    /// for a chat the chat list may not hold.
+    shown_kind: Option<(ChatId, ForumStatus)>,
+    /// Bringing the pane in line with core after a refusal.
+    fix_retry: Backoff,
     window: Option<MessageWindow>,
     echoes: Echoes,
     /// The message list's GPUI state. Always `window.len() + shown_echoes` rows.
@@ -130,7 +193,11 @@ impl Default for ChatShell {
         rows.set_follow_mode(FollowMode::Tail);
         Self {
             list: ChatList::default(),
-            selected: None,
+            pane: Pane::Empty,
+            topics: None,
+            open_removed: None,
+            shown_kind: None,
+            fix_retry: Backoff::default(),
             window: None,
             echoes: Echoes::default(),
             rows,
@@ -160,7 +227,7 @@ impl std::fmt::Debug for ChatShell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatShell")
             .field("chats", &self.list.len())
-            .field("selected", &self.selected)
+            .field("pane", &self.pane)
             .field("rows", &self.rows.item_count())
             .field("viewing", &self.viewing)
             .finish_non_exhaustive()
@@ -198,19 +265,63 @@ impl ChatShell {
 #[cfg(test)]
 mod reset_tests;
 
-/// Whether `chat` is a forum, whose pane shows a placeholder until topic
-/// lists arrive (stage 2, task 10).
+/// Whether `chat` is a forum, whose pane shows its topic list (owner
+/// decision D4: always, whatever the forum's default view).
 pub(crate) fn is_forum(chat: &ChatSummary) -> bool {
     matches!(chat.kind, ChatKind::Supergroup { forum: true, .. })
 }
 
 impl ChatShell {
+    pub(crate) fn pane(&self) -> Pane {
+        self.pane
+    }
+
+    /// The thread whose messages the pane shows (and the composer writes
+    /// to): none for a topic list.
     pub(crate) fn selected(&self) -> Option<ThreadKey> {
-        self.selected
+        self.pane.thread()
     }
 
     pub(crate) fn selected_chat(&self) -> Option<&ChatSummary> {
-        self.list.get(self.selected?.chat)
+        self.list.get(self.pane.chat()?)
+    }
+
+    /// The shown forum's topic list.
+    pub(crate) fn topics(&self) -> Option<&TopicList> {
+        self.topics.as_ref()
+    }
+
+    /// How the pane no longer fits what core says, if it does not (see
+    /// [`Stale`]).
+    pub(crate) fn stale_pane(&self) -> Option<Stale> {
+        let chat = self.pane.chat()?;
+        match (self.pane, self.forum_status(chat)) {
+            (Pane::Thread(_), ForumStatus::Forum) => Some(Stale::Kind { to: None }),
+            (Pane::Forum { .. }, ForumStatus::NotForum) => Some(Stale::Kind {
+                to: Some(ThreadKey::whole(chat)),
+            }),
+            (
+                Pane::Forum {
+                    open: Some(topic), ..
+                },
+                _,
+            ) => match self.open_removed {
+                Some((removed, reason)) if removed == topic => Some(Stale::TopicRemoved(reason)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// What core says about `chat`'s kind: its summary in the chat list,
+    /// else the kind it announced while the pane showed it.
+    fn forum_status(&self, chat: ChatId) -> ForumStatus {
+        match (self.list.get(chat), self.shown_kind) {
+            (Some(summary), _) if is_forum(summary) => ForumStatus::Forum,
+            (Some(_), _) => ForumStatus::NotForum,
+            (None, Some((c, status))) if c == chat => status,
+            (None, _) => ForumStatus::Unknown,
+        }
     }
 
     pub(crate) fn window(&self) -> Option<&MessageWindow> {
@@ -251,18 +362,23 @@ impl ChatShell {
     /// Starts the flood-wait countdown ticker unless it runs. Returns
     /// whether the caller should start one.
     pub(crate) fn start_countdown(&mut self) -> bool {
-        let start = self.countdown == Countdown::Idle && self.echoes.any_waiting();
+        let start = self.countdown == Countdown::Idle && self.counting_down();
         if start {
             self.countdown = Countdown::Running;
         }
         start
     }
 
-    /// One second passed: redraws the echo rows. Returns whether to keep
-    /// ticking (an echo still counts down).
+    /// Whether a flood wait counts down: a send's, or the topic list's.
+    fn counting_down(&self) -> bool {
+        self.echoes.any_waiting() || self.topics.as_ref().is_some_and(TopicList::flooding)
+    }
+
+    /// One second passed: redraws the echo rows (the caller redraws the
+    /// rest). Returns whether to keep ticking (something still counts down).
     pub(crate) fn countdown_tick(&mut self) -> bool {
         self.remeasure_echoes();
-        let more = self.echoes.any_waiting();
+        let more = self.counting_down();
         if !more {
             self.countdown = Countdown::Idle;
         }
@@ -366,14 +482,35 @@ impl ChatShell {
             // `LoadEnded` needs the time: see [`Self::load_ended`]. Errors
             // never end a load: core says which load ended.
             Event::Connection(state) => self.on_connection(state),
-            // Topic lists are shown from Stage 2 task 10.
-            Event::TopicsReset { .. }
+            topics @ (Event::TopicsReset { .. }
             | Event::TopicsAppended { .. }
             | Event::TopicsPaging { .. }
             | Event::TopicBumped { .. }
             | Event::TopicRemoved { .. }
-            | Event::ForumInvalidated(_)
-            | Event::Auth(_)
+            | Event::ForumInvalidated(_)) => {
+                if let Event::TopicRemoved {
+                    chat,
+                    topic,
+                    reason: reason @ (TopicGone::Deleted | TopicGone::Hidden),
+                } = topics
+                    && self.pane
+                        == (Pane::Forum {
+                            chat,
+                            open: Some(topic),
+                        })
+                {
+                    self.open_removed = Some((topic, reason));
+                }
+                if let Some(list) = self.topics.as_mut() {
+                    list.apply(topics);
+                }
+            }
+            Event::KindChanged { chat, forum } => {
+                if self.pane.chat() == Some(chat) {
+                    self.shown_kind = Some((chat, forum));
+                }
+            }
+            Event::Auth(_)
             | Event::CredentialSource(_)
             | Event::CredentialItem(_)
             | Event::Error(_)
@@ -396,8 +533,11 @@ impl ChatShell {
                     w.load_ended(dir, error, now);
                 }
             }
-            // Topic lists are shown from Stage 2 task 10.
-            LoadTarget::Topics(_) => {}
+            LoadTarget::Topics(chat) => {
+                if let Some(list) = self.topics.as_mut().filter(|l| l.chat() == chat) {
+                    list.load_ended(error, now);
+                }
+            }
         }
     }
 
@@ -409,10 +549,14 @@ impl ChatShell {
             .then(|| self.focus_retry.due(now))
             .flatten();
         let window = self.window.as_ref().and_then(|w| w.retry_due(now));
+        let topics = self.topics.as_ref().and_then(|l| l.retry_due(now));
+        let fix = self.stale_pane().and_then(|_| self.fix_retry.due(now));
         let recovery = self.held_recovery.map(|at| at.max(now));
         [
             self.list.retry_due(now),
             window,
+            topics,
+            fix,
             self.frame_retry.due(now),
             recovery,
         ]

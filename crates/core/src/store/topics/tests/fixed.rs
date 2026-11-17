@@ -291,7 +291,7 @@ fn a_fresh_by_id_deletion_removes_without_a_suspicion() {
     let changes = l
         .apply_by_id(seq, by_id(vec![], vec![tid(3)]), now)
         .unwrap();
-    assert_eq!(changes, [ListChange::Removed(tid(3))]);
+    assert_eq!(changes, [ListChange::Removed(tid(3), TopicGone::Deleted)]);
     assert!(l.get(tid(3)).is_none());
 
     l.mark_due(tid(2), now);

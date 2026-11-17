@@ -9,12 +9,15 @@ use abyss_core::api::{
     PasswordBuf, UserError,
 };
 use abyss_core::{BackendChoice, CoreConfig, StartError};
-use gpui::{AppContext, Context, Entity, Focusable, SharedString, Subscription, Task, Window};
+use gpui::{
+    AppContext, Context, Entity, FocusHandle, Focusable, SharedString, Subscription, Task, Window,
+};
 
 use super::Root;
 use super::auth::{AuthView, project};
 use super::bridge::{CoreLink, EventSource, SharedCore, spawn_pump};
 use super::shutdown::{self, Closing, Next};
+use crate::chat::discarded::Discarded;
 use crate::chat::{ChatShell, Refused};
 use crate::launch::Launch;
 use crate::ui::copy;
@@ -119,6 +122,12 @@ pub(crate) struct Session {
     /// `CredentialItem`): a failure shows Retry.
     pub(super) cred_item: CredentialItem,
     pub(super) composer: Entity<TextInput>,
+    /// Drafts discarded because their thread can no longer be sent to,
+    /// offered for copying until dismissed (`chat::discarded`).
+    pub(super) discarded: Discarded,
+    /// The chat shell's own focus, for a pane without a composer (a topic
+    /// list): key bindings such as Cmd+[ need a focused element on screen.
+    pub(super) pane_focus: FocusHandle,
     /// A new chat folder's title (`folder_menu`).
     pub(super) folder_name: Entity<TextInput>,
     /// The open archive/folder menu, if any (`folder_menu`).
@@ -194,6 +203,8 @@ impl Session {
             source: None,
             cred_item: CredentialItem::Settled,
             composer,
+            discarded: Discarded::default(),
+            pane_focus: cx.focus_handle(),
             folder_name,
             menu: None,
             shell,
@@ -311,6 +322,7 @@ impl Session {
         self.folder_name
             .update(cx, |input, cx| input.clear(window, cx));
         self.menu = None;
+        self.discarded.clear();
         self.logout_prompt = false;
     }
 
@@ -526,6 +538,26 @@ impl Session {
         if let Ok(mut core) = self.core.try_borrow_mut() {
             drop(core.begin_shutdown());
         }
+    }
+}
+
+impl Session {
+    /// Copies every discarded draft, each under its label, and closes
+    /// their notice.
+    pub(super) fn copy_discarded(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if self.discarded.is_empty() {
+            return;
+        }
+        let text = self.discarded.copy_text();
+        self.discarded.clear();
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.show_notice(crate::chat::copy::TEXT_COPIED.into(), window, cx);
+    }
+
+    /// Closes the discarded drafts' notice; their texts are gone.
+    pub(super) fn dismiss_discarded(&mut self, _: &mut Window, cx: &mut Context<'_, Root>) {
+        self.discarded.clear();
+        cx.notify();
     }
 }
 

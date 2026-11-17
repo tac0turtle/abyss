@@ -217,6 +217,19 @@ pub enum Visibility {
     Hidden,
 }
 
+/// Why a topic left the shown list (`Event::TopicRemoved`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopicGone {
+    /// A fresh by-id result confirmed the deletion: nothing can be posted
+    /// to it any more.
+    Deleted,
+    /// Its visibility became hidden (General only); it can still be
+    /// posted to.
+    Hidden,
+    /// Cut by the list's cap: it still exists, only no longer listed.
+    Evicted,
+}
+
 /// One forum topic, as the UI shows it.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Topic {

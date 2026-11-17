@@ -8,7 +8,9 @@ use std::time::Instant;
 use super::entry::{Deletion, bound};
 use super::order;
 use super::{ListChange, Replay, TopicList};
-use crate::model::{Freshness, Message, MsgId, Preview, TopicId, TopicOrder, Visibility};
+use crate::model::{
+    Freshness, Message, MsgId, Preview, TopicGone, TopicId, TopicOrder, Visibility,
+};
 use crate::store::bump_moves;
 
 /// Whether the thread's tail was on screen when a message arrived
@@ -244,7 +246,7 @@ impl TopicList {
         entry.meta.set_changed(seq);
         entry.owe(now);
         let changes = match (was_shown, entry.shown()) {
-            (true, false) => vec![ListChange::Removed(topic)],
+            (true, false) => vec![ListChange::Removed(topic, TopicGone::Hidden)],
             (false, true) => {
                 // Re-shown: placed at its rank among the shown topics, as
                 // the consumer places an `Appended` topic it doesn't hold.

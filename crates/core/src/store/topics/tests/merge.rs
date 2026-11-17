@@ -550,6 +550,13 @@ impl Sim {
             }
         };
         prop_assert!(result.is_ok(), "no fetch is invalidated with five topics");
+        // Every accepted deletion is told as one, however the rows change.
+        if let Ok(changes) = &result {
+            for id in deleted.iter().filter(|id| self.list.entry(**id).is_none()) {
+                let told = ListChange::Removed(*id, TopicGone::Deleted);
+                prop_assert!(changes.contains(&told), "{:?}: {:?}", id, changes);
+            }
+        }
         for s in &found {
             self.oracle.found(flight.n, s);
         }

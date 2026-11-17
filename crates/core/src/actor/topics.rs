@@ -38,7 +38,7 @@ use crate::backend::{
     Backend, BackendError, RejectReason, TopicsById, TopicsCursor, TopicsPage, Update,
 };
 use crate::cache::CacheCmd;
-use crate::model::{ChatId, Message, MsgId, ThreadKey, TopicId};
+use crate::model::{ChatId, Message, MsgId, ThreadKey, TopicGone, TopicId};
 use crate::store::{
     AutoRefresh, ByIdCall, ByIdSnapshot, ForumStatus, ListChange, NotBefore, PageCall, PageKind,
     PageSnapshot, Paging, PostClosed, Refresh, Rest, TOPICS_CALL_INTERVAL, Tail, TopicEdit, Topics,
@@ -498,7 +498,7 @@ impl<B: Backend> Actor<B> {
         let gone: Vec<TopicId> = changes
             .iter()
             .filter_map(|c| match c {
-                ListChange::Removed(id) if deleted.contains(id) => Some(*id),
+                ListChange::Removed(id, TopicGone::Deleted) if deleted.contains(id) => Some(*id),
                 _ => None,
             })
             .collect();
@@ -747,7 +747,11 @@ impl<B: Backend> Actor<B> {
                 },
                 ListChange::Appended(topics) => Event::TopicsAppended { chat, view, topics },
                 ListChange::Bumped(topic) => Event::TopicBumped { chat, topic },
-                ListChange::Removed(topic) => Event::TopicRemoved { chat, topic },
+                ListChange::Removed(topic, reason) => Event::TopicRemoved {
+                    chat,
+                    topic,
+                    reason,
+                },
             };
             self.emit(event).await;
         }

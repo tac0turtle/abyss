@@ -163,11 +163,20 @@ fn eviction_at_the_cap_is_emitted() {
     let mut consumer = Consumer::of(&l);
     assert_eq!(consumer.shown.len(), MAX_TOPICS_PER_FORUM);
     l.discover(tid(9_000));
-    let (seq, _) = dispatch(&mut l, now);
+    l.mark_due(tid(2), now);
+    let (seq, ids) = dispatch(&mut l, now);
+    assert!(
+        ids.contains(&tid(2)) && ids.contains(&tid(9_000)),
+        "{ids:?}"
+    );
+    // The new topic evicts topic 2, which the same result reports deleted:
+    // the deletion is told too (round 5 of the task 10 review).
     let out = l
-        .apply_by_id(seq, by_id(snaps(&[9_000]), vec![]), now)
+        .apply_by_id(seq, by_id(snaps(&[9_000]), vec![tid(2)]), now)
         .unwrap();
-    assert!(out.contains(&ListChange::Removed(tid(2))), "{out:?}");
+    let evicted = ListChange::Removed(tid(2), TopicGone::Evicted);
+    let deleted = ListChange::Removed(tid(2), TopicGone::Deleted);
+    assert!(out.contains(&evicted) && out.contains(&deleted), "{out:?}");
     consumer.apply(&out);
     consumer.assert_matches(&l);
     assert_eq!(consumer.shown.len(), MAX_TOPICS_PER_FORUM);
@@ -194,7 +203,7 @@ fn closing_an_open_topic_past_the_cap_enforces_it() {
     assert_eq!(l.len(), MAX_TOPICS_PER_FORUM + 1);
     let mut consumer = Consumer::of(&l);
     let out = l.set_open(None);
-    assert_eq!(out, [ListChange::Removed(tid(1))]);
+    assert_eq!(out, [ListChange::Removed(tid(1), TopicGone::Evicted)]);
     assert_eq!(l.len(), MAX_TOPICS_PER_FORUM);
     consumer.apply(&out);
     consumer.assert_matches(&l);
@@ -382,6 +391,26 @@ fn unhiding_a_pinned_general_between_pinned_topics_is_incremental() {
         ids(&l),
         [5, 3, 1, 2],
         "at the end of the pinned prefix, its rank"
+    );
+    // A first page hides it again: the reset comes after a `Hidden`.
+    let mut general = pinned(1);
+    general.visibility = Visibility::Hidden;
+    let first = vec![pinned(5), general, pinned(3), snap(topic(2))];
+    let out = load(
+        &mut l,
+        PageKind::First,
+        page(TopicOrder::LastActivity, first, Rest::Last),
+        now,
+    );
+    assert!(
+        matches!(
+            out.as_slice(),
+            [
+                ListChange::Removed(TopicId::GENERAL, TopicGone::Hidden),
+                ListChange::Reset { .. }
+            ]
+        ),
+        "{out:?}"
     );
 }
 

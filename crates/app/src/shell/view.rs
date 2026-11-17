@@ -46,6 +46,9 @@ impl Render for Root {
             .text_color(theme.text)
             .font_family(theme::BODY_FONT)
             .text_size(px(14.))
+            .on_action(cx.listener(|root, _: &super::ForumBack, window, cx| {
+                root.with_session(|s, cx| s.back_from_forum(window, cx), cx);
+            }))
             .child(body)
             .children(panel)
             .children(overlay)
@@ -179,6 +182,10 @@ fn session_body(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) ->
             (live && session.auth == AuthView::SignedIn)
                 .then(|| super::folder_menu::menu_overlay(session, theme, cx))
                 .flatten(),
+        )
+        .children(
+            (live && !session.discarded.is_empty())
+                .then(|| discarded_notice(&session.discarded, theme, cx)),
         )
         .children(
             session
@@ -606,6 +613,46 @@ fn toast(text: SharedString, theme: &Theme) -> Div {
                 .text_color(theme.text)
                 .child(text),
         )
+}
+
+/// Batches of discarded drafts the notice lists.
+const DISCARDED_LINES: usize = 3;
+
+/// Discarded drafts (their threads can no longer be sent to), with Copy
+/// and Dismiss: above the toast, and kept until one of them.
+fn discarded_notice(
+    discarded: &crate::chat::discarded::Discarded,
+    theme: &Theme,
+    cx: &mut Context<'_, Root>,
+) -> Div {
+    // The newest few batches; Copy takes every text.
+    let lines = discarded.lines().take(DISCARDED_LINES).cloned();
+    let notice = div()
+        .flex()
+        .gap_3()
+        .items_center()
+        .px_4()
+        .py_2()
+        .occlude()
+        .child(div().flex().flex_col().children(lines))
+        .child(on(
+            secondary("discarded-copy", chat_copy::COPY_TEXT, theme),
+            Session::copy_discarded,
+            cx,
+        ))
+        .child(on(
+            secondary("discarded-dismiss", chat_copy::DISMISS, theme),
+            Session::dismiss_discarded,
+            cx,
+        ));
+    div()
+        .absolute()
+        .bottom_16()
+        .left_0()
+        .w_full()
+        .flex()
+        .justify_center()
+        .child(raised(notice, theme))
 }
 
 /// A blocking notice with a Quit button.

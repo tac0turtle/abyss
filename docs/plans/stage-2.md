@@ -229,8 +229,10 @@ TopicsReset    { chat, view: TopicsGen, order: TopicOrder, topics: Vec<Topic>, c
 TopicsAppended { chat, view: TopicsGen, topics: Vec<Topic> }   // added or changed, in list order
 TopicsPaging   { chat, view: TopicsGen, has_more: bool }
 TopicBumped    { chat, topic: Topic }        // changed; moves only as section 6.1's order rule says
-TopicRemoved   { chat, topic: TopicId }      // deleted or hidden; an open thread of it is invalidated
+TopicRemoved   { chat, topic: TopicId, reason: TopicGone }  // Deleted (fresh by-id) | Hidden (General) | Evicted (cap); a deleted open thread is invalidated
+                                             // Deleted/Hidden are always told, also for a topic the list no longer holds and before a reset that omits it; absence from a reset implies nothing (task 10 review)
 ForumInvalidated(ChatId)                     // forum flag changed or reconcile: drop the copy, await TopicsReset
+KindChanged { chat, forum: ForumStatus }     // forum flag changed (Forum | NotForum), listed or not; precedes its own ForumInvalidated, summaries may arrive independently (task 10 review)
 LoadTarget::Topics(ChatId)
 UserError::TopicClosed, UserError::TopicDeleted
 ```
@@ -564,7 +566,7 @@ enum Deletion { None, Suspected }           // core-internal; a local suspicion 
   - Waiting commands are answered when their chat leaves the queue, whatever the outcome.
   - `SendText` is admitted to the pending-send table (256 entries, as in Stage 1) but not dispatched until the fence lifts.
 - **Lifting the fence.** Whatever the outcome:
-  - **Changed kind:** invalidate every window and the topic list of the chat, delete its cached messages (their thread keys changed meaning), and emit `ForumInvalidated(chat)` and `ChatBumped`. The UI shows the topic list or the plain chat.
+  - **Changed kind:** invalidate every window and the topic list of the chat, delete its cached messages (their thread keys changed meaning), and emit `KindChanged { chat, forum }`, `ForumInvalidated(chat)` and, for a listed chat, `ChatBumped`. The UI shows the topic list or the plain chat; `KindChanged` reaches it also for a chat it has open that the dialogs list no longer holds. It precedes its own `ForumInvalidated`; summaries carrying the kind may arrive independently, before or after it, so the UI reconciles from either (task 10 review).
   - **Unchanged kind, or abandoned:** continuity is still **not** restored. Every window of the chat is invalidated. The open thread, if it belongs to the chat, reloads its tail, and only that thread-scoped `ReconcileTail` (section 10) can set `cache_contiguous` again.
   - Deferred commands then run.
 - **General rule:** whenever a live message for a chat is routed `ChatOnly` while that chat has windows, all of its windows lose `cache_contiguous`. A window keeps the flag only while every live message of its thread has reached it.
@@ -647,8 +649,8 @@ enum Pane { Empty, Thread(ThreadKey), Forum { chat: ChatId, open: Option<TopicId
 - Selecting the same forum row again while a topic is open also goes back to the list.
 - Selecting another chat sends `CloseChat` and `CloseForum` as needed.
 - The UI changes the pane only after the command is admitted (the Stage 1 `Admit` rule, task 6j).
-- `ForumInvalidated` drops the UI's list. If the chat is still a forum, the pane waits for `TopicsReset` (with a "Loading topics…" placeholder). If not, it switches to `Thread({chat, None})`.
-- `TopicRemoved` for the open topic goes back to the list with a notice.
+- `ForumInvalidated` drops the UI's list. If the chat is still a forum, the pane waits for `TopicsReset` (with a "Loading topics…" placeholder). If not, it switches to `Thread({chat, None})`. The kind comes from the chat's summary, or from `KindChanged` for a shown chat the list doesn't hold; a chat that became a forum switches to `Forum { open: None }` the same way. A refused switch retries with the Stage 1 backoff. Drafts of threads an event makes unsendable are discarded when the event arrives, whatever the pane shows or whether a command is admitted: `TopicRemoved` with `reason: Deleted` drops that topic's key (a hidden General can still be posted to, and an evicted topic still exists: their drafts stay; an open hidden topic's text is stashed, or, with no slot free, goes to the notice), `KindChanged` every topic key of a chat that stopped being a forum or the whole-chat key of one that became a forum; the composer's text goes with them when it belongs to one. Nothing unsendable is stashed, so draft slots stay at 64 with no exception. One notice holds every discarded text under its label ("a topic of “X”", "“X”"), with one line per batch and **Copy text** (all entries, newest first). It keeps at most 64 texts, dropping the oldest: that and Dismiss are the only ways a discarded text is lost. It is cleared at account teardown, and no text reaches logs (task 10 review).
+- `TopicRemoved` for the open topic (`Deleted` or `Hidden`; the cap never evicts it) goes back to the list with a notice. `Evicted` only drops the row.
 
 **Topic list.**
 - A `uniform_list` of fixed-height rows: a neutral "#" glyph (D3), the title, a preview (the Stage 1 100-character rule), the time, the unread mark, a pin mark for pinned topics, and a "closed" mark.
@@ -1128,3 +1130,15 @@ Follow-ups (not Stage 2 tasks):
 | 1 | P2: timeouts and flood waits dropped an accepted read intent, leaving the thread unread while the UI suppresses a repeat `MarkRead` | Read intents kept per thread until a covering read lands, one flight per thread, backoff 1→30 s, flood waits after their deadline, rejections terminal; only a read's first timeout counts toward stall detection |
 | 2 | P2: excluding retried timeouts also bypassed the exhausted-permit recovery, so retried reads could park every permit | Independent check at the end of `on_done`: all permits parked on the current client triggers a stall rebuild (no-op once retiring); the existing lifecycle test extends to cover it |
 | 3 | Pass | Accepted: closed-topic refusal at admission only; held sends keep their original thread across a kind change |
+
+### Task 10: forum navigation and the topic list (6 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 | P2: app truncation broke core's replay contract; a forum flag change left the wrong pane; removing the open topic left its composer active | Exact replay; panes reconcile with the chat's kind; open-topic removal returns to the list with a notice |
+| 2 | P2: refused reconciliation looped every frame; window-only chats never reconciled; overflow text could land in another chat | Backoff with a scheduled wake; new `Event::KindChanged`; (overflow slot, later replaced) |
+| 3 | P2: the overflow draft slot could block navigation or panic | Overflow slot removed; drafts made unsendable by a kind change or deletion are discarded with a Copy notice; cap stays 64 |
+| 4 | P2: cleanup depended on the shown pane; bulk discards kept one text | Cleanup runs on the invalidating event; one notice accumulates up to 64 texts, Copy takes all |
+| (lead) | Cap evictions were reported like deletions, discarding valid drafts | `TopicRemoved` carries `TopicGone { Deleted, Hidden, Evicted }`; only `Deleted` discards drafts |
+| 5 | P2: a deletion in the same response as its eviction surfaced only as `Evicted`; resets dropped `Hidden` | By-id deletions always emit `Deleted`; semantic removals precede resets; an open topic fetched hidden emits `Hidden` |
+| 6 | Pass | Note: re-discovering an already deleted id can emit `Deleted` again (bounded, idempotent cleanup) |

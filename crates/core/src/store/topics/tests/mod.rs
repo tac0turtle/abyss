@@ -17,8 +17,8 @@ use super::{
     TopicList, TopicsGen,
 };
 use crate::model::{
-    Body, ChatId, Freshness, Message, MsgId, PeerKind, Preview, ThreadKey, Topic, TopicId,
-    TopicOrder, TopicSnapshot, Visibility,
+    Body, ChatId, Freshness, Message, MsgId, PeerKind, Preview, ThreadKey, Topic, TopicGone,
+    TopicId, TopicOrder, TopicSnapshot, Visibility,
 };
 use crate::sanitize::{MAX_NAME_BYTES, is_clean};
 use crate::store::Rest;
@@ -182,7 +182,7 @@ pub(super) fn check_emitted(list: &TopicList, changes: &[ListChange]) -> Result<
                 topics.iter().collect()
             }
             ListChange::Bumped(t) => vec![t],
-            ListChange::Removed(_) => Vec::new(),
+            ListChange::Removed(..) => Vec::new(),
         };
         if let Some(t) = topics.into_iter().find(|t| hidden(t.id)) {
             return Err(format!("emitted hidden {:?}", t.id));

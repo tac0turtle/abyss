@@ -123,12 +123,12 @@ fn reconciled(view: u64, newest: i32) -> Event {
 fn open(core: &mut Core) -> ChatShell {
     let mut shell = ChatShell::default();
     shell.apply(Event::DialogsReset(vec![summary()]));
-    shell.select(THREAD, &mut core.admit()).unwrap();
+    shell.select(CHAT, &mut core.admit()).unwrap();
     assert!(matches!(
         core.take().as_slice(),
         [Command::OpenThread(THREAD)]
     ));
-    shell.select(THREAD, &mut core.admit()).unwrap();
+    shell.select(CHAT, &mut core.admit()).unwrap();
     assert!(core.take().is_empty(), "already open");
     shell.apply(history(1, HistoryDir::Tail, 51..=100));
     shell
@@ -449,14 +449,12 @@ fn switching_chats_keeps_echoes_with_their_chat() {
         id: 2,
     };
     core.take();
-    shell
-        .select(ThreadKey::whole(other), &mut core.admit())
-        .unwrap();
+    shell.select(other, &mut core.admit()).unwrap();
     assert!(
         matches!(core.take().as_slice(), [Command::OpenThread(t)] if *t == ThreadKey::whole(other))
     );
     assert_eq!(shell.rows().item_count(), 0);
-    shell.select(THREAD, &mut core.admit()).unwrap();
+    shell.select(CHAT, &mut core.admit()).unwrap();
     assert_eq!(
         shell.rows().item_count(),
         1,

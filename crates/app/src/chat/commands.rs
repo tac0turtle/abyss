@@ -7,14 +7,15 @@
 use std::time::Instant;
 
 use abyss_core::api::{Command, HistoryDir, UserError, WindowState};
-use abyss_core::model::{LocalId, ThreadKey};
+use abyss_core::model::{ChatId, LocalId, ThreadKey, TopicId};
 use gpui::FollowMode;
 
 use super::messages::MessageWindow;
 use super::retry::AUTO_RESTART_GAP;
 use super::sends::Echo;
+use super::topics::{Intent, TopicList};
 use super::viewport::Seen;
-use super::{ChatShell, CoreState};
+use super::{ChatShell, CoreState, Pane, Stale};
 
 /// Core did not take a command: its queue is full, or it is gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,28 +28,159 @@ pub(crate) enum Refused {
 pub(crate) type Admit<'a> = &'a mut dyn FnMut(Command) -> Result<(), Refused>;
 
 impl ChatShell {
-    /// Opens `thread` once core admitted `OpenThread` (core closes the
-    /// previous one). Refused, the previous thread stays selected.
-    ///
-    /// A forum has no whole-chat history (core refuses that key): until
-    /// its topic list arrives (stage 2, task 10) it shows a placeholder, so
-    /// only the previous thread is closed, and no window is kept for it.
-    pub(crate) fn select(&mut self, thread: ThreadKey, admit: Admit<'_>) -> Result<(), Refused> {
-        if self.selected == Some(thread) {
+    /// Opens `chat` from the chat list, once core admitted the command
+    /// (the Stage 1 `Admit` rule): a forum shows its topic list
+    /// (`OpenForum`), any other chat its messages (`OpenThread`, which
+    /// closes the previous thread and any forum view in core). Refused,
+    /// the pane stays as it was. Selecting a forum whose topic is open
+    /// goes back to its list.
+    pub(crate) fn select(&mut self, chat: ChatId, admit: Admit<'_>) -> Result<(), Refused> {
+        if !self.list.get(chat).is_some_and(super::is_forum) {
+            return self.show_thread(ThreadKey::whole(chat), admit);
+        }
+        match self.pane {
+            Pane::Forum {
+                chat: c,
+                open: None,
+            } if c == chat => Ok(()),
+            Pane::Forum { chat: c, .. } if c == chat => self.back_to_topics(admit),
+            _ => self.show_forum(chat, admit),
+        }
+    }
+
+    fn show_thread(&mut self, thread: ThreadKey, admit: Admit<'_>) -> Result<(), Refused> {
+        if self.pane == Pane::Thread(thread) {
             return Ok(());
         }
-        let forum = self.list.get(thread.chat).is_some_and(super::is_forum);
         // Core stopped (task 6l): local only, so the thread's stranded
         // echoes and draft stay reachable; nothing is asked of core.
         if self.core == CoreState::Running {
-            match (forum, self.selected) {
-                (false, _) => admit(Command::OpenThread(thread))?,
-                (true, Some(prev)) => admit(Command::CloseThread(prev))?,
-                (true, None) => {}
-            }
+            admit(Command::OpenThread(thread))?;
         }
-        self.selected = Some(thread);
-        self.window = (!forum).then(|| MessageWindow::new(thread));
+        self.set_pane(Pane::Thread(thread));
+        self.topics = None;
+        self.show_window(Some(thread));
+        Ok(())
+    }
+
+    /// Shows `chat`'s topic list. The previous thread is closed after the
+    /// forum opened: refused, core merely keeps a window nobody shows (its
+    /// live tail is cleared by the next frame), so the switch stands.
+    fn show_forum(&mut self, chat: ChatId, admit: Admit<'_>) -> Result<(), Refused> {
+        let opening = if self.core == CoreState::Running {
+            admit(Intent::First.command(chat))?;
+            if let Some(prev) = self.selected()
+                && let Err(refused) = admit(Command::CloseThread(prev))
+            {
+                tracing::debug!(?refused, "the previous thread stays open in core");
+            }
+            Some(Intent::First)
+        } else {
+            None
+        };
+        self.set_pane(Pane::Forum { chat, open: None });
+        self.topics = Some(TopicList::new(chat, opening));
+        self.show_window(None);
+        Ok(())
+    }
+
+    /// Opens `topic` of the shown forum (`OpenThread` with the topic).
+    pub(crate) fn open_topic(&mut self, topic: TopicId, admit: Admit<'_>) -> Result<(), Refused> {
+        let Pane::Forum { chat, open } = self.pane else {
+            return Ok(());
+        };
+        if open == Some(topic) {
+            return Ok(());
+        }
+        let thread = ThreadKey {
+            chat,
+            topic: Some(topic),
+        };
+        if self.core == CoreState::Running {
+            admit(Command::OpenThread(thread))?;
+        }
+        self.set_pane(Pane::Forum {
+            chat,
+            open: Some(topic),
+        });
+        self.show_window(Some(thread));
+        Ok(())
+    }
+
+    /// Back one level (the "‹ Topics" button and Cmd+[): from a topic to
+    /// its forum's list, which shows at once from the copy kept here; from
+    /// a topic list to no chat (`CloseForum`, which drops a waiting load).
+    pub(crate) fn back(&mut self, admit: Admit<'_>) -> Result<(), Refused> {
+        match self.pane {
+            Pane::Forum { open: Some(_), .. } => self.back_to_topics(admit),
+            Pane::Forum { chat, open: None } => {
+                if self.core == CoreState::Running {
+                    admit(Command::CloseForum(chat))?;
+                }
+                self.set_pane(Pane::Empty);
+                self.topics = None;
+                Ok(())
+            }
+            Pane::Empty | Pane::Thread(_) => Ok(()),
+        }
+    }
+
+    /// Brings the pane in line with core ([`Self::stale_pane`]): a chat
+    /// whose kind changed is shown the other way (`OpenForum`, or
+    /// `OpenThread` of the whole chat), a removed open topic goes back to
+    /// the list.
+    /// Refused, it is tried again after a bounded backoff
+    /// ([`Self::fix_due`]).
+    pub(crate) fn fix_pane(&mut self, now: Instant, admit: Admit<'_>) -> Result<(), Refused> {
+        let Some(chat) = self.pane.chat() else {
+            return Ok(());
+        };
+        let res = match self.stale_pane() {
+            None => Ok(()),
+            Some(Stale::Kind { to: None }) => self.show_forum(chat, admit),
+            Some(Stale::Kind { to: Some(thread) }) => self.show_thread(thread, admit),
+            Some(Stale::TopicRemoved(_)) => self.back_to_topics(admit),
+        };
+        if res.is_err() {
+            self.fix_retry.failed(now);
+        }
+        res
+    }
+
+    /// How the pane must change at `now`, unless a refused change waits
+    /// out its backoff (or gave up until a fresh trigger).
+    pub(crate) fn fix_due(&self, now: Instant) -> Option<Stale> {
+        self.stale_pane().filter(|_| self.fix_retry.ready(now))
+    }
+
+    /// The pane becomes `pane`. The kind core announced for the previous
+    /// chat (`KindChanged`) is forgotten with it.
+    fn set_pane(&mut self, pane: Pane) {
+        if pane.chat() != self.pane.chat() {
+            self.shown_kind = None;
+        }
+        self.pane = pane;
+    }
+
+    fn back_to_topics(&mut self, admit: Admit<'_>) -> Result<(), Refused> {
+        let (Pane::Forum { chat, .. }, Some(thread)) = (self.pane, self.selected()) else {
+            return Ok(());
+        };
+        if self.core == CoreState::Running {
+            admit(Command::CloseThread(thread))?;
+        }
+        self.set_pane(Pane::Forum { chat, open: None });
+        self.show_window(None);
+        Ok(())
+    }
+
+    /// The message list starts afresh for `thread` (none: no messages
+    /// shown).
+    fn show_window(&mut self, thread: Option<ThreadKey>) {
+        self.open_removed = None;
+        // The pane changed: a refused reconciliation starts over.
+        self.fix_retry.reset();
+        self.window = thread.map(MessageWindow::new);
         self.revealed.clear();
         self.read_sent = None;
         // The user's choice: frame commands for the new thread start afresh.
@@ -56,7 +188,40 @@ impl ChatShell {
         self.shown_echoes = self.echo_count();
         self.rows.reset(self.shown_echoes);
         self.rows.set_follow_mode(FollowMode::Tail);
-        Ok(())
+    }
+
+    /// Topic list row `last_visible` is on screen. Returns whether a
+    /// request is due.
+    pub(crate) fn topics_seen(&mut self, last_visible: usize, now: Instant) -> bool {
+        let Some(list) = self.topics.as_mut() else {
+            return false;
+        };
+        list.seen(last_visible);
+        list.wants(now).is_some()
+    }
+
+    /// Asks for what the topic list wants at `now` (see
+    /// [`TopicList::wants`]). A refusal is retried after a backoff.
+    pub(crate) fn request_topics(&mut self, now: Instant, admit: Admit<'_>) -> Result<(), Refused> {
+        if self.core == CoreState::Stopped {
+            return Ok(());
+        }
+        let Some(list) = self.topics.as_mut() else {
+            return Ok(());
+        };
+        let Some(intent) = list.wants(now) else {
+            return Ok(());
+        };
+        match admit(intent.command(list.chat())) {
+            Ok(()) => {
+                list.requested(intent);
+                Ok(())
+            }
+            Err(refused) => {
+                list.refused(intent, now);
+                Err(refused)
+            }
+        }
     }
 
     /// Where a composer submission would go: `Ok(None)` when nothing is open
@@ -65,10 +230,10 @@ impl ChatShell {
         if self.core == CoreState::Stopped {
             return Ok(None);
         }
-        let Some(thread) = self.selected.filter(|_| {
-            self.selected_chat()
-                .is_some_and(|c| c.can_send && !super::is_forum(c))
-        }) else {
+        let Some(thread) = self
+            .selected()
+            .filter(|_| self.selected_chat().is_some_and(|c| c.can_send))
+        else {
             return Ok(None);
         };
         if self.echoes.is_full() {
@@ -185,11 +350,21 @@ impl ChatShell {
         self.drafts.stash(thread, text)
     }
 
-    /// Whether the open thread can change to `to` without losing a draft:
-    /// the box's `text` needs a slot unless it is empty or the slots free.
-    pub(crate) fn can_switch(&self, to: ThreadKey, text: &str) -> bool {
-        self.selected
-            .is_none_or(|from| self.drafts.can_switch(from, to, text))
+    /// Drops the drafts of threads that can no longer be sent to, and
+    /// returns them, oldest first.
+    pub(crate) fn discard_drafts(
+        &mut self,
+        obsolete: impl Fn(ThreadKey) -> bool,
+    ) -> Vec<(ThreadKey, String)> {
+        self.drafts.discard(obsolete)
+    }
+
+    /// Whether the open thread can change to `to` (none: a pane without
+    /// messages) without losing a draft: the box's `text` needs a slot
+    /// unless it is empty or the slots free.
+    pub(crate) fn can_switch(&self, to: Option<ThreadKey>, text: &str) -> bool {
+        self.selected()
+            .is_none_or(|from| self.drafts.can_switch(from, to.unwrap_or(from), text))
     }
 
     /// Takes `thread`'s stashed draft.
@@ -359,7 +534,9 @@ impl ChatShell {
     fn auto_recover(&mut self, now: Instant) {
         let exhausted = self.focus_retry.gave_up()
             || self.frame_retry.gave_up()
+            || self.fix_retry.gave_up()
             || self.list.exhausted()
+            || self.topics.as_ref().is_some_and(TopicList::exhausted)
             || self.window.as_ref().is_some_and(MessageWindow::exhausted);
         if !exhausted {
             return;
@@ -374,7 +551,11 @@ impl ChatShell {
         self.held_recovery = None;
         self.focus_retry.restart_if_exhausted();
         self.frame_retry.restart_if_exhausted();
+        self.fix_retry.restart_if_exhausted();
         self.list.recover();
+        if let Some(t) = self.topics.as_mut() {
+            t.recover();
+        }
         if let Some(w) = self.window.as_mut() {
             w.recover();
         }
@@ -388,7 +569,11 @@ impl ChatShell {
         self.held_recovery = None;
         self.focus_retry.reset();
         self.frame_retry.reset();
+        self.fix_retry.reset();
         self.list.retry_now();
+        if let Some(t) = self.topics.as_mut() {
+            t.retry_now();
+        }
         if let Some(w) = self.window.as_mut() {
             w.retry_now();
         }
@@ -401,10 +586,19 @@ impl ChatShell {
         self.window.as_ref().is_some_and(MessageWindow::gave_up) || self.frame_retry.gave_up()
     }
 
-    /// Which Retry pills the UI offers: (history, dialogs). A change needs
-    /// a redraw (`shell::chats`).
-    pub(crate) fn retry_offered(&self) -> (bool, bool) {
-        (self.history_gave_up(), self.list.gave_up())
+    /// Whether automatic retries of the topic list's load gave up.
+    pub(crate) fn topics_gave_up(&self) -> bool {
+        self.topics.as_ref().is_some_and(TopicList::gave_up)
+    }
+
+    /// Which Retry pills the UI offers: (history, dialogs, topics). A
+    /// change needs a redraw (`shell::chats`).
+    pub(crate) fn retry_offered(&self) -> (bool, bool, bool) {
+        (
+            self.history_gave_up(),
+            self.list.gave_up(),
+            self.topics_gave_up(),
+        )
     }
 
     /// The user pressed Retry.
@@ -414,9 +608,10 @@ impl ChatShell {
 
     /// The current retry wake-up fired ([`Self::retry_fired`]): runs a
     /// recovery the gap held back once it is due (while the window is still
-    /// active), then resends what is due now, focus if its backoff allows
-    /// and a dialogs page; the caller then redraws, so the frame check
-    /// retries the rest.
+    /// active), then resends what is due now, focus if its backoff allows,
+    /// a dialogs page and the topic list's load (a flood wait's kept load
+    /// once it ended); the caller then redraws, so the frame check retries
+    /// the rest.
     pub(crate) fn retry_wakeup(&mut self, now: Instant, admit: Admit<'_>) -> Result<(), Refused> {
         if self.held_recovery.is_some_and(|at| at <= now) {
             self.held_recovery = None;
@@ -429,7 +624,8 @@ impl ChatShell {
         } else {
             Ok(())
         };
-        focus.and(self.request_dialogs(now, admit))
+        let dialogs = self.request_dialogs(now, admit);
+        focus.and(dialogs).and(self.request_topics(now, admit))
     }
 
     /// Whether core's idea of the window (its state, the live tail) lags

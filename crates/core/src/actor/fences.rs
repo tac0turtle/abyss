@@ -15,7 +15,8 @@
 //!   sends wait in the pending table, and a bootstrap leaves its tail out.
 //! - **Lifting**, whatever the outcome: a changed kind invalidates the
 //!   chat's windows and topic list, deletes its cached messages and emits
-//!   `ForumInvalidated` and `ChatBumped`. An unchanged kind (or an abandoned
+//!   `KindChanged`, `ForumInvalidated` and, for a listed chat, `ChatBumped`
+//!   (an unfenced summary refresh may send its own `ChatBumped` first). An unchanged kind (or an abandoned
 //!   check) invalidates the windows and reloads the open thread's tail,
 //!   whose thread-scoped reconcile alone restores continuity. Waiting
 //!   loads are answered (their views are gone) and held sends go.
@@ -183,6 +184,10 @@ impl<B: Backend> Actor<B> {
         self.forum_kind_changed(chat, after);
         self.note_kind(chat, after);
         self.note_kinds();
+        if after != ForumStatus::Unknown {
+            let forum = after;
+            self.emit(Event::KindChanged { chat, forum }).await;
+        }
         self.emit(Event::ForumInvalidated(chat)).await;
         if let Some(summary) = self.dialogs.get(chat).cloned() {
             self.emit(Event::ChatBumped(summary)).await;

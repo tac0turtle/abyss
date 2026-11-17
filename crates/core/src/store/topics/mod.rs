@@ -30,7 +30,7 @@ pub use tombstones::MAX_TOMBSTONES;
 use self::entry::TopicEntry;
 use self::tombstones::Tombstones;
 use super::dialogs::Rest;
-use crate::model::{Topic, TopicId, TopicOrder, TopicSnapshot};
+use crate::model::{Topic, TopicGone, TopicId, TopicOrder, TopicSnapshot};
 
 /// Most topics a list holds, plus the open topic if it would otherwise be cut.
 pub const MAX_TOPICS_PER_FORUM: usize = 500;
@@ -256,7 +256,10 @@ impl TopicList {
         // discovery again once another topic is open.
         self.open_retry = due::Retry::default();
         let cut = self.enforce_cap();
-        let changes = cut.into_iter().map(ListChange::Removed).collect();
+        let changes = cut
+            .into_iter()
+            .map(|id| ListChange::Removed(id, TopicGone::Evicted))
+            .collect();
         self.checked(&before, changes, Replay::Exact)
     }
 
@@ -474,9 +477,10 @@ impl TopicList {
 
     /// `changes` if a consumer that held the emitted list `before` reaches
     /// the current one by applying them (the [`ListChange`] contract);
-    /// otherwise one reset. For [`Replay::Exact`] operations a divergence is
-    /// a bug: debug builds (and so tests) fail on it, release builds repair
-    /// it with the reset.
+    /// otherwise their semantic removals (`Deleted`, `Hidden`) followed by
+    /// one reset. For [`Replay::Exact`] operations a divergence is a bug:
+    /// debug builds (and so tests) fail on it, release builds repair it
+    /// with the reset.
     fn checked(
         &self,
         before: &[order::Key],
@@ -501,7 +505,16 @@ impl TopicList {
         if replay == Replay::Exact {
             debug_assert_eq!(rows, shown, "incremental replay diverged");
         }
-        vec![self.reset()]
+        changes
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    ListChange::Removed(_, TopicGone::Deleted | TopicGone::Hidden)
+                )
+            })
+            .chain([self.reset()])
+            .collect()
     }
 
     fn reset(&self) -> ListChange {

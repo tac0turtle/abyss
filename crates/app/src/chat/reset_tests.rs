@@ -68,7 +68,7 @@ fn logout_forgets_account_a_before_account_b_opens_the_same_peer() {
     let mut shell = ChatShell::default();
     // Account A: the chat is open, messages shown, a send pending.
     shell.apply(Event::DialogsReset(vec![summary("A's chat")]));
-    shell.select(SHARED_THREAD, &mut admit).unwrap();
+    shell.select(SHARED_THREAD.chat, &mut admit).unwrap();
     shell.apply(tail(1..=20));
     let target = shell.send_target().unwrap().unwrap();
     let local = shell
@@ -93,7 +93,7 @@ fn logout_forgets_account_a_before_account_b_opens_the_same_peer() {
         sent.push(cmd);
         Ok(())
     };
-    shell.select(SHARED_THREAD, &mut admit).unwrap();
+    shell.select(SHARED_THREAD.chat, &mut admit).unwrap();
     assert!(
         matches!(sent.as_slice(), [Command::OpenThread(SHARED_THREAD), ..]),
         "B's chat is opened afresh: {sent:?}"

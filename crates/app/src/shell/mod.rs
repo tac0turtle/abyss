@@ -10,6 +10,7 @@ mod folder_menu;
 mod onboarding;
 mod session;
 mod shutdown;
+mod topic_view;
 mod view;
 
 use abyss_core::StartError;
@@ -30,7 +31,11 @@ actions!(
         /// Our own quit (Cmd+Q), so shutdown can wait for core (plan section 5).
         Quit,
         /// Shows or hides settings (Cmd+comma).
-        Appearance
+        Appearance,
+        /// Back from a forum topic to its topic list, and from a topic list
+        /// to no chat (Cmd+[). Not Escape: that cancels IME composition in
+        /// the composer.
+        ForumBack
     ]
 );
 
@@ -40,6 +45,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", Quit, None),
         KeyBinding::new("cmd-,", Appearance, None),
+        KeyBinding::new("cmd-[", ForumBack, None),
     ]
 }
 

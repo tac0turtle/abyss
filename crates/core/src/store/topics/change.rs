@@ -1,7 +1,7 @@
 //! What the store tells the UI, and how the UI applies it.
 
 use super::order::{Key, slot};
-use crate::model::{MsgId, Topic, TopicId, TopicOrder};
+use crate::model::{MsgId, Topic, TopicGone, TopicId, TopicOrder};
 
 /// What an operation changed in the emitted (shown) list.
 ///
@@ -10,7 +10,12 @@ use crate::model::{MsgId, Topic, TopicId, TopicOrder};
 /// holds exactly the store's emitted list (the store checks this for every
 /// change it emits that isn't a reset, and emits a reset otherwise):
 /// - `Reset`: replace the list and the order.
-/// - `Removed(id)`: drop the topic if present.
+/// - `Removed(id, _)`: drop the topic if present (the reason is for the
+///   consumer's other state, never for the list). It may name a topic the
+///   consumer doesn't hold (a deletion of an unlisted or just-evicted
+///   topic, an open General fetched already hidden): a no-op for the rows.
+///   A deletion or hiding is never only implied by a reset: its `Removed`
+///   comes first, also when a `Reset` follows that omits the topic anyway.
 /// - `Bumped(t)`: replace the copy in place. In `LastActivity` order, an
 ///   unpinned topic whose `last_id` grew then moves to the top of the
 ///   unpinned part (a live message, as in the chat list).
@@ -31,8 +36,9 @@ pub enum ListChange {
     Appended(Vec<Topic>),
     /// Changed by a live event (`TopicBumped`).
     Bumped(Topic),
-    /// Deleted, hidden or cut by the cap (`TopicRemoved`).
-    Removed(TopicId),
+    /// Deleted, hidden or cut by the cap (`TopicRemoved`), as the second
+    /// field says.
+    Removed(TopicId, TopicGone),
 }
 
 impl ListChange {
@@ -76,7 +82,7 @@ pub(super) fn apply_rows<R: Row>(change: &ListChange, order: &mut TopicOrder, ro
             *order = *o;
             *rows = topics.iter().map(R::row).collect();
         }
-        ListChange::Removed(id) => {
+        ListChange::Removed(id, _) => {
             if let Some(at) = find(rows, *id) {
                 rows.remove(at);
             }

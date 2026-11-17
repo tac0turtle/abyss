@@ -10,6 +10,7 @@ use super::*;
 use crate::api::{UserError, WindowState};
 use crate::backend::fake::{Fault, Op, text_message};
 use crate::backend::{BackendError, Update};
+use crate::store::ForumStatus;
 
 fn whole(chat: ChatId) -> ThreadKey {
     ThreadKey::whole(chat)
@@ -37,6 +38,14 @@ fn forum_invalidated(events: &[Event], chat: ChatId) -> bool {
     has(
         events,
         |e| matches!(e, Event::ForumInvalidated(c) if *c == chat),
+    )
+}
+
+/// Whether core announced `chat` as a forum (`KindChanged`).
+fn announced(events: &[Event], chat: ChatId) -> bool {
+    has(
+        events,
+        |e| matches!(e, Event::KindChanged { chat: c, forum: ForumStatus::Forum } if *c == chat),
     )
 }
 
@@ -121,6 +130,7 @@ async fn a_chat_beyond_page_one_becomes_a_forum() {
         .filter(|e| matches!(e, Event::ForumInvalidated(c) if *c == w))
         .count();
     assert_eq!(changes, 1, "{seen:?}");
+    assert!(announced(&seen, w), "unlisted, yet announced: {seen:?}");
     let listed = seen.iter().rev().find_map(|e| match e {
         Event::DialogsReset(v) | Event::DialogsAppended(v) => v.iter().find(|c| c.id == w),
         _ => None,

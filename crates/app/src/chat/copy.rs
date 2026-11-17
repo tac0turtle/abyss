@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use abyss_core::api::{ConnState, SendState};
-use abyss_core::model::{ChatKind, MediaKind};
+use abyss_core::model::{ChatKind, MediaKind, ThreadKey};
 use gpui::SharedString;
 
 use super::sends::{Echo, Phase};
@@ -81,7 +81,44 @@ pub(crate) const BOX_NOT_EMPTY: &str =
 /// Shown once text is back in the message box.
 pub(crate) const PUT_BACK_DONE: &str = "Not sent and not kept. Your text is back in the box.";
 pub(crate) const LINK_COPIED: &str = "Link copied. abyss never opens links from messages.";
-pub(crate) const FORUM_TOPICS: &str = "Topics arrive in a later version.";
+/// A topic thread's way back to its forum's topic list (also Cmd+[).
+pub(crate) const TOPICS_BACK: &str = "‹ Topics";
+pub(crate) const LOADING_TOPICS: &str = "Loading topics…";
+/// The open topic was deleted or hidden.
+pub(crate) const TOPIC_REMOVED: &str =
+    "This topic was deleted or hidden. abyss went back to the topic list.";
+pub(crate) const NO_TOPICS: &str = "No topics yet";
+/// A forum opened after a core stop whose topics were never loaded.
+pub(crate) const TOPICS_UNAVAILABLE: &str = "Topics unavailable: abyss stopped.";
+/// Shown once automatic retries of topics pages gave up.
+pub(crate) const RETRY_TOPICS: &str = "Couldn't load topics · Retry";
+/// A topic row's glyph (owner decision D3: neutral, no icon colours).
+pub(crate) const TOPIC_GLYPH: &str = "#";
+/// Fallback titles for a topic without one (plan section 3).
+pub(crate) const GENERAL_TOPIC: &str = "General";
+pub(crate) const UNTITLED_TOPIC: &str = "Topic";
+pub(crate) const PINNED_TOPIC: &str = "pinned";
+pub(crate) const CLOSED_TOPIC: &str = "closed";
+
+/// Where a discarded draft of `thread` was written: a topic of the chat
+/// (titled `chat`), or the chat.
+pub(crate) fn draft_place(chat: Option<&str>, thread: ThreadKey) -> String {
+    match (chat, thread.topic.is_some()) {
+        (Some(title), true) => format!("a topic of “{title}”"),
+        (Some(title), false) => format!("“{title}”"),
+        (None, true) => "a topic of this chat".to_owned(),
+        (None, false) => "this chat".to_owned(),
+    }
+}
+
+/// A topics load Telegram asked to wait for: it runs again by itself.
+pub(crate) fn topics_flood(seconds: u64) -> SharedString {
+    if seconds == 0 {
+        LOADING_TOPICS.into()
+    } else {
+        format!("Telegram asked to wait. Loading again in {seconds} s.").into()
+    }
+}
 
 pub(crate) fn conn_label(conn: Option<ConnState>) -> SharedString {
     match conn {

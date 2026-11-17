@@ -173,6 +173,7 @@ mod fake {
     use crate::ui::text_input;
 
     mod folder_menu;
+    mod forum;
     mod quit;
 
     fn open(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {
@@ -1035,81 +1036,6 @@ mod fake {
             })
             .unwrap();
         cx.run_until_parked();
-    }
-
-    fn count(sent: &[String], prefix: &str) -> usize {
-        sent.iter().filter(|c| c.starts_with(prefix)).count()
-    }
-
-    /// Until topic lists arrive (stage 2, task 10), a forum's pane shows the
-    /// `FORUM_TOPICS` placeholder instead of a message list and composer:
-    /// selecting it asks core for no whole-chat history (core refuses that
-    /// key), only closes the previous thread, and Enter sends nothing.
-    #[gpui::test]
-    fn a_forum_shows_a_placeholder_and_no_composer(cx: &mut TestAppContext) {
-        let (root, cx, harness) = chats_open(cx, 1);
-        let forum = ChatId {
-            kind: PeerKind::Channel,
-            id: 100,
-        };
-        let mut dialogs = FakeScript::demo(2, 0).dialogs;
-        dialogs.push(abyss_core::model::ChatSummary {
-            kind: abyss_core::model::ChatKind::Supergroup {
-                forum: true,
-                gigagroup: false,
-            },
-            ..summary(forum, "Forum")
-        });
-        harness
-            .events
-            .unbounded_send(Event::DialogsReset(dialogs))
-            .unwrap();
-        cx.run_until_parked();
-        let from = sent_count(&harness);
-        root.update_in(cx, |root, window, cx| {
-            root.with_session(|s, cx| s.select_chat(forum, window, cx), cx);
-        });
-        cx.run_until_parked();
-        assert_eq!(selected(&root, cx), Some(forum));
-        assert_eq!(
-            commands_since(&harness, from),
-            [format!(
-                "{:?}",
-                Command::CloseThread(ThreadKey::whole(user(1)))
-            )],
-            "no OpenThread for the forum"
-        );
-        assert_eq!(
-            read(&root, cx, |s| crate::shell::chat_view::placeholder(
-                &s.shell
-            )),
-            Some(crate::chat::copy::FORUM_TOPICS)
-        );
-        let composer = read(&root, cx, |s| {
-            s.shell
-                .selected_chat()
-                .is_some_and(crate::shell::chat_view::shows_composer)
-        });
-        assert!(!composer, "no composer");
-        assert_eq!(read(&root, cx, |s| s.shell.send_target()), Ok(None));
-        let from = sent_count(&harness);
-        cx.simulate_input("hello");
-        cx.simulate_keystrokes("enter");
-        cx.run_until_parked();
-        assert!(
-            commands_since(&harness, from)
-                .iter()
-                .all(|c| !c.starts_with("SendText")),
-            "nothing sent"
-        );
-
-        // Back to a plain chat: core opens it again.
-        select(&root, cx, 2);
-        assert_eq!(
-            count(&commands_since(&harness, from), "OpenThread"),
-            1,
-            "a plain chat opens"
-        );
     }
 
     #[gpui::test]

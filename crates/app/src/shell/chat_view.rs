@@ -21,7 +21,7 @@ use crate::chat::list::{ArchiveEntry, Shown, SidebarRow};
 use crate::chat::messages::MessageWindow;
 use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
-use crate::chat::{ChatShell, Row, copy, format, is_forum, list as chat_list};
+use crate::chat::{ChatShell, Pane, Row, copy, format, list as chat_list};
 use crate::ui::mark::mark;
 use crate::ui::theme::{self, Depth, Theme, Themes};
 
@@ -53,7 +53,7 @@ fn palette(ink: Rgba, theme: &Theme) -> Palette {
 }
 
 /// Tone tracks age: the depth of something dated `unix`.
-fn depth_of(unix: i64, now: i64, tz: &TimeZone) -> Depth {
+pub(super) fn depth_of(unix: i64, now: i64, tz: &TimeZone) -> Depth {
     Depth::from_days(format::days_ago(unix, now, tz))
 }
 
@@ -63,6 +63,7 @@ pub(super) fn chat_shell(
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
     div()
+        .track_focus(&session.pane_focus)
         .size_full()
         .flex()
         .flex_row()
@@ -266,7 +267,7 @@ fn chat_rows(
     session.dialogs_seen(range.end.saturating_sub(1), window, cx);
     let theme = &Themes::of(window, cx);
     let (tz, now) = (format::local_tz(), format::now());
-    let selected = session.shell.selected();
+    let selected = session.shell.pane().chat();
     let rows = session.shell.list.rows();
     rows.get(range.clone())
         .unwrap_or_default()
@@ -277,7 +278,7 @@ fn chat_rows(
             SidebarRow::Chat(chat) => {
                 let row = ChatRow {
                     chat,
-                    selected: selected.is_some_and(|t| t.chat == chat.id),
+                    selected: selected == Some(chat.id),
                     time: format::list_time(chat.last_date, now, &tz),
                     depth: depth_of(chat.last_date, now, &tz),
                 };
@@ -413,19 +414,23 @@ impl ChatRow<'_> {
     }
 }
 
-/// An unread count: the row's own two colors, swapped.
+/// A chat row's unread count.
 fn unread_badge(chat: &ChatSummary, surface: Rgba, ink: Rgba) -> Option<Div> {
-    (chat.unread > 0).then(|| {
-        let mention = if chat.unread_mentions > 0 { "@ " } else { "" };
-        div()
-            .px_2()
-            .flex_none()
-            .rounded_full()
-            .bg(ink)
-            .text_color(surface)
-            .text_xs()
-            .child(format!("{mention}{}", copy::unread_badge(chat.unread)))
-    })
+    (chat.unread > 0).then(|| count_badge(chat.unread, chat.unread_mentions, surface, ink))
+}
+
+/// An unread count, marked when it holds mentions: the row's own two
+/// colors, swapped.
+pub(super) fn count_badge(unread: u32, mentions: u32, surface: Rgba, ink: Rgba) -> Div {
+    let mention = if mentions > 0 { "@ " } else { "" };
+    div()
+        .px_2()
+        .flex_none()
+        .rounded_full()
+        .bg(ink)
+        .text_color(surface)
+        .text_xs()
+        .child(format!("{mention}{}", copy::unread_badge(unread)))
 }
 
 /// Initials on a faint disc of the row's text color (no images in Stage 1).
@@ -443,13 +448,10 @@ fn avatar(chat: &ChatSummary, ink: Rgba) -> Div {
 }
 
 /// What the open chat's pane shows instead of rows (`None`: its rows).
-/// A forum shows that topics arrive later (it has no whole-chat history).
 /// After a core stop, history never loaded is unavailable, never
 /// "Loading…" (task 6m).
 pub(super) fn placeholder(shell: &ChatShell) -> Option<&'static str> {
-    if shell.selected_chat().is_some_and(is_forum) {
-        Some(copy::FORUM_TOPICS)
-    } else if shell.row_count() > 0 {
+    if shell.row_count() > 0 {
         None
     } else if shell.window().is_some_and(MessageWindow::is_loaded) {
         Some(copy::EMPTY_CHAT)
@@ -466,6 +468,15 @@ fn chat_pane(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> An
             .child(muted(copy::SELECT_CHAT))
             .into_any_element();
     };
+    let header = match session.shell.pane() {
+        Pane::Forum { open: None, .. } => {
+            return super::topic_view::topic_pane(session, chat, theme, cx);
+        }
+        Pane::Forum {
+            open: Some(topic), ..
+        } => super::topic_view::topic_header(session, chat, topic, cx),
+        Pane::Empty | Pane::Thread(_) => pane_header(chat),
+    };
     let window = session.shell.window();
     let body = match placeholder(&session.shell) {
         None => list(session.shell.rows().clone(), cx.processor(message_row))
@@ -481,22 +492,13 @@ fn chat_pane(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> An
     let live = !session.shell.is_stopped();
     let detached = live && window.is_some_and(MessageWindow::has_newer);
     let gave_up = live && session.shell.history_gave_up();
-    // Once this pane is painted, check what the list shows (mark read,
-    // load more, live tail): the layout is then the one on screen.
-    let this = cx.weak_entity();
-    let after_paint = canvas(
-        |_, _, _| {},
-        move |_, (), window, cx| super::chats::after_paint(this, window, cx),
-    )
-    .absolute()
-    .size_0();
     div()
         .flex_1()
         .h_full()
         .min_w_0()
         .flex()
         .flex_col()
-        .child(pane_header(chat))
+        .child(header)
         .child(
             div()
                 .flex_1()
@@ -511,19 +513,26 @@ fn chat_pane(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> An
                         retry_button("retry-history", copy::RETRY_HISTORY, theme, cx).top_3()
                     }),
                 )
-                .child(after_paint),
+                .child(after_paint(cx)),
         )
-        .children(shows_composer(chat).then(|| composer_area(session, chat, theme)))
+        .child(composer_area(session, chat, theme))
         .into_any_element()
 }
 
-/// Whether the pane of `chat` has a composer: a forum has nothing to post
-/// into until its topics arrive.
-pub(super) fn shows_composer(chat: &ChatSummary) -> bool {
-    !is_forum(chat)
+/// Once the pane is painted, checks what the message list shows (mark
+/// read, load more, live tail): the layout is then the one on screen.
+pub(super) fn after_paint(cx: &mut Context<'_, Root>) -> impl IntoElement {
+    let this = cx.weak_entity();
+    canvas(
+        |_, _, _| {},
+        move |_, (), window, cx| super::chats::after_paint(this, window, cx),
+    )
+    .absolute()
+    .size_0()
 }
 
-fn pane_header(chat: &ChatSummary) -> Div {
+/// The chat's title and kind label.
+pub(super) fn pane_header(chat: &ChatSummary) -> Div {
     div()
         .p_3()
         .flex()
@@ -557,7 +566,7 @@ fn jump_button(theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
 /// Offered once automatic retries gave up: retries everything now. An
 /// overlay: rendered after what it covers, it blocks the mouse for the
 /// rows below and stops the click there (task 10e).
-fn retry_button(
+pub(super) fn retry_button(
     id: &'static str,
     label: &'static str,
     theme: &Theme,
@@ -575,7 +584,12 @@ fn retry_button(
 }
 
 /// A small action in `ink` on `fill`.
-fn pill(id: impl Into<ElementId>, label: &'static str, fill: Rgba, ink: Rgba) -> Stateful<Div> {
+pub(super) fn pill(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    fill: Rgba,
+    ink: Rgba,
+) -> Stateful<Div> {
     div()
         .id(id)
         .px_3()

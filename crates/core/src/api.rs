@@ -2,9 +2,9 @@
 
 use crate::model::{
     ChatFolder, ChatId, ChatSummary, FolderEdit, LocalId, Message, MsgId, PeerFolder, ThreadKey,
-    Topic, TopicId, TopicOrder,
+    Topic, TopicGone, TopicId, TopicOrder,
 };
-use crate::store::{TopicsGen, ViewGen};
+use crate::store::{ForumStatus, TopicsGen, ViewGen};
 
 pub use crate::auth_types::{
     ApiCredentials, ApiHash, ApiHashError, ApiId, ApiIdError, AuthState, CodeDelivery,
@@ -404,14 +404,24 @@ pub enum Event {
         topic: Topic,
     },
     /// A topic left the shown list: deleted (then its open thread is
-    /// invalidated), hidden, or cut by the cap.
+    /// invalidated), hidden, or cut by the cap, as `reason` says.
     TopicRemoved {
         chat: ChatId,
         topic: TopicId,
+        reason: TopicGone,
     },
     /// The forum's topic list was dropped (reconcile, a forum flag change):
     /// drop the copy and wait for `TopicsReset`.
     ForumInvalidated(ChatId),
+    /// A chat's forum flag changed (`forum` is `Forum` or `NotForum`),
+    /// whether or not the chat list holds it: a shown chat is shown the
+    /// new way. It precedes its own `ForumInvalidated`; summaries carrying
+    /// the kind (`ChatBumped`, dialogs pages) may also arrive on their own,
+    /// before or after it.
+    KindChanged {
+        chat: ChatId,
+        forum: ForumStatus,
+    },
     Edited(Message),
     Deleted {
         chat: ChatId,

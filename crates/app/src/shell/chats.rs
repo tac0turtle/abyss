@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use abyss_core::SendError;
 use abyss_core::api::{Command, ConnState, Event, LoadTarget, SendState, UserError, WindowState};
-use abyss_core::model::{ChatId, LocalId, ThreadKey};
+use abyss_core::model::{ChatId, LocalId, ThreadKey, TopicId};
 use gpui::{App, Context, Focusable, Subscription, WeakEntity, Window};
 
 use super::Root;
@@ -16,7 +16,8 @@ use super::auth::AuthView;
 use super::bridge::SharedCore;
 use super::session::Session;
 use crate::chat::copy as chat_copy;
-use crate::chat::{ChatShell, Refused, format};
+use crate::chat::discarded::Obsolete;
+use crate::chat::{Admit, ChatShell, Pane, Refused, Stale, format};
 use crate::ui::copy;
 
 /// How often a flood-wait countdown redraws.
@@ -145,6 +146,7 @@ impl Session {
         self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
             s.retry_wakeup(now, admit)
         });
+        self.fix_pane(window, cx);
         cx.notify();
     }
 
@@ -154,7 +156,8 @@ impl Session {
         self.shell.retry_loads();
         let now = cx.background_executor().now();
         self.drive(OnRefusal::Notice, window, cx, |s, admit| {
-            s.request_dialogs(now, admit)
+            let dialogs = s.request_dialogs(now, admit);
+            dialogs.and(s.request_topics(now, admit))
         });
         // Redraw, so the frame check asks for history.
         cx.notify();
@@ -184,6 +187,9 @@ impl Session {
             Event::SendState {
                 state: SendState::FloodWait { .. },
                 ..
+            } | Event::LoadEnded {
+                target: LoadTarget::Topics(_),
+                error: Some(UserError::FloodWait { .. }),
             }
         );
         let online = matches!(event, Event::Connection(ConnState::Online));
@@ -197,11 +203,24 @@ impl Session {
                         ..
                     }
             );
+        let topics_paged = online
+            || matches!(
+                event,
+                Event::TopicsPaging { .. }
+                    | Event::LoadEnded {
+                        target: LoadTarget::Topics(_),
+                        ..
+                    }
+            );
+        let obsolete = Obsolete::of(&event);
         let now = cx.background_executor().now();
         if let Event::LoadEnded { target, error } = event {
             self.shell.load_ended(target, error, now);
         } else {
             self.shell.apply(event);
+        }
+        if let Some(why) = obsolete {
+            self.discard_obsolete(why, window, cx);
         }
         if folders {
             self.recheck_folder_menu(window, cx);
@@ -217,11 +236,19 @@ impl Session {
                 s.request_dialogs(now, admit)
             });
         }
+        // Likewise a topic list showing no row, or one whose end is on
+        // screen while a page arrives.
+        if topics_paged {
+            self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
+                s.request_topics(now, admit)
+            });
+        }
         if online {
             // Back online (a fresh trigger): redraw, so the frame check asks
             // for what gave up meanwhile.
             cx.notify();
         }
+        self.fix_pane(window, cx);
         self.schedule_retry(window, cx);
     }
 
@@ -232,6 +259,7 @@ impl Session {
         self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
             s.frame_seen(seen, now, admit)
         });
+        self.fix_pane(window, cx);
     }
 
     fn on_activation(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
@@ -256,37 +284,183 @@ impl Session {
         }
     }
 
+    /// A chat list row: a forum shows its topic list, any other chat its
+    /// messages.
     pub(super) fn select_chat(
         &mut self,
         chat: ChatId,
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        // A chat row opens the whole chat; a forum shows a placeholder
-        // until its topic list arrives (stage 2, task 10).
-        let thread = ThreadKey::whole(chat);
+        let forum = self.shell.list.get(chat).is_some_and(crate::chat::is_forum);
+        let to = (!forum).then(|| ThreadKey::whole(chat));
+        self.navigate(to, window, cx, |s, admit| s.select(chat, admit));
+    }
+
+    /// A topic row of the shown forum.
+    pub(super) fn select_topic(
+        &mut self,
+        topic: TopicId,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        let Pane::Forum { chat, .. } = self.shell.pane() else {
+            return;
+        };
+        let to = Some(ThreadKey {
+            chat,
+            topic: Some(topic),
+        });
+        self.navigate(to, window, cx, |s, admit| s.open_topic(topic, admit));
+    }
+
+    /// "‹ Topics" and Cmd+[: from a topic to its forum's list, from a
+    /// topic list to no chat.
+    pub(super) fn back_from_forum(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if !matches!(self.shell.pane(), Pane::Forum { .. }) {
+            return;
+        }
+        self.navigate(None, window, cx, ChatShell::back);
+    }
+
+    /// Changes the pane with `f`, whose thread afterwards is `to` (none: no
+    /// messages shown). The composer's text stays the previous thread's
+    /// draft, and the new thread's comes back; a switch that would need a
+    /// draft slot past the bound is refused (task 6l).
+    fn navigate(
+        &mut self,
+        to: Option<ThreadKey>,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+        f: impl FnOnce(&mut ChatShell, Admit<'_>) -> Result<(), Refused>,
+    ) {
         let from = self.shell.selected();
-        if from != Some(thread) {
+        if from != to {
             let text = self.composer.read(cx).text().to_owned();
-            if !self.shell.can_switch(thread, &text) {
+            if !self.shell.can_switch(to, &text) {
                 // Never drop a draft (task 6l): the chat and its text stay.
                 self.show_notice(chat_copy::TOO_MANY_DRAFTS.into(), window, cx);
                 return;
             }
         }
-        let opened = self.drive(OnRefusal::Notice, window, cx, |s, admit| {
-            s.select(thread, admit)
+        if self.switch_pane(OnRefusal::Notice, window, cx, f) {
+            let shown = self.shell.selected();
+            if from != shown {
+                self.swap_draft(from, shown, window, cx);
+            }
+        }
+    }
+
+    /// Changes the pane with `f` and focuses the new pane (the caller
+    /// moves the composer's text). Returns whether core admitted the
+    /// change; a refusal redraws only what it changed (`drive`, a notice).
+    fn switch_pane(
+        &mut self,
+        on_refusal: OnRefusal,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+        f: impl FnOnce(&mut ChatShell, Admit<'_>) -> Result<(), Refused>,
+    ) -> bool {
+        if self.drive(on_refusal, window, cx, f).is_none() {
+            return false;
+        }
+        let shown = self.shell.selected();
+        if self.auth == AuthView::SignedIn {
+            let focus = match shown {
+                Some(_) => self.composer.focus_handle(cx),
+                None => self.pane_focus.clone(),
+            };
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    /// Brings the pane in line with core when it no longer fits (a chat's
+    /// kind changed, the open topic was removed). It only moves the pane:
+    /// the event that made threads unsendable already discarded their
+    /// drafts (`discard_obsolete`); text typed into the old thread since
+    /// joins them, so nothing is stashed and no draft slot is needed. The
+    /// new thread's own draft comes back. A refusal waits out a bounded
+    /// backoff, and the retry wake-up tries again.
+    fn fix_pane(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        let now = cx.background_executor().now();
+        let Some(stale) = self.shell.fix_due(now) else {
+            return;
+        };
+        let (from, pane) = (self.shell.selected(), self.shell.pane());
+        let fixed = self.switch_pane(OnRefusal::Quiet, window, cx, |s, admit| {
+            s.fix_pane(now, admit)
         });
-        if opened.is_some() && from != Some(thread) {
-            self.swap_draft(from, thread, window, cx);
+        if !fixed {
+            return;
         }
-        let composer = self
-            .shell
-            .selected_chat()
-            .is_some_and(super::chat_view::shows_composer);
-        if opened.is_some() && composer && self.auth == AuthView::SignedIn {
-            window.focus(&self.composer.focus_handle(cx), cx);
+        // Text typed into the old thread: discarded if the change made it
+        // unsendable; a hidden topic's is its draft, unless no slot is free.
+        let typed = self.composer.update(cx, |c, cx| c.take_text(window, cx));
+        if let Some(key) = from
+            && !typed.is_empty()
+        {
+            let lost = match Obsolete::of_stale(stale, pane) {
+                Some(why) => Some((why, typed)),
+                None => self
+                    .shell
+                    .stash_draft(key, typed)
+                    .err()
+                    .map(|text| (Obsolete::HiddenNoRoom(key), text)),
+            };
+            if let Some((why, text)) = lost {
+                self.note_discarded(why, vec![(key, text)], cx);
+            }
         }
+        // The new thread's own draft comes back into the box, emptied
+        // above; should it not fit, it stays stashed.
+        if let Some(to) = self.shell.selected()
+            && let Some(draft) = self.shell.take_draft(to)
+            && !self
+                .composer
+                .update(cx, |c, cx| c.put_text(&draft, window, cx))
+        {
+            drop(self.shell.stash_draft(to, draft));
+        }
+        if matches!(stale, Stale::TopicRemoved(_)) {
+            self.show_notice(chat_copy::TOPIC_REMOVED.into(), window, cx);
+        }
+    }
+
+    /// `why` made threads unsendable, whatever the pane shows: their
+    /// stashed drafts go, and so does the box's text if it is one of
+    /// theirs, all into the discarded-drafts notice.
+    fn discard_obsolete(&mut self, why: Obsolete, window: &mut Window, cx: &mut Context<'_, Root>) {
+        let mut lost = self.shell.discard_drafts(|key| why.covers(key));
+        if let Some(open) = self.shell.selected().filter(|key| why.covers(*key)) {
+            let typed = self.composer.update(cx, |c, cx| c.take_text(window, cx));
+            if !typed.is_empty() {
+                lost.push((open, typed));
+            }
+        }
+        self.note_discarded(why, lost, cx);
+    }
+
+    /// Adds `lost` drafts (oldest first) to the discarded-drafts notice,
+    /// each labelled with where it was written.
+    fn note_discarded(
+        &mut self,
+        why: Obsolete,
+        lost: Vec<(ThreadKey, String)>,
+        cx: &mut Context<'_, Root>,
+    ) {
+        if lost.is_empty() {
+            return;
+        }
+        let labelled = lost
+            .into_iter()
+            .map(|(key, text)| {
+                let title = self.shell.list.get(key.chat).map(|c| c.title.as_str());
+                (chat_copy::draft_place(title, key).into(), text)
+            })
+            .collect();
+        self.discarded.add(why, labelled);
         cx.notify();
     }
 
@@ -350,19 +524,24 @@ impl Session {
     fn swap_draft(
         &mut self,
         from: Option<ThreadKey>,
-        to: ThreadKey,
+        to: Option<ThreadKey>,
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        let incoming = self.shell.take_draft(to);
+        let incoming = to.and_then(|to| self.shell.take_draft(to));
         let text = self.composer.update(cx, |c, cx| c.take_text(window, cx));
-        let kept = from.map_or(Ok(()), |from| self.shell.stash_draft(from, text));
-        debug_assert!(kept.is_ok(), "room was checked before the switch");
-        // Checked above; should it fail, the text stays in the box rather
-        // than be lost (the incoming draft then stays stashed).
+        // A pane without a thread shows no box, so it holds no text.
+        let kept = match from {
+            Some(from) => self.shell.stash_draft(from, text),
+            None if text.is_empty() => Ok(()),
+            None => Err(text),
+        };
+        // Room was checked before the switch (`navigate`); should it fail,
+        // the text stays in the box rather than be lost (the incoming draft
+        // then stays stashed).
         let restore = match (kept, incoming) {
             (Err(text), incoming) => {
-                if let Some(draft) = incoming {
+                if let (Some(to), Some(draft)) = (to, incoming) {
                     drop(self.shell.stash_draft(to, draft));
                 }
                 text
@@ -458,6 +637,30 @@ impl Session {
             s.request_dialogs(now, admit)
         });
         cx.notify();
+    }
+
+    /// Topic list row `last_visible` was rendered: maybe load the next
+    /// page. Called during render, so the request goes out after it.
+    pub(super) fn topics_seen(
+        &mut self,
+        last_visible: usize,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        let now = cx.background_executor().now();
+        if !self.shell.topics_seen(last_visible, now) {
+            return;
+        }
+        cx.defer_in(window, move |root, window, cx| {
+            root.with_session(
+                |s, cx| {
+                    s.drive(OnRefusal::Quiet, window, cx, |s, admit| {
+                        s.request_topics(now, admit)
+                    })
+                },
+                cx,
+            );
+        });
     }
 
     /// Chat list row `last_visible` was rendered: maybe load the next page.

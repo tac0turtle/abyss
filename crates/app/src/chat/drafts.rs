@@ -43,6 +43,19 @@ impl Drafts {
         Ok(())
     }
 
+    /// Drops the drafts of threads that can no longer be sent to
+    /// (`obsolete`), and returns them, oldest first.
+    pub(crate) fn discard(
+        &mut self,
+        obsolete: impl Fn(ThreadKey) -> bool,
+    ) -> Vec<(ThreadKey, String)> {
+        let (gone, kept) = std::mem::take(&mut self.list)
+            .into_iter()
+            .partition(|(t, _)| obsolete(*t));
+        self.list = kept;
+        gone.into()
+    }
+
     /// Whether switching from `from` (its box holding `text`) to `to` can
     /// keep every draft: `to`'s draft leaves first (freeing its slot), and
     /// `from`'s replaces its own; an empty box stashes nothing.
