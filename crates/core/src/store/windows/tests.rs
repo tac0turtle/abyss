@@ -374,3 +374,190 @@ fn the_open_window_alone_over_budget_trims_itself() {
     assert!(w.get(ThreadKey::whole(a)).is_some(), "trimmed, not evicted");
     assert!(w.total_bytes() <= MAX_STORE_BYTES);
 }
+
+/// Windows keyed by thread (plan stage 2, section 11): random histories of
+/// a forum's topics, its whole-chat thread and another chat, with messages
+/// that sometimes name another thread than the window they are offered to.
+mod threads {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::model::TopicId;
+
+    /// A forum (a channel) and a private chat.
+    fn forum() -> ChatId {
+        chat(PeerKind::Channel, 9)
+    }
+
+    /// The threads under test: topics 1–3 and the whole chat of the forum,
+    /// and the private chat.
+    fn key(n: usize) -> ThreadKey {
+        match n {
+            0..=2 => ThreadKey {
+                chat: forum(),
+                topic: TopicId::try_from(i32::try_from(n).unwrap() + 1).ok(),
+            },
+            3 => ThreadKey::whole(forum()),
+            _ => ThreadKey::whole(user(1)),
+        }
+    }
+
+    const KEYS: usize = 5;
+
+    fn post(thread: ThreadKey, id: i32) -> Message {
+        Message {
+            thread,
+            ..msg(thread.chat, id, "")
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Open(usize),
+        Close(usize),
+        Invalidate(usize),
+        /// A page for window `.0` whose messages name thread `.1`.
+        Prepend(usize, usize, Vec<i32>),
+        Append(usize, usize, Vec<i32>),
+        Upsert(usize, usize, i32),
+        Replace(usize, usize, i32),
+        Delete(usize, Vec<i32>),
+        LoseContinuity(usize),
+        Contiguous(usize),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        let k = 0..KEYS;
+        let ids = prop::collection::vec(1..200i32, 0..12);
+        prop_oneof![
+            k.clone().prop_map(Op::Open),
+            k.clone().prop_map(Op::Close),
+            k.clone().prop_map(Op::Invalidate),
+            (k.clone(), k.clone(), ids.clone()).prop_map(|(w, t, v)| Op::Prepend(w, t, v)),
+            (k.clone(), k.clone(), ids.clone()).prop_map(|(w, t, v)| Op::Append(w, t, v)),
+            (k.clone(), k.clone(), 1..200i32).prop_map(|(w, t, id)| Op::Upsert(w, t, id)),
+            (k.clone(), k.clone(), 1..200i32).prop_map(|(w, t, id)| Op::Replace(w, t, id)),
+            (k.clone(), ids).prop_map(|(c, v)| Op::Delete(c, v)),
+            k.clone().prop_map(Op::LoseContinuity),
+            k.prop_map(Op::Contiguous),
+        ]
+    }
+
+    /// Every window's ids, by thread.
+    fn snapshot(w: &Windows) -> Vec<(ThreadKey, Vec<MsgId>, bool)> {
+        w.threads()
+            .filter_map(|t| {
+                let win = w.get(t)?;
+                let ids = win.messages().iter().map(|m| m.id).collect();
+                Some((t, ids, win.cache_contiguous()))
+            })
+            .collect()
+    }
+
+    fn apply(w: &mut Windows, op: &Op) {
+        let page = |t: usize, ids: &[i32]| -> Vec<Message> {
+            ids.iter().map(|id| post(key(t), *id)).collect()
+        };
+        let view = |w: &Windows, n: usize| w.get(key(n)).map(Window::view_gen);
+        match op {
+            Op::Open(n) => drop(w.open(key(*n))),
+            Op::Close(n) => w.close(key(*n)),
+            Op::Invalidate(n) => drop(w.invalidate(key(*n))),
+            Op::Prepend(n, t, ids) => {
+                if let Some(g) = view(w, *n) {
+                    w.prepend(key(*n), g, more(page(*t, ids))).unwrap();
+                }
+            }
+            Op::Append(n, t, ids) => {
+                if let Some(g) = view(w, *n) {
+                    w.append_newer(key(*n), g, last(page(*t, ids))).unwrap();
+                }
+            }
+            Op::Upsert(n, t, id) => drop(w.upsert(key(*n), post(key(*t), *id))),
+            Op::Replace(n, t, id) => drop(w.replace(key(*n), post(key(*t), *id))),
+            Op::Delete(n, ids) => {
+                let ids: Vec<MsgId> = ids.iter().map(|id| MsgId(*id)).collect();
+                w.delete(key(*n).chat, &ids);
+            }
+            Op::LoseContinuity(n) => w.lose_continuity(key(*n).chat),
+            Op::Contiguous(n) => w.set_cache_contiguous(key(*n)),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Every message in a window has `thread == key` after any sequence
+        /// of loads, live messages and edits; a message offered to another
+        /// thread's window is rejected (never stored). A chat-level delete
+        /// removes the ids from every thread window of that chat and from
+        /// no other chat, and losing continuity is per chat too.
+        #[test]
+        fn every_window_holds_only_its_thread(ops in prop::collection::vec(op(), 1..60)) {
+            let mut w = Windows::default();
+            for op in &ops {
+                let before = snapshot(&w);
+                apply(&mut w, op);
+                for t in w.threads() {
+                    let win = w.get(t).unwrap();
+                    prop_assert!(win.messages().iter().all(|m| m.thread == t), "{op:?}");
+                }
+                match op {
+                    Op::Prepend(n, t, _)
+                    | Op::Append(n, t, _)
+                    | Op::Upsert(n, t, _)
+                    | Op::Replace(n, t, _)
+                        if n != t =>
+                    {
+                        prop_assert_eq!(snapshot(&w), before.clone(), "rejected: {:?}", op);
+                    }
+                    Op::Delete(n, ids) => {
+                        let chat = key(*n).chat;
+                        for (t, held, contiguous) in snapshot(&w) {
+                            let was = before.iter().find(|(b, _, _)| *b == t).unwrap();
+                            if t.chat == chat {
+                                prop_assert!(held.iter().all(|id| !ids.contains(&id.0)));
+                                let kept: Vec<MsgId> = was.1.iter().copied()
+                                    .filter(|id| !ids.contains(&id.0)).collect();
+                                prop_assert_eq!(held, kept);
+                            } else {
+                                prop_assert_eq!(&held, &was.1, "another chat");
+                            }
+                            prop_assert_eq!(contiguous, was.2);
+                        }
+                    }
+                    Op::LoseContinuity(n) => {
+                        let chat = key(*n).chat;
+                        for (t, _, contiguous) in snapshot(&w) {
+                            let was = before.iter().find(|(b, _, _)| *b == t).unwrap();
+                            prop_assert_eq!(contiguous, was.2 && t.chat != chat);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        /// `holder` finds the window of the asked chat that holds an id,
+        /// the preferred thread first.
+        #[test]
+        fn holder_finds_the_copy_in_its_chat(ops in prop::collection::vec(op(), 1..40), id in 1..200i32, n in 0..KEYS) {
+            let mut w = Windows::default();
+            for op in &ops {
+                apply(&mut w, op);
+            }
+            let prefer = key(n);
+            let holding: Vec<ThreadKey> = w
+                .threads()
+                .filter(|t| t.chat == prefer.chat && w.get(*t).unwrap().get(MsgId(id)).is_some())
+                .collect();
+            match w.holder(prefer, MsgId(id)) {
+                Some(t) => {
+                    prop_assert!(holding.contains(&t));
+                    prop_assert!(!holding.contains(&prefer) || t == prefer);
+                }
+                None => prop_assert!(holding.is_empty()),
+            }
+        }
+    }
+}

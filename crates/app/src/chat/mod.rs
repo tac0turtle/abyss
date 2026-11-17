@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use abyss_core::api::{ConnState, Event, LoadTarget, UserError, WindowState};
-use abyss_core::model::{ChatId, ChatSummary, Message, MsgId, ThreadKey};
+use abyss_core::model::{ChatId, ChatKind, ChatSummary, Message, MsgId, ThreadKey};
 use abyss_core::store::ViewGen;
 use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, Task, px};
 
@@ -197,6 +197,12 @@ impl ChatShell {
 
 #[cfg(test)]
 mod reset_tests;
+
+/// Whether `chat` is a forum, whose pane shows a placeholder until topic
+/// lists arrive (stage 2, task 10).
+pub(crate) fn is_forum(chat: &ChatSummary) -> bool {
+    matches!(chat.kind, ChatKind::Supergroup { forum: true, .. })
+}
 
 impl ChatShell {
     pub(crate) fn selected(&self) -> Option<ThreadKey> {

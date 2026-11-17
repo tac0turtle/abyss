@@ -345,6 +345,7 @@ async fn stale_generation_completions_are_dropped() {
                 dir: HistoryDir::Tail,
                 query: HistoryQuery::Tail,
                 floor: None,
+                since: actor.windows.continuity_mark(),
                 res: Ok(HistoryPage {
                     messages,
                     has_more: false,

@@ -21,5 +21,6 @@ pub use topics::{
     TopicList, Topics, TopicsGen, UnreadTrigger,
 };
 pub use windows::{
-    Change, MAX_MESSAGES_PER_CHAT, MAX_STORE_BYTES, MAX_WINDOWS, Stale, ViewGen, Window, Windows,
+    Change, ContinuityMark, MAX_MESSAGES_PER_CHAT, MAX_STORE_BYTES, MAX_WINDOWS, Stale, ViewGen,
+    Window, Windows,
 };

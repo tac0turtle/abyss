@@ -22,6 +22,13 @@ pub const MAX_STORE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ViewGen(pub u64);
 
+/// A reading of the windows' continuity clock, taken when a tail is
+/// requested. A tail may restore its window's cache continuity only if the
+/// window lost none since ([`Windows::may_restore`]): an older tail's
+/// snapshot can predate the messages that bypassed the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ContinuityMark(u64);
+
 /// The completion belongs to a view that was closed, evicted or replaced.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Stale;
@@ -48,6 +55,9 @@ pub struct Window {
     /// may be served from it. Lives and dies with the window, so it is bounded
     /// by [`MAX_WINDOWS`]; cleared on reopen and invalidation.
     cache_contiguous: bool,
+    /// The continuity clock's value when the window last lost continuity
+    /// ([`Windows::lose_continuity`]). Kept across invalidation.
+    lost_at: u64,
 }
 
 impl Window {
@@ -59,6 +69,7 @@ impl Window {
             has_older: true,
             has_newer: false,
             cache_contiguous: false,
+            lost_at: 0,
         }
     }
 
@@ -67,7 +78,10 @@ impl Window {
     }
 
     fn reset(&mut self, view_gen: ViewGen) {
-        *self = Self::new(view_gen);
+        *self = Self {
+            lost_at: self.lost_at,
+            ..Self::new(view_gen)
+        };
     }
 
     pub fn view_gen(&self) -> ViewGen {
@@ -139,6 +153,8 @@ pub struct Windows {
     account_index: HashMap<MsgId, ChatId>,
     /// Bumped whenever the set or recency order of windowed threads changes.
     rev: u64,
+    /// Advanced by every [`Windows::lose_continuity`] (see [`ContinuityMark`]).
+    continuity_clock: u64,
     /// The thread whose view is open (set by [`Windows::open`], cleared by
     /// [`Windows::close`]). The byte budget never evicts its window: the
     /// actor's open view, its loads and what they owe the UI all rely on
@@ -204,6 +220,49 @@ impl Windows {
     /// The thread whose view is open, if any (see [`Windows::open`]).
     pub fn shown(&self) -> Option<ThreadKey> {
         self.shown
+    }
+
+    /// Every window of `chat` loses [`Window::cache_contiguous`]: a live
+    /// message of the chat bypassed them, so their cache may miss it (plan
+    /// stage 2, section 6.6). Only a tail of the thread requested after this
+    /// may set it again ([`Self::may_restore`]).
+    pub fn lose_continuity(&mut self, chat: ChatId) {
+        // Saturates: once exhausted, `may_restore` refuses every mark (fail closed).
+        self.continuity_clock = self.continuity_clock.saturating_add(1);
+        let now = self.continuity_clock;
+        for (_, w) in self.by_thread.iter_mut().filter(|(t, _)| t.chat == chat) {
+            w.cache_contiguous = false;
+            w.lost_at = now;
+        }
+    }
+
+    /// The continuity clock now, for a tail being requested.
+    pub fn continuity_mark(&self) -> ContinuityMark {
+        ContinuityMark(self.continuity_clock)
+    }
+
+    /// Whether a tail of `thread` requested at `since` may restore its
+    /// cache continuity: the window exists and lost none after `since`.
+    pub fn may_restore(&self, thread: ThreadKey, since: ContinuityMark) -> bool {
+        self.continuity_clock != u64::MAX
+            && self
+                .by_thread
+                .get(&thread)
+                .is_some_and(|w| w.lost_at <= since.0)
+    }
+
+    /// The thread whose window holds message `id` of `prefer.chat`:
+    /// `prefer` when its window does, else any other window of that chat
+    /// (ids are per chat, so normally only one thread holds it).
+    pub fn holder(&self, prefer: ThreadKey, id: MsgId) -> Option<ThreadKey> {
+        let holds = |t: &ThreadKey| self.by_thread.get(t).is_some_and(|w| w.get(id).is_some());
+        if holds(&prefer) {
+            return Some(prefer);
+        }
+        self.lru
+            .iter()
+            .copied()
+            .find(|t| t.chat == prefer.chat && holds(t))
     }
 
     /// Marks `thread`'s disk cache as contiguous with the live tail (see
@@ -323,7 +382,7 @@ impl Windows {
         let w = self.current(thread, view_gen)?;
         let bound = w.oldest();
         w.has_older = page.has_more;
-        let older = sorted_unique(page.messages, |id| bound.is_none_or(|o| id < o));
+        let older = sorted_unique(thread, page.messages, |id| bound.is_none_or(|o| id < o));
         let mut change = Change::default();
         for m in older.into_iter().rev() {
             self.insert_sorted(thread, 0, m, &mut change);
@@ -349,7 +408,7 @@ impl Windows {
         let bound = w.oldest();
         let room = MAX_MESSAGES_PER_CHAT.saturating_sub(w.messages.len());
         let more = page.has_more;
-        let older = sorted_unique(page.messages, |id| bound.is_none_or(|o| id < o));
+        let older = sorted_unique(thread, page.messages, |id| bound.is_none_or(|o| id < o));
         let mut change = Change::default();
         let mut fitted = true;
         for m in older.into_iter().rev() {
@@ -379,7 +438,7 @@ impl Windows {
         let w = self.current(thread, view_gen)?;
         let bound = w.newest();
         w.has_newer = page.has_more;
-        let newer = sorted_unique(page.messages, |id| bound.is_none_or(|n| id > n));
+        let newer = sorted_unique(thread, page.messages, |id| bound.is_none_or(|n| id > n));
         let mut change = Change::default();
         for m in newer {
             let pos = self.by_thread.get(&thread).map_or(0, |w| w.messages.len());
@@ -403,6 +462,9 @@ impl Windows {
     /// messages are dropped.
     pub fn upsert(&mut self, thread: ThreadKey, msg: Message) -> Change {
         let mut change = Change::default();
+        if !keyed(thread, &msg) {
+            return change;
+        }
         let Some(w) = self.by_thread.get(&thread) else {
             return change;
         };
@@ -425,6 +487,9 @@ impl Windows {
     /// an edit of a message outside the window must not create a hole in
     /// history. Returns whether it applied.
     pub fn replace(&mut self, thread: ThreadKey, msg: Message) -> bool {
+        if !keyed(thread, &msg) {
+            return false;
+        }
         let Some(w) = self.by_thread.get_mut(&thread) else {
             return false;
         };
@@ -496,9 +561,27 @@ impl Windows {
     }
 }
 
-/// Sorts `page` by id, drops duplicates and every message whose id fails `keep`.
-fn sorted_unique(mut page: Vec<Message>, keep: impl Fn(MsgId) -> bool) -> Vec<Message> {
-    page.retain(|m| keep(m.id));
+/// Whether `m` may enter `thread`'s window: its `thread` is the window's
+/// key. A message of another thread is rejected, and the rejection logged.
+fn keyed(thread: ThreadKey, m: &Message) -> bool {
+    let keyed = m.thread == thread;
+    if !keyed {
+        tracing::warn!(
+            id = m.id.0,
+            "a message of another thread was kept out of a window"
+        );
+    }
+    keyed
+}
+
+/// Sorts `page` by id, drops duplicates, messages of another thread than
+/// `thread` (see [`keyed`]) and every message whose id fails `keep`.
+fn sorted_unique(
+    thread: ThreadKey,
+    mut page: Vec<Message>,
+    keep: impl Fn(MsgId) -> bool,
+) -> Vec<Message> {
+    page.retain(|m| keyed(thread, m) && keep(m.id));
     page.sort_unstable_by_key(|m| m.id);
     page.dedup_by_key(|m| m.id);
     page

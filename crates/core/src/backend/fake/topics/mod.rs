@@ -49,8 +49,9 @@ fn require_forum(s: &State, chat: ChatId) -> Result<(), BackendError> {
 }
 
 /// Whether `m` belongs to `thread` once normalized. A whole-chat key
-/// (`topic: None`) takes every message of the chat, which is how core still
-/// shows a forum until it opens topic threads (plan task 7).
+/// (`topic: None`) takes every message of the chat, as the server's
+/// `getHistory` does for a forum; core keeps only the messages `route`
+/// files under the key it asked for.
 fn belongs(m: &Message, thread: ThreadKey, status: ForumStatus) -> bool {
     m.thread.chat == thread.chat
         && (thread.topic.is_none()

@@ -29,17 +29,26 @@ pub(crate) type Admit<'a> = &'a mut dyn FnMut(Command) -> Result<(), Refused>;
 impl ChatShell {
     /// Opens `thread` once core admitted `OpenThread` (core closes the
     /// previous one). Refused, the previous thread stays selected.
+    ///
+    /// A forum has no whole-chat history (core refuses that key): until
+    /// its topic list arrives (stage 2, task 10) it shows a placeholder, so
+    /// only the previous thread is closed, and no window is kept for it.
     pub(crate) fn select(&mut self, thread: ThreadKey, admit: Admit<'_>) -> Result<(), Refused> {
         if self.selected == Some(thread) {
             return Ok(());
         }
+        let forum = self.list.get(thread.chat).is_some_and(super::is_forum);
         // Core stopped (task 6l): local only, so the thread's stranded
         // echoes and draft stay reachable; nothing is asked of core.
         if self.core == CoreState::Running {
-            admit(Command::OpenThread(thread))?;
+            match (forum, self.selected) {
+                (false, _) => admit(Command::OpenThread(thread))?,
+                (true, Some(prev)) => admit(Command::CloseThread(prev))?,
+                (true, None) => {}
+            }
         }
         self.selected = Some(thread);
-        self.window = Some(MessageWindow::new(thread));
+        self.window = (!forum).then(|| MessageWindow::new(thread));
         self.revealed.clear();
         self.read_sent = None;
         // The user's choice: frame commands for the new thread start afresh.
@@ -56,10 +65,10 @@ impl ChatShell {
         if self.core == CoreState::Stopped {
             return Ok(None);
         }
-        let Some(thread) = self
-            .selected
-            .filter(|_| self.selected_chat().is_some_and(|c| c.can_send))
-        else {
+        let Some(thread) = self.selected.filter(|_| {
+            self.selected_chat()
+                .is_some_and(|c| c.can_send && !super::is_forum(c))
+        }) else {
             return Ok(None);
         };
         if self.echoes.is_full() {

@@ -258,7 +258,8 @@ impl Session {
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        // A chat row opens the whole chat (forum topics are Stage 2).
+        // A chat row opens the whole chat; a forum shows a placeholder
+        // until its topic list arrives (stage 2, task 10).
         let thread = ThreadKey::whole(chat);
         let from = self.shell.selected();
         if from != Some(thread) {
@@ -275,7 +276,11 @@ impl Session {
         if opened.is_some() && from != Some(thread) {
             self.swap_draft(from, thread, window, cx);
         }
-        if opened.is_some() && self.auth == AuthView::SignedIn {
+        let composer = self
+            .shell
+            .selected_chat()
+            .is_some_and(super::chat_view::shows_composer);
+        if opened.is_some() && composer && self.auth == AuthView::SignedIn {
             window.focus(&self.composer.focus_handle(cx), cx);
         }
         cx.notify();

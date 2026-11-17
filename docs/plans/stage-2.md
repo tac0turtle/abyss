@@ -1100,3 +1100,12 @@ Follow-ups (not Stage 2 tasks):
 | 1 (ready after fixes) | P2: flood deadline not rechecked at admission, so a queued topics job could start during a flood wait; P2: by-id panic path skipped the 1 s interval. P3: an unlisted open topic retried ~1/s forever | Admission skips topics jobs during the wait (order kept, wake at deadline); shared `by_id_ended`; retry record with 1→30 s backoff, reset on open/refresh. Accepted deviations: list reducers for live updates pulled forward from task 8, receipt-time stamping, interval from call end |
 | 2 (changes requested) | P2: discovery lost when the open topic changed. P3: cache-test barrier race | Open id stays in discovery but is skipped by dispatch while open; cache delete queued before `ThreadInvalidated` |
 | 3 | Pass | — |
+
+### Task 7: core topic threads (2 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 (ready after fixes) | P1: a tail in flight across a loss of continuity restored it, recreating the round-2 gap. P2: forums rendered as an empty conversation (whole-chat view filtered out every forum message). P2: forum status was inferred from view shape | Per-window continuity clock with a `ContinuityMark` captured at dispatch; forum placeholder pane with no composer, and core refuses a whole-chat `OpenThread` on a known forum; `KnownKinds` remembers the last stated kind for chats with views (≤ 14) |
+| 2 (pass) | P3: the continuity clock could wrap | Saturating clock; restoration refused once exhausted |
+
+**Dependency for task 8 (from this review):** after a loss of continuity nothing re-requests the tail, so an open window can stay non-contiguous and live messages stay uncached until the next tail. Task 8's fence lift must invalidate and reload the affected open windows (already in its spec); its tests must assert continuity is restored afterwards.

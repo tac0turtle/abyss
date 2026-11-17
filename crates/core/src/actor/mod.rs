@@ -21,6 +21,7 @@ mod peers;
 mod sends;
 #[cfg(all(test, feature = "fake"))]
 mod tests;
+mod threads;
 mod topics;
 
 use std::collections::{HashMap, VecDeque};
@@ -152,6 +153,8 @@ pub(crate) struct Actor<B: Backend> {
     peers: peers::PeerSync,
     /// Forum topic lists and their account-level limits (`topics`).
     topics: topics::TopicLists,
+    /// The kind last stated for each chat with a retained view (`threads`).
+    forum_kinds: threads::KnownKinds,
     /// Highest displayed id per thread, flushed every `READ_FLUSH`.
     reads: HashMap<ThreadKey, MsgId>,
     sends: sends::PendingSends,
@@ -239,6 +242,7 @@ impl<B: Backend> Actor<B> {
             viewing: None,
             peers: peers::PeerSync::default(),
             topics: topics::TopicLists::default(),
+            forum_kinds: threads::KnownKinds::default(),
             reads: HashMap::new(),
             sends: sends::PendingSends::default(),
             deadline: CALL_DEADLINE,
@@ -665,6 +669,9 @@ impl<B: Backend> Actor<B> {
     /// cached and server tails follow. During a full bootstrap the tail is a
     /// boot snapshot, replacing any earlier one of the same thread.
     async fn open_thread(&mut self, thread: ThreadKey) {
+        if self.refuse_open(thread).await {
+            return;
+        }
         if let Some(prev) = self.open.filter(|p| *p != thread) {
             self.windows.close(prev);
             self.forget_owed(prev);
@@ -675,6 +682,7 @@ impl<B: Backend> Actor<B> {
             self.windows.invalidate(thread);
         }
         let view = self.windows.open(thread);
+        self.note_kinds();
         let prev = self.open.replace(thread);
         self.follow_open_thread(prev).await;
         self.seed_view(thread, view).await;
@@ -738,6 +746,7 @@ impl<B: Backend> Actor<B> {
             dir: HistoryDir::Tail,
             query: HistoryQuery::Tail,
             floor: self.tail_floor(load.thread),
+            since: self.windows.continuity_mark(),
         };
         if !self.enqueue(job).await {
             self.release_history(load);
@@ -812,6 +821,7 @@ impl<B: Backend> Actor<B> {
             dir,
             query,
             floor: None,
+            since: self.windows.continuity_mark(),
         };
         if !self.enqueue(job).await {
             self.release_history(load);

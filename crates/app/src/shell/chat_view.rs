@@ -20,7 +20,7 @@ use super::{Root, State};
 use crate::chat::messages::MessageWindow;
 use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
-use crate::chat::{ChatShell, Row, copy, format, list as chat_list};
+use crate::chat::{ChatShell, Row, copy, format, is_forum, list as chat_list};
 use crate::ui::mark::mark;
 use crate::ui::theme::{self, Depth, Theme, Themes};
 
@@ -277,10 +277,13 @@ fn avatar(chat: &ChatSummary, ink: Rgba) -> Div {
 }
 
 /// What the open chat's pane shows instead of rows (`None`: its rows).
+/// A forum shows that topics arrive later (it has no whole-chat history).
 /// After a core stop, history never loaded is unavailable, never
 /// "Loading…" (task 6m).
 pub(super) fn placeholder(shell: &ChatShell) -> Option<&'static str> {
-    if shell.row_count() > 0 {
+    if shell.selected_chat().is_some_and(is_forum) {
+        Some(copy::FORUM_TOPICS)
+    } else if shell.row_count() > 0 {
         None
     } else if shell.window().is_some_and(MessageWindow::is_loaded) {
         Some(copy::EMPTY_CHAT)
@@ -344,12 +347,17 @@ fn chat_pane(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> An
                 )
                 .child(after_paint),
         )
-        .child(composer_area(session, chat, theme))
+        .children(shows_composer(chat).then(|| composer_area(session, chat, theme)))
         .into_any_element()
 }
 
+/// Whether the pane of `chat` has a composer: a forum has nothing to post
+/// into until its topics arrive.
+pub(super) fn shows_composer(chat: &ChatSummary) -> bool {
+    !is_forum(chat)
+}
+
 fn pane_header(chat: &ChatSummary) -> Div {
-    let forum = matches!(chat.kind, ChatKind::Supergroup { forum: true, .. });
     div()
         .p_3()
         .flex()
@@ -363,7 +371,6 @@ fn pane_header(chat: &ChatSummary) -> Div {
                 .child(chat.title.clone()),
         )
         .children(copy::kind_label(chat.kind).map(|t| muted(t).text_xs()))
-        .children(forum.then(|| muted(copy::FORUM_TOPICS).text_xs()))
 }
 
 fn jump_button(theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {

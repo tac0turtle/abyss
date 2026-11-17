@@ -32,10 +32,18 @@ fn key(chat: ChatId, t: i32) -> ThreadKey {
     }
 }
 
-/// Message `id` of the forum, in topic `t`.
+/// The forum's thread `t`: its whole-chat thread for 0, otherwise topic `t`.
+fn thread(t: i32) -> ThreadKey {
+    ThreadKey {
+        chat: forum(),
+        topic: (t > 0).then(|| topic(t)),
+    }
+}
+
+/// Message `id` of the forum, in thread `t` (see [`thread`]).
 fn post(id: i32, t: i32) -> Message {
     let mut m = msg(forum(), id, "");
-    m.thread.topic = Some(topic(t));
+    m.thread = thread(t);
     m
 }
 
@@ -43,14 +51,19 @@ fn posts(t: i32, ids: impl IntoIterator<Item = i32>) -> Vec<Message> {
     ids.into_iter().map(|id| post(id, t)).collect()
 }
 
-/// Every stored row of the forum as `id -> topic` (0 for none), read
-/// through the whole-chat key.
+/// Every stored row of the forum as `id -> topic` column (0 for none), read
+/// straight from the table: no thread key addresses every row.
 fn stored(db: &mut Cache) -> BTreeMap<i32, i32> {
-    db.tail(ThreadKey::whole(forum()), u32::MAX)
-        .unwrap()
-        .iter()
-        .map(|m| (m.id.0, m.thread.topic.map_or(0, TopicId::get)))
-        .collect()
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT id, topic FROM messages WHERE kind = 2 AND chat = ?1")
+        .unwrap();
+    stmt.query_map([forum().id], |r| {
+        Ok((r.get(0)?, i32::try_from(r.get::<_, i64>(1)?).unwrap()))
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
 }
 
 fn row_count(db: &Cache) -> i64 {
@@ -79,37 +92,41 @@ fn thread_pages_return_only_their_thread() {
     );
 }
 
-/// Until task 7 normalizes threads, the actor files a forum's messages,
-/// which carry their topic, under `ThreadKey::whole`. A whole-chat key
-/// therefore covers every row of its chat: writes keep each message's own
-/// topic, pages return them all, and a whole-chat replace spans topics, as
-/// before schema version 4. A non-forum chat only has topic-0 rows.
+/// A whole-chat key addresses exactly the thread `{ chat, topic: None }`:
+/// the rows with topic 0 (plan stage 2, task 7). Core files a forum's
+/// messages under their topics, so writes through a whole-chat key skip
+/// them, its pages never return them, and its reconciles and replaces never
+/// touch them. A non-forum chat only has topic-0 rows.
 #[test]
-fn a_whole_chat_key_spans_the_chats_topics() {
+fn a_whole_chat_key_addresses_only_topic_0() {
     let (_t, dir, key_) = setup();
     let mut db = Cache::open(&dir, &key_).unwrap();
     let whole = ThreadKey::whole(forum());
     let mut mixed = posts(2, [1, 3]);
     mixed.extend(posts(3, [2, 4]));
-    mixed.push(msg(forum(), 5, "no forum header"));
+    mixed.push(post(5, 0));
     db.put_messages(whole, &mixed).unwrap();
-    assert_eq!(
-        stored(&mut db),
-        BTreeMap::from([(1, 2), (2, 3), (3, 2), (4, 3), (5, 0)])
-    );
-    assert_eq!(ids(&db.tail(key(forum(), 3), 10).unwrap()), [2, 4]);
+    assert_eq!(stored(&mut db), BTreeMap::from([(5, 0)]), "topics skipped");
+    db.put_messages(key(forum(), 2), &posts(2, [1, 3])).unwrap();
+    db.put_messages(key(forum(), 3), &posts(3, [2, 4])).unwrap();
+    assert_eq!(ids(&db.tail(whole, 10).unwrap()), [5]);
+    assert!(db.before(whole, MsgId(5), 10).unwrap().is_empty());
+    assert_eq!(ids(&db.after(whole, MsgId(0), 10).unwrap()), [5]);
 
-    // Overlap with the chat's newest row (5): ids from 4 on, of any topic.
-    let mut tail = posts(3, [4]);
-    tail.extend(posts(2, [6]));
-    let gone = reconcile_tail(&mut db, whole, &tail, Some(MsgId(4))).unwrap();
-    assert_eq!(gone, [MsgId(5)]);
+    // Overlap with the whole thread's own newest row (5), not the chat's.
+    let gone = reconcile_tail(&mut db, whole, &posts(0, [5, 6]), Some(MsgId(5))).unwrap();
+    assert!(gone.is_empty());
     assert_eq!(
         stored(&mut db),
-        BTreeMap::from([(1, 2), (2, 3), (3, 2), (4, 3), (6, 2)])
+        BTreeMap::from([(1, 2), (2, 3), (3, 2), (4, 3), (5, 0), (6, 0)])
     );
-    reconcile_tail(&mut db, whole, &posts(2, [9]), Some(MsgId(9))).unwrap();
-    assert_eq!(stored(&mut db), BTreeMap::from([(9, 2)]), "a chat-wide gap");
+    // A gap replaces the whole thread's rows only; the topics' rows stay.
+    let gone = reconcile_tail(&mut db, whole, &posts(0, [9]), Some(MsgId(9))).unwrap();
+    assert_eq!(gone, [MsgId(5), MsgId(6)]);
+    assert_eq!(
+        stored(&mut db),
+        BTreeMap::from([(1, 2), (2, 3), (3, 2), (4, 3), (9, 0)])
+    );
 }
 
 /// `put_messages` writes only the messages its thread addresses.
@@ -293,9 +310,13 @@ fn rows_with_a_bad_topic_are_deleted() {
     // bad ones among them.
     assert_eq!(ids(&db.tail(good, 10).unwrap()), [10]);
     assert_eq!(row_count(&db), 5, "ids 3, 6 and 7 deleted");
-    // The whole-chat page selects every row of the chat.
-    assert_eq!(stored(&mut db), BTreeMap::from([(10, 3)]));
-    assert_eq!(row_count(&db), 1);
+    // The whole-chat page selects the topic-0 rows, and topic 2's page the
+    // row filed under 2: both disagree with their bodies.
+    assert!(db.tail(ThreadKey::whole(forum()), 10).unwrap().is_empty());
+    assert!(db.tail(key(forum(), 2), 10).unwrap().is_empty());
+    // A negative column matches no thread: never served, left to the
+    // chat's trimming and eviction.
+    assert_eq!(stored(&mut db), BTreeMap::from([(4, -1), (5, -3), (10, 3)]));
 }
 
 /// `messages_thread` serves every production topic page without scanning
@@ -321,9 +342,10 @@ fn topic_pages_use_the_thread_index() {
     }
 }
 
-/// A forum's history: each id's topic (1–3), and whether it is cached.
+/// A forum's history: each id's thread (0 for the whole-chat thread, else
+/// topics 1–3), and whether it is cached.
 fn history() -> impl Strategy<Value = Vec<(i32, i32, bool)>> {
-    prop::collection::vec((1..=3i32, any::<bool>()), 1..40).prop_map(|v| {
+    prop::collection::vec((0..=3i32, any::<bool>()), 1..40).prop_map(|v| {
         v.into_iter()
             .zip(1..)
             .map(|((t, cached), id)| (id, t, cached))
@@ -340,9 +362,9 @@ fn cached(history: &[(i32, i32, bool)]) -> BTreeMap<i32, i32> {
 }
 
 fn fill(db: &mut Cache, rows: &BTreeMap<i32, i32>) {
-    for t in 1..=3 {
+    for t in 0..=3 {
         let ids = rows.iter().filter(|(_, rt)| **rt == t).map(|(id, _)| *id);
-        db.put_messages(key(forum(), t), &posts(t, ids)).unwrap();
+        db.put_messages(thread(t), &posts(t, ids)).unwrap();
     }
 }
 
@@ -352,12 +374,12 @@ proptest! {
     /// Section 11: over interleaved topics, `reconcile_range` on one thread
     /// leaves every other thread's rows as they were, and makes its own
     /// rows in the range equal the server page. Server messages of other
-    /// threads are ignored. A whole-chat key spans every topic (see
-    /// `a_whole_chat_key_spans_the_chats_topics`).
+    /// threads are ignored. A whole-chat key (thread 0) is one more
+    /// thread: it addresses only topic-0 rows.
     #[test]
     fn reconcile_range_never_touches_another_thread(
         history in history(),
-        thread in prop::option::of(1..=3i32),
+        t in 0..=3i32,
         server in prop::collection::vec(any::<bool>(), 40),
         (lo, hi) in (0..=41i32, 0..=41i32),
     ) {
@@ -365,7 +387,7 @@ proptest! {
         let mut db = Cache::open(&dir, &key_).unwrap();
         let before = cached(&history);
         fill(&mut db, &before);
-        let ours = |t: i32| thread.is_none_or(|th| th == t);
+        let ours = |rt: i32| rt == t;
         let in_range = |id: i32| (lo..=hi).contains(&id);
         let page: Vec<Message> = history
             .iter()
@@ -373,42 +395,38 @@ proptest! {
             .filter(|(_, s)| **s)
             .map(|(&(id, t, _), _)| post(id, t))
             .collect();
-        let thread_key = ThreadKey {
-            chat: forum(),
-            topic: thread.map(topic),
-        };
         let gone = db
-            .reconcile_range(thread_key, MsgId(lo), MsgId(hi), &page)
+            .reconcile_range(thread(t), MsgId(lo), MsgId(hi), &page)
             .unwrap();
 
         let served: BTreeMap<i32, i32> = page
             .iter()
             .map(|m| (m.id.0, m.thread.topic.map_or(0, TopicId::get)))
-            .filter(|&(id, t)| ours(t) && in_range(id))
+            .filter(|&(id, rt)| ours(rt) && in_range(id))
             .collect();
         let mut expected: BTreeMap<i32, i32> = before
             .iter()
-            .filter(|&(&id, &t)| !(ours(t) && in_range(id)))
-            .map(|(&id, &t)| (id, t))
+            .filter(|&(&id, &rt)| !(ours(rt) && in_range(id)))
+            .map(|(&id, &rt)| (id, rt))
             .collect();
         expected.extend(&served);
         prop_assert_eq!(stored(&mut db), expected);
         let expected_gone: Vec<MsgId> = before
             .iter()
-            .filter(|&(&id, &t)| ours(t) && in_range(id) && !served.contains_key(&id))
+            .filter(|&(&id, &rt)| ours(rt) && in_range(id) && !served.contains_key(&id))
             .map(|(&id, _)| MsgId(id))
             .collect();
         prop_assert_eq!(gone, expected_gone);
     }
 
-    /// Section 11: `ReconcileTail` on topic `t`, with or without overlap,
-    /// never changes a sibling topic's rows. Its own rows from the tail's
+    /// Section 11: `ReconcileTail` on thread `t` (0: the whole-chat
+    /// thread), with or without overlap, never changes a sibling's rows. Its own rows from the tail's
     /// start on equal the tail; below it they are kept only when the tail
     /// overlaps `t`'s own newest cached row, so a gap is never bridged.
     #[test]
     fn reconcile_tail_never_touches_another_thread(
         history in history(),
-        t in 1..=3i32,
+        t in 0..=3i32,
         tail in prop::collection::vec(any::<bool>(), 40),
         first in prop::option::of(1..=41i32),
     ) {
@@ -423,7 +441,7 @@ proptest! {
             .filter(|&(&(id, ht, _), &s)| s && ht == t && id >= start)
             .map(|(&(id, ht, _), _)| post(id, ht))
             .collect();
-        reconcile_tail(&mut db, key(forum(), t), &page, first.map(MsgId)).unwrap();
+        reconcile_tail(&mut db, thread(t), &page, first.map(MsgId)).unwrap();
 
         let newest = before.iter().filter(|(_, bt)| **bt == t).map(|(id, _)| *id).max();
         let overlap = first.is_some() && newest.is_none_or(|n| start <= n);

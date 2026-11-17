@@ -16,7 +16,7 @@ use crate::backend::{
 };
 use crate::cache::CacheHandle;
 use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId, ThreadKey, TopicId};
-use crate::store::{FetchSeq, PageKind, TOPICS_PAGE, TopicsGen, ViewGen};
+use crate::store::{ContinuityMark, FetchSeq, PageKind, TOPICS_PAGE, TopicsGen, ViewGen};
 
 /// Messages per history page (server and cache).
 pub(super) const PAGE: u32 = 50;
@@ -69,6 +69,9 @@ pub(super) enum Job {
         /// made. The server's answer is authoritative up to it; anything
         /// newer in the window arrived later (a live update).
         floor: Option<MsgId>,
+        /// The continuity clock when the load was requested: a tail may
+        /// restore cache continuity only if its window lost none since.
+        since: ContinuityMark,
     },
     Send {
         local_id: LocalId,
@@ -142,6 +145,7 @@ pub(super) enum Outcome {
         dir: HistoryDir,
         query: HistoryQuery,
         floor: Option<MsgId>,
+        since: ContinuityMark,
         res: CallResult<HistoryPage>,
     },
     Send {
@@ -289,16 +293,17 @@ pub(super) fn job_future<C: Client>(
             dir,
             query,
             floor,
+            since,
         } => {
-            let call = async move { client.history(load.thread, query, PAGE).await };
-            let fut = admitted.run(call, move |res| Outcome::History {
+            let outcome = move |res| Outcome::History {
                 load,
                 dir,
                 query,
                 floor,
+                since,
                 res,
-            });
-            (TaskKind::History(load, dir), Box::pin(fut))
+            };
+            history(client, admitted, load, dir, query, outcome)
         }
         Job::Send {
             local_id,
@@ -336,6 +341,22 @@ pub(super) fn job_future<C: Client>(
 }
 
 /// The future of a by-id topics call.
+/// A history call of `load` in `dir`, answered by `outcome`.
+fn history<C: Client>(
+    client: Arc<C>,
+    admitted: Admitted,
+    load: Load,
+    dir: HistoryDir,
+    query: HistoryQuery,
+    outcome: impl FnOnce(CallResult<HistoryPage>) -> Outcome + Send + 'static,
+) -> (TaskKind, DoneFuture) {
+    let call = async move { client.history(load.thread, query, PAGE).await };
+    (
+        TaskKind::History(load, dir),
+        Box::pin(admitted.run(call, outcome)),
+    )
+}
+
 fn topics_by_id<C: Client>(
     client: Arc<C>,
     admitted: Admitted,

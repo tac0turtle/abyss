@@ -1,20 +1,24 @@
-//! Stage 2 task 6: forum topic lists in the actor, against the fake's
-//! forums (plan section 11, "Actor against the fake").
+//! Stage 2 tasks 6 and 7: forum topic lists and topic threads in the
+//! actor, against the fake's forums (plan section 11, "Actor against the
+//! fake").
 
 mod admission;
 mod bootstrap;
+mod continuity;
 mod crossing;
 mod deletion;
 mod drain;
 mod flood;
+mod kinds;
 mod open_topic;
 mod opening;
 mod overflow;
+mod threads;
 
 use std::time::Duration;
 
 use super::{Harness, harness};
-use crate::api::{Command, ConnState, Event, LoadTarget};
+use crate::api::{Command, ConnState, Event, HistoryDir, LoadTarget};
 use crate::backend::fake::{FakeScript, TopicsCallRecord, TopicsRequest, summary};
 use crate::model::{
     Body, ChatId, ChatKind, ChatSummary, Freshness, Message, MsgId, PeerKind, ThreadKey, Topic,
@@ -257,4 +261,70 @@ fn message_in(thread: ThreadKey, id: i32, text: &str) -> Message {
     let mut m = crate::backend::fake::text_message(thread.chat, id, text);
     m.thread.topic = thread.topic.filter(|t| *t != TopicId::GENERAL);
     m
+}
+
+/// Forum 100 with General (1), topic A (2) and topic B (3), and a post in
+/// each `(id, topic)` of `posts` (topic 1: General, without a header).
+fn forum_with(posts: impl IntoIterator<Item = (i32, i32)>) -> (FakeScript, ChatId) {
+    let f = forum(100);
+    let mut script = FakeScript::demo(1, 1);
+    add_big_forum(&mut script, f, 2);
+    let history = script.history.entry(f).or_default();
+    history.extend(
+        posts
+            .into_iter()
+            .map(|(id, t)| message_in(topic_key(f, t), id, "post")),
+    );
+    (script, f)
+}
+
+/// Waits for the next `History` of `thread` in `dir`; returns its messages
+/// (each checked to carry `thread`) and the events before it.
+async fn history_of(
+    h: &mut Harness,
+    thread: ThreadKey,
+    dir: HistoryDir,
+) -> (Vec<Message>, Vec<Event>) {
+    let (ev, skipped) = h
+        .until(
+            |e| matches!(e, Event::History { thread: t, dir: d, .. } if *t == thread && *d == dir),
+        )
+        .await;
+    assert_keyed(&skipped);
+    let Event::History { messages, .. } = ev else {
+        unreachable!()
+    };
+    assert!(messages.iter().all(|m| m.thread == thread), "{messages:?}");
+    (messages, skipped)
+}
+
+/// Waits until `thread`'s view is reconciled with the server's tail;
+/// returns the events before it (each checked by [`assert_keyed`]).
+async fn reconciled(h: &mut Harness, thread: ThreadKey) -> Vec<Event> {
+    let (_, skipped) = h
+        .until(|e| matches!(e, Event::Reconciled { thread: t, .. } if *t == thread))
+        .await;
+    assert_keyed(&skipped);
+    skipped
+}
+
+/// The thread-equals-key invariant on events: every message a `History`
+/// carries has the event's thread, and an `Edited` one is normalized (a
+/// forum message has a topic).
+fn assert_keyed(events: &[Event]) {
+    for e in events {
+        match e {
+            Event::History {
+                thread, messages, ..
+            } => assert!(messages.iter().all(|m| m.thread == *thread), "{e:?}"),
+            Event::Edited(m) if m.thread.chat.kind == PeerKind::Channel => {
+                assert!(m.thread.topic.is_some(), "{e:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn ids(messages: &[Message]) -> Vec<i32> {
+    messages.iter().map(|m| m.id.0).collect()
 }

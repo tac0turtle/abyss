@@ -307,6 +307,7 @@ impl<B: Backend> Actor<B> {
             dir: HistoryDir::Tail,
             query: HistoryQuery::Tail,
             floor,
+            since: self.windows.continuity_mark(),
         });
     }
 

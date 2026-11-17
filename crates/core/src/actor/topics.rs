@@ -143,6 +143,7 @@ impl<B: Backend> Actor<B> {
         // The reset below shows the list as it is after any cut.
         self.topics.lists.open(chat).set_open(open);
         self.topics.prune_cursors();
+        self.note_kinds();
         if retained {
             self.emit_reset(chat).await;
             self.emit_paging(chat).await;
@@ -619,6 +620,7 @@ impl<B: Backend> Actor<B> {
                 let open = self.open_topic(chat);
                 self.topics.lists.open(chat).set_open(open);
             }
+            self.note_kinds();
         }
         for chat in self.topics.lists.chats().to_vec() {
             if let Some(list) = self.topics.lists.get_mut(chat) {

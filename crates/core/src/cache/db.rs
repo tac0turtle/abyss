@@ -126,23 +126,31 @@ fn topic_code(topic: Option<TopicId>) -> i64 {
     topic.map_or(0, |t| i64::from(t.get()))
 }
 
-/// Whether `thread` addresses `m`'s row. A topic key addresses that topic.
-/// A whole-chat key addresses every row of its chat, topics included: until
-/// core normalizes threads (stage 2 task 7), the actor files a forum's
-/// messages, which carry their topic, under `ThreadKey::whole`, so a
-/// whole-chat page, reconcile or replace must keep covering them. In a
-/// non-forum chat every row has topic 0, so the two readings agree.
+/// Whether `thread` addresses `m`'s row: same chat, same topic. A whole-chat
+/// key addresses exactly the thread `{ chat, topic: None }`, the rows with
+/// topic 0. Core files every message under its normalized thread (plan stage
+/// 2, section 3), so a forum's messages all carry a topic and no whole-chat
+/// key reaches them; a message of another thread is rejected.
 fn addresses(thread: ThreadKey, m: &Message) -> bool {
-    m.thread.chat == thread.chat && (thread.topic.is_none() || m.thread.topic == thread.topic)
+    m.thread == thread
+}
+
+/// Logs the messages of `msgs` that `thread` does not address: a write
+/// rejects them (plan stage 2, section 3).
+fn note_rejected(thread: ThreadKey, msgs: &[Message]) {
+    let rejected = msgs.iter().filter(|m| !addresses(thread, m)).count();
+    if rejected > 0 {
+        tracing::warn!(rejected, "messages of another thread were not cached");
+    }
 }
 
 /// The SQL form of [`addresses`]: rows of `thread.chat` (parameters `?1`
-/// kind and `?2` chat), narrowed to the topic for a topic key.
+/// kind and `?2` chat) whose `topic` is the thread's [`topic_code`].
 #[derive(Clone, Copy, Debug)]
 struct Rows {
     kind: i64,
     chat: i64,
-    topic: Option<i64>,
+    topic: i64,
 }
 
 impl Rows {
@@ -150,36 +158,35 @@ impl Rows {
         Self {
             kind: kind_code(thread.chat.kind),
             chat: thread.chat.id,
-            topic: thread.topic.map(|t| i64::from(t.get())),
+            topic: topic_code(thread.topic),
         }
     }
 
     /// The table to select from. A topic key names `messages_thread`:
     /// without statistics, SQLite otherwise prefers the primary key for any
     /// query that reads `body`, and filters the chat's rows by topic one by
-    /// one (`topic_pages_use_the_thread_index`).
+    /// one (`topic_pages_use_the_thread_index`). A whole-chat key keeps the
+    /// primary key: outside a forum every row of the chat has topic 0, so
+    /// the filter drops nothing.
     fn table(self) -> &'static str {
-        match self.topic {
-            Some(_) => "messages INDEXED BY messages_thread",
-            None => "messages",
+        if self.topic == 0 {
+            "messages"
+        } else {
+            "messages INDEXED BY messages_thread"
         }
     }
 
-    /// `AND topic = ?{param}` for a topic key, nothing for a whole chat.
-    /// `param` must be the statement's highest parameter, so a whole-chat
-    /// statement simply has one parameter fewer.
-    fn topic_clause(self, param: u8) -> String {
-        match self.topic {
-            Some(_) => format!(" AND topic = ?{param}"),
-            None => String::new(),
-        }
+    /// `AND topic = ?{param}`. `param` must be the statement's highest
+    /// parameter: [`Self::params`] binds the topic last.
+    fn topic_clause(param: u8) -> String {
+        format!(" AND topic = ?{param}")
     }
 
-    /// Kind, chat, then `rest`, then the topic when [`Self::topic_clause`]
-    /// binds one.
+    /// Kind, chat, then `rest`, then the topic.
     fn params(self, rest: &[i64]) -> ParamsFromIter<Vec<i64>> {
         let head = [self.kind, self.chat].into_iter();
-        params_from_iter(head.chain(rest.iter().copied()).chain(self.topic).collect())
+        let tail = std::iter::once(self.topic);
+        params_from_iter(head.chain(rest.iter().copied()).chain(tail).collect())
     }
 }
 
@@ -218,7 +225,7 @@ fn page_query(
         "SELECT id, topic, {} FROM {} WHERE kind = ?1 AND chat = ?2{} AND {} LIMIT ?4",
         bounded_body(5),
         rows.table(),
-        rows.topic_clause(6),
+        Rows::topic_clause(6),
         page.clause(),
     );
     (sql, rows.params(&[bound, i64::from(limit), row_limit()]))
@@ -550,6 +557,7 @@ impl Cache {
     /// oversized messages are skipped.
     pub fn put_messages(&mut self, thread: ThreadKey, msgs: &[Message]) -> Result<(), CacheError> {
         let chat = thread.chat;
+        note_rejected(thread, msgs);
         self.write(|tx, mut bytes| {
             register_chat(tx, chat)?;
             for m in msgs.iter().filter(|m| addresses(thread, m)) {
@@ -572,6 +580,7 @@ impl Cache {
         server: &[Message],
     ) -> Result<Vec<MsgId>, CacheError> {
         let chat = thread.chat;
+        note_rejected(thread, server);
         let page: Vec<&Message> = server
             .iter()
             .filter(|m| addresses(thread, m) && (lo..=hi).contains(&m.id))
@@ -817,7 +826,7 @@ fn ids_in_range(
     let sql = format!(
         "SELECT id FROM {} WHERE kind = ?1 AND chat = ?2 AND id BETWEEN ?3 AND ?4{}",
         rows.table(),
-        rows.topic_clause(5)
+        Rows::topic_clause(5)
     );
     let mut stmt = tx.prepare_cached(&sql)?;
     let ids = stmt

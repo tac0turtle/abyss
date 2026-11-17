@@ -13,7 +13,7 @@ use crate::backend::{
 };
 use crate::cache::CacheCmd;
 use crate::model::{ChatSummary, Message, MsgId, ThreadKey};
-use crate::store::{Bump, Change, Last, Rest, Unread, ViewGen, Window};
+use crate::store::{Bump, Change, ContinuityMark, Last, Rest, Route, Unread, ViewGen, Window};
 
 pub(super) fn user_error(e: CallError) -> UserError {
     match e {
@@ -42,19 +42,6 @@ fn call_error(outcome: &Outcome) -> Option<CallError> {
     }
 }
 
-/// The thread whose window shows `m`: its whole chat. Temporary (Stage 2
-/// task 1): forum chats are still shown as one stream, so every key is
-/// `topic: None` while `m.thread.topic` keeps the raw topic the server
-/// stated. A message's `thread` therefore need not equal its window's key
-/// yet. Task 7 replaces this with `route`, which normalizes the message's
-/// thread and enforces that equality for windows and events. The cache
-/// (task 5) stores each row under its message's own topic and checks rows
-/// against their body; meanwhile a whole-chat cache key spans all of its
-/// chat's topics, so the forum stream this files keeps its cache.
-pub(super) fn shown_in(m: &Message) -> ThreadKey {
-    ThreadKey::whole(m.thread.chat)
-}
-
 pub(super) const MIN_ID: MsgId = MsgId(i32::MIN);
 pub(super) const MAX_ID: MsgId = MsgId(i32::MAX);
 
@@ -77,6 +64,8 @@ pub(super) struct HistoryReply {
     pub(super) query: HistoryQuery,
     /// See [`Job::History`](super::jobs::Job::History).
     pub(super) floor: Option<MsgId>,
+    /// See [`Job::History`](super::jobs::Job::History).
+    pub(super) since: ContinuityMark,
     /// What the server page covered, captured before tombstones filter it.
     pub(super) covered: Option<Coverage>,
     pub(super) page: HistoryPage,
@@ -141,6 +130,7 @@ struct HistoryReq {
     dir: HistoryDir,
     query: HistoryQuery,
     floor: Option<MsgId>,
+    since: ContinuityMark,
 }
 
 impl<B: Backend> Actor<B> {
@@ -169,9 +159,15 @@ impl<B: Backend> Actor<B> {
                 dir,
                 query,
                 floor,
+                since,
                 res,
             } => {
-                let req = HistoryReq { dir, query, floor };
+                let req = HistoryReq {
+                    dir,
+                    query,
+                    floor,
+                    since,
+                };
                 self.on_history_done(load, req, res).await;
             }
             Outcome::TopicsPage { call, kind, res } => self.on_topics_page(call, kind, res).await,
@@ -224,7 +220,13 @@ impl<B: Backend> Actor<B> {
             owed: self.take_owed(load),
         };
         match res {
-            Ok(page) => {
+            Ok(HistoryPage { messages, has_more }) => {
+                // Normalized before anything reads it: coverage, the window
+                // and the cache only ever see the load's own thread.
+                let page = HistoryPage {
+                    messages: self.keep_thread(load.thread, messages),
+                    has_more,
+                };
                 let mode = if boot == Some(BootKind::Refresh) {
                     TailMode::Merge
                 } else {
@@ -237,6 +239,7 @@ impl<B: Backend> Actor<B> {
                     dir: req.dir,
                     query: req.query,
                     floor: req.floor,
+                    since: req.since,
                     covered: Coverage::of(&page),
                     page,
                     mode,
@@ -315,6 +318,7 @@ impl<B: Backend> Actor<B> {
                     self.cache_write(CacheCmd::PutChats(all)).await;
                 }
                 self.dialogs_loaded = true;
+                self.note_kinds();
                 self.emit(event).await;
                 let has_more = self.dialogs_next.is_some();
                 self.emit(Event::DialogsPaging { has_more }).await;
@@ -338,6 +342,7 @@ impl<B: Backend> Actor<B> {
             return; // the server answered first
         }
         self.dialogs.reset(chats);
+        self.note_kinds();
         self.emit(Event::DialogsReset(self.dialogs.as_slice().to_vec()))
             .await;
     }
@@ -391,7 +396,7 @@ impl<B: Backend> Actor<B> {
         anchor: Option<MsgId>,
         messages: Option<Vec<Message>>,
     ) {
-        let messages = messages.unwrap_or_default();
+        let messages = self.keep_thread(load.thread, messages.unwrap_or_default());
         if dir == HistoryDir::Tail {
             return self.on_cache_tail(load, messages).await;
         }
@@ -612,6 +617,7 @@ impl<B: Backend> Actor<B> {
         let HistoryReply {
             thread,
             req,
+            since,
             mut page,
             ..
         } = p;
@@ -628,11 +634,16 @@ impl<B: Backend> Actor<B> {
         // first message tombstones left), or from the start of history when
         // the page is all of it. A partial page that covered nothing proves
         // nothing: the cache is left alone and is not contiguous.
+        //
+        // A tail requested before the window last lost continuity may
+        // predate messages that bypassed it: it neither writes the cache
+        // nor restores continuity (only a later tail does).
         let from = match (page.has_more, range) {
             (false, _) => Some(None),
             (true, Some((lo, _))) => Some(Some(lo)),
             (true, None) => None,
-        };
+        }
+        .filter(|_| self.windows.may_restore(thread, since));
         if self.cache.is_some()
             && let Some(from) = from
         {
@@ -730,8 +741,20 @@ impl<B: Backend> Actor<B> {
     }
 
     /// Applies an edit unless the window holds a later edit of the message.
+    /// An edit only replaces a copy a window holds: found by `(chat, id)`
+    /// across the chat's windows, the routed thread's first. The stored
+    /// copy's thread wins (plan stage 2, section 6.2).
     pub(super) async fn on_edited(&mut self, m: Message) {
-        let thread = shown_in(&m);
+        let (Route::Thread(routed), mut m) = self.route_live(m) else {
+            return;
+        };
+        let Some(thread) = self.windows.holder(routed, m.id) else {
+            return;
+        };
+        if thread != routed {
+            tracing::debug!(id = m.id.0, "an edit names another thread than its copy");
+            m.thread = thread;
+        }
         if self.has_newer_copy(thread, &m) || !self.windows.replace(thread, m.clone()) {
             return;
         }
@@ -752,10 +775,16 @@ impl<B: Backend> Actor<B> {
             && self.windows.get(thread).is_some_and(|w| !w.has_newer())
     }
 
+    /// A new message bumps its chat; routed to a thread, it also reaches
+    /// that thread's window and, under the continuity gate, its cache.
     async fn on_new_message(&mut self, m: Message, origin: Origin<'_>) {
-        let thread = shown_in(&m);
-        let chat = thread.chat;
-        let unread = if m.outgoing || self.tail_visible(thread) {
+        let (route, m) = self.route_live(m);
+        let thread = match route {
+            Route::Thread(key) => Some(key),
+            Route::ChatOnly(_) | Route::ForumSuspected(_) => None,
+        };
+        let chat = m.thread.chat;
+        let unread = if m.outgoing || thread.is_some_and(|t| self.tail_visible(t)) {
             Unread::Unchanged
         } else {
             Unread::Increment
@@ -771,6 +800,9 @@ impl<B: Backend> Actor<B> {
         {
             self.emit(Event::ChatBumped(summary)).await;
         }
+        let Some(thread) = thread else {
+            return; // nothing shows it yet; opening its thread fetches it
+        };
         let Some(view) = self.windows.get(thread).map(Window::view_gen) else {
             return;
         };
