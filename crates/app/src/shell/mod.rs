@@ -29,7 +29,7 @@ actions!(
     [
         /// Our own quit (Cmd+Q), so shutdown can wait for core (plan section 5).
         Quit,
-        /// Shows or hides the appearance panel (Cmd+comma).
+        /// Shows or hides settings (Cmd+comma).
         Appearance
     ]
 );
@@ -79,9 +79,9 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let started = launch
-            .map_err(Failure::Launch)
-            .and_then(|l| session::start(l).map_err(Failure::Start));
+        let started = launch.map_err(Failure::Launch).and_then(|l| {
+            session::start(l, crate::preferences::Preferences::config(cx)).map_err(Failure::Start)
+        });
         Self::with_started(started, window, cx)
     }
 
@@ -186,6 +186,7 @@ pub(crate) fn open(launch: Result<Launch, LaunchError>, cx: &mut App) -> gpui::R
         ..Default::default()
     };
     crate::ui::theme::Themes::init(cx);
+    crate::preferences::Preferences::init(cx);
     let handle = cx.open_window(options, |window, cx| {
         cx.new(|cx| Root::new(launch, window, cx))
     })?;

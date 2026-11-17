@@ -53,13 +53,13 @@ pub(crate) const TROUBLE: [&str; 4] = [
 pub(crate) const HAVE_CREDENTIALS: &str = "I have my api_id and api_hash";
 
 pub(crate) const ENTRY_TITLE: &str = "Enter your API credentials";
-pub(crate) const ENTRY_DETAIL: &str = "Paste them from my.telegram.org. They stay on this Mac, \
-                                       in your Keychain, once Telegram has accepted them.";
+pub(crate) const ENTRY_DETAIL: &str = "Paste them from my.telegram.org. They are saved on this Mac \
+                                       once Telegram has accepted them.";
 pub(crate) const API_ID_PLACEHOLDER: &str = "api_id (digits)";
 pub(crate) const API_HASH_PLACEHOLDER: &str = "api_hash (32 characters)";
 pub(crate) const REVEAL: &str = "Show";
 pub(crate) const HIDE: &str = "Hide";
-pub(crate) const STORED_NOTE: &str = "A pair is saved in your Keychain. Use it, enter a new \
+pub(crate) const STORED_NOTE: &str = "A pair is saved on this Mac. Use it, enter a new \
                                       pair to replace it, or forget it.";
 pub(crate) const USE_SAVED: &str = "Use saved pair";
 pub(crate) const FORGET_SAVED: &str = "Forget saved pair";
@@ -76,9 +76,9 @@ pub(crate) fn api_id_invalid(error: ApiIdError) -> &'static str {
 }
 
 pub(crate) const ENV_TITLE: &str = "Credentials from the environment";
-pub(crate) const KEYCHAIN_TITLE: &str = "Keychain unavailable";
+pub(crate) const KEYCHAIN_TITLE: &str = "Local storage unavailable";
 pub(crate) const KEYCHAIN_DETAIL: &str = "abyss couldn't read your saved API credentials. \
-                                          Unlock the Keychain or allow access, then retry.";
+                                          Check local storage access, then retry.";
 
 /// Why the env override is unusable, and how to fix it.
 pub(crate) fn env_detail(error: CredentialError) -> Vec<SharedString> {

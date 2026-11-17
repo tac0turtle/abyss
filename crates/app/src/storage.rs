@@ -31,7 +31,7 @@
 //! against a same-uid attacker.
 
 #[cfg(target_os = "macos")]
-mod acl;
+use abyss_core::secret::acl;
 
 use std::fmt;
 use std::io;

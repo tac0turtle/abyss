@@ -20,7 +20,7 @@ const EXCLUDE_VALUE: [u8; 61] = [
 /// Marks `dir` as excluded from backups. The exclusion is an xattr on the
 /// directory, so it covers every file inside it.
 #[cfg(target_os = "macos")]
-pub(super) fn exclude_from_backup(dir: &Path) -> io::Result<()> {
+pub(crate) fn exclude_from_backup(dir: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
@@ -44,7 +44,7 @@ pub(super) fn exclude_from_backup(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(super) fn exclude_from_backup(_dir: &Path) -> io::Result<()> {
+pub(crate) fn exclude_from_backup(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 

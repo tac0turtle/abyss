@@ -373,6 +373,8 @@ pub struct NewLogin {
 /// where it occurs; it never carries secrets).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageError {
+    /// A private local secret file could not be read or written.
+    Local,
     /// The Keychain refused or failed the operation.
     Keychain,
     /// A stored item was unreadable.
@@ -394,6 +396,7 @@ pub enum StorageError {
 impl From<&StoreError> for StorageError {
     fn from(e: &StoreError) -> Self {
         match e {
+            StoreError::Local(_) => Self::Local,
             StoreError::Os { .. } | StoreError::Injected => Self::Keychain,
             StoreError::Malformed => Self::Corrupt,
             StoreError::Stopped => Self::Stopped,

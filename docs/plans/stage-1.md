@@ -1609,6 +1609,13 @@ Open items:
 
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 
+**Storage update (2026-11-17):** Keychain storage is now opt-in through
+Settings and defaults off. The session, cache key, API credentials and logout
+marker otherwise live unencrypted in a private 0600 file inside a 0700,
+backup-excluded directory. The cache itself stays encrypted. The original
+Keychain-only guarantee below applies only when Keychain storage is enabled;
+see [the current storage behavior](../connecting.md#secret-storage-and-keychain-prompts).
+
 History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This supersedes the "nothing on disk except the Keychain item" property in sections 3 and 9. The new property: **nothing plaintext on disk; everything on disk is undecryptable without a device-only Keychain key.**
 
 - **Engine:** SQLite + SQLCipher via `rusqlite` `bundled-sqlcipher`. On macOS this links CommonCrypto/Security.framework, not OpenSSL (`libsqlite3-sys` build.rs: `SQLCIPHER_CRYPTO_CC` when no `OPENSSL_DIR` is set). `Cache::open` asserts `PRAGMA cipher_provider = commoncrypto`, so a build that silently picked up OpenSSL fails closed.

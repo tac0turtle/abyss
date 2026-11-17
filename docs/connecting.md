@@ -52,8 +52,8 @@ Press **I have my api_id and api_hash**.
 
 **Continue** checks both fields and takes you to the phone screen. It does
 not contact Telegram yet: the pair is first used when you enter your phone
-number and abyss asks for a login code. abyss saves the pair in your macOS
-Keychain (item `dev.abyss.apicreds`) only once Telegram has accepted it, i.e.
+number and abyss asks for a login code. abyss saves the pair on this Mac
+only once Telegram has accepted it, i.e.
 after a code request with this pair succeeds. If Telegram rejects the pair,
 you come back to this screen with the reason.
 
@@ -62,17 +62,17 @@ you will need to enter the pair again next time.
 
 If a pair is already saved, you can use it, enter a new pair to replace it,
 or forget it. Forgetting is refused while you are signed in: log out first.
-If the Keychain refuses to delete it, abyss says the pair is still stored
+If local storage refuses to delete it, abyss says the pair is still stored
 and offers **Retry**; it never claims the pair is gone before it is.
 
 ### Environment override
 
 `ABYSS_API_ID` and `ABYSS_API_HASH` override the saved pair. Both must be
-set. They are never written to the Keychain. While they are set, the entry
+set. They are never saved. While they are set, the entry
 screen is disabled and abyss explains what is wrong with them; fix them, or
 unset both and restart abyss.
 
-If the Keychain cannot be read (for example, it is locked), abyss shows
+If saved credentials cannot be read, abyss shows
 **Retry** instead of asking for a new pair.
 
 ## 4. Phone
@@ -116,8 +116,8 @@ set is shown.
 
 **Back** works on every screen before you are signed in, except the welcome
 screen and the screens where abyss is waiting on something outside the form
-(checking a lost sign-in answer, an unusable environment override, a locked
-Keychain). From the phone screen, Back returns to the credential screens
+(checking a lost sign-in answer, an unusable environment override, unavailable local
+storage). From the phone screen, Back returns to the credential screens
 unless the pair comes from the environment.
 
 Once you are signed in, the only way back is **Log out** (top right of the
@@ -127,17 +127,17 @@ any unsent draft are cleared as soon as the logout starts.
 
 If Telegram cannot be reached, the logout still deletes the local data, and
 abyss tells you to end the session from Settings › Devices on another
-device. If the local deletion fails (for example, the Keychain refuses),
+device. If the local deletion fails (for example, local storage refuses),
 abyss shows **Logout incomplete** with **Retry**, and accepts no new login
 until Retry succeeds.
 
-abyss records in the Keychain that a logout is in progress, and does nothing
+abyss records in local storage that a logout is in progress, and does nothing
 else until that record is saved. Meanwhile it shows **Logging out**: your
 chats stay, but nothing new is sent. A message you write then is kept as
 failed, and automatic resends (after a Telegram flood wait, say) wait.
 A message already handed to Telegram before you logged out cannot be
 taken back. If the record cannot be saved (for example, the
-Keychain is locked), abyss shows **Couldn't start logout**: nothing was
+storage is unavailable), abyss shows **Couldn't start logout**: nothing was
 ended or deleted, you are still signed in on this Mac, and you can **Retry**
 or **Stay signed in**, which resumes the waiting resends; a message kept
 as failed is sent with its **Retry**. A logout Telegram started (it ended
@@ -150,9 +150,46 @@ back in. This holds only for a logout whose record was saved; a logout that
 could not start leaves the account signed in, as the screen says.
 
 If abyss cannot read that record at startup, it cannot tell whether a
-logout is unfinished, so it shows **Couldn't read Keychain** and waits. It
+logout is unfinished, so it shows **Couldn't read local storage** and waits. It
 loads no session, opens no message cache (opening can replace a cache it
 cannot read) and deletes nothing. **Retry** reads the record again: if there is
 none, abyss starts normally with your account; if there is one, it finishes
 that logout; if it still cannot read it, it keeps waiting.
 
+## Secret storage and Keychain prompts
+
+Keychain storage is **off by default**. Open **Settings…** from the abyss
+menu (Cmd+,) and turn on **Store secrets in Keychain** to opt in. Changes
+apply on the next launch. Resetting appearance does not change this setting.
+
+By default, the session, API credentials, message-cache key and unfinished
+logout record are stored in
+`~/Library/Application Support/dev.abyss/private/secrets`. The directory is
+0700, the file is 0600, and the directory is excluded from Time Machine
+backups. These secrets are unencrypted in that file and accessible to
+processes running as your macOS user. The message cache remains encrypted,
+but its key is in the local file. Enable Keychain storage if you want the
+secrets protected by macOS Keychain access controls.
+
+The first launch after upgrading imports existing Keychain secrets. This
+may ask for access to each existing item. Switching storage preserves the
+session, cache key, API credentials and any unfinished logout. The app
+commits the destination before removing the source copies; failed migration
+or cleanup blocks startup and can be retried. Later launches in local mode
+do not access Keychain.
+
+With Keychain enabled, a locked login keychain or an access decision can
+still cause a macOS prompt. Selecting **Always Allow** trusts that signed
+app identity. Ad-hoc signed builds change identity when rebuilt, so they
+can ask again. For builds with an installed signing certificate, use the
+same identity across rebuilds:
+
+```sh
+ABYSS_SIGNING_IDENTITY='Apple Development: Your Name (TEAMID)' scripts/bundle.sh
+```
+
+The bundle script retains `dev.abyss` as the signing identifier. It defaults
+to ad-hoc signing when the variable is unset. Keeping the certificate and
+identifier stable lets Keychain recognize subsequent builds; it does not
+bypass a locked keychain or a user's access decision. See Apple's
+[code signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).

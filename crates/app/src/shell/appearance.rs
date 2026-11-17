@@ -29,7 +29,10 @@ pub(super) fn panel(
 ) -> AnyElement {
     let sections = Mode::ALL.map(|mode| mode_section(mode, showing, settings, theme, cx));
     let card = div()
+        .id("settings-panel")
         .w(px(PANEL_WIDTH))
+        .max_h_full()
+        .overflow_y_scroll()
         .flex()
         .flex_col()
         .gap_4()
@@ -42,10 +45,16 @@ pub(super) fn panel(
             div()
                 .text_xl()
                 .font_weight(FontWeight::SEMIBOLD)
+                .child(copy::SETTINGS),
+        )
+        .child(
+            div()
+                .font_weight(FontWeight::MEDIUM)
                 .child(copy::APPEARANCE),
         )
         .child(muted(copy::APPEARANCE_NOTE).text_sm())
         .children(sections)
+        .child(storage_section(theme, cx))
         .child(footer(theme, cx));
     div()
         .absolute()
@@ -201,4 +210,40 @@ fn footer(theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
         .items_center()
         .child(reset)
         .child(done)
+}
+
+fn storage_section(theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
+    let prefs = cx.try_global::<crate::preferences::Preferences>();
+    let enabled = prefs.is_some_and(|p| p.use_keychain == Some(true));
+    let saving = prefs.is_some_and(|p| p.saving);
+    let failed = prefs.is_some_and(|p| p.failed);
+    let label = if saving {
+        "Saving…"
+    } else if enabled {
+        "On"
+    } else {
+        "Off"
+    };
+    let toggle = button("keychain-storage", label, theme).on_click(
+        cx.listener(|_, _: &ClickEvent, _, cx| crate::preferences::Preferences::toggle(cx)),
+    );
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(copy::KEYCHAIN_STORAGE),
+                )
+                .child(toggle),
+        )
+        .child(muted(copy::KEYCHAIN_STORAGE_DETAIL).text_sm())
+        .child(muted(copy::KEYCHAIN_MIGRATION_NOTE).text_sm())
+        .children(failed.then(|| muted(copy::PREFERENCE_FAILED).text_sm()))
 }

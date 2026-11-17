@@ -59,8 +59,9 @@ unsafe extern "C" {
     safe static kSecUseDataProtectionKeychain: CFStringRef;
     safe static kSecValueData: CFStringRef;
     safe static kSecReturnData: CFStringRef;
-    #[cfg(test)]
     safe static kSecReturnAttributes: CFStringRef;
+    safe static kSecUseAuthenticationUI: CFStringRef;
+    safe static kSecUseAuthenticationUIFail: CFStringRef;
 }
 
 const PRODUCTION_NAMESPACE: &str = "dev.abyss";
@@ -165,6 +166,40 @@ impl KeychainStore {
 }
 
 impl SecretStore for KeychainStore {
+    fn has_items(&self) -> Result<bool, StoreError> {
+        for item in [
+            SecretItem::Session,
+            SecretItem::CacheKey,
+            SecretItem::ApiCredentials,
+            SecretItem::LogoutPending,
+        ] {
+            let mut query = self.identity(item);
+            query.push((
+                key(kSecReturnAttributes),
+                CFBoolean::true_value().into_CFType(),
+            ));
+            query.push((
+                key(kSecUseAuthenticationUI),
+                key(kSecUseAuthenticationUIFail).into_CFType(),
+            ));
+            let query = dict(&query);
+            let mut out: CFTypeRef = std::ptr::null();
+            // SAFETY: query and out live for the call. Any returned value
+            // follows the Create rule; it is released without reading data.
+            let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &raw mut out) };
+            if !out.is_null() {
+                // SAFETY: a non-null result is an owned CF object.
+                drop(unsafe { CFType::wrap_under_create_rule(out) });
+            }
+            if status == errSecItemNotFound {
+                continue;
+            }
+            check(status)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn get(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
         let mut query = self.identity(item);
         query.push((key(kSecReturnData), CFBoolean::true_value().into_CFType()));

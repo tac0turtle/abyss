@@ -9,8 +9,10 @@
 # --no-default-features, as CI does, and needs Xcode's Metal toolchain.
 # The `fake` feature is never enabled here.
 #
-# The ad-hoc signature only seals the bundle's resources. Developer ID
-# signing, notarization and the App Sandbox are a later stage.
+# ABYSS_SIGNING_IDENTITY can select an installed code-signing certificate.
+# A stable certificate and bundle identifier let Keychain trust survive rebuilds.
+# Without it, ad-hoc signing only seals resources; its identity changes on rebuild.
+# Notarization and the App Sandbox are a later stage.
 set -euo pipefail
 
 # Oldest macOS the bundle declares (LSMinimumSystemVersion). The Rust
@@ -67,7 +69,8 @@ sed -e "s/@VERSION@/$version/g" -e "s/@MIN_MACOS@/$min_macos/g" \
     assets/macos/Info.plist >"$bundle/Contents/Info.plist"
 plutil -lint "$bundle/Contents/Info.plist"
 
-codesign --force --sign - "$bundle"
+signing_identity="${ABYSS_SIGNING_IDENTITY:--}"
+codesign --force --identifier dev.abyss --sign "$signing_identity" "$bundle"
 codesign --verify --deep --strict "$bundle"
 
 echo "bundled $bundle (version $version, binary minos ${binary_min:-unknown})"

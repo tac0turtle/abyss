@@ -3,8 +3,8 @@
 //! A mode of 0700 says nothing about ACL entries: an inherited or existing
 //! `everyone allow read,list` entry keeps granting access after `chmod`.
 //! [`strip`] removes every extended entry from one directory and checks none
-//! is left. It is used only on `dev.abyss` and `cache`, never on Application
-//! Support. The calls are the `_link_np` variants, which act on a symlink
+//! is left. It is used only on app-owned directories and files, never on
+//! Application Support. The calls are the `_link_np` variants, which act on a symlink
 //! itself rather than its target (the caller has already refused symlinks).
 //!
 //! `libc` 0.2 has no ACL bindings for Apple targets, so the five libSystem
@@ -58,7 +58,7 @@ fn entries(path: &CStr) -> io::Result<bool> {
 }
 
 /// Removes every extended ACL entry from `path`, then checks none is left.
-pub(super) fn strip(path: &Path) -> io::Result<()> {
+pub fn strip(path: &Path) -> io::Result<()> {
     let path = c_path(path)?;
     if !entries(&path)? {
         return Ok(());

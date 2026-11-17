@@ -46,7 +46,10 @@ impl Started {
     }
 }
 
-pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
+pub(crate) fn start(
+    launch: Launch,
+    secret_storage: Result<abyss_core::secret::SecretStorageConfig, StartError>,
+) -> Result<Started, StartError> {
     match launch {
         #[cfg(feature = "fake")]
         Launch::Fake {
@@ -66,6 +69,7 @@ pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
             // Opt-in only (`ABYSS_FAKE_CACHE=1`), never the real cache.
             let config = CoreConfig {
                 fake_faults: faults,
+                secret_storage: None,
                 cache: cache.and_then(|location| crate::storage::config(Ok(location))),
             };
             let core = abyss_core::start(config, BackendChoice::Fake(backend))?;
@@ -83,6 +87,7 @@ pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
             )]
             let config = CoreConfig {
                 cache: crate::storage::config(cache),
+                secret_storage: Some(secret_storage?),
                 ..CoreConfig::default()
             };
             let core = abyss_core::start(config, BackendChoice::Grammers(env))?;

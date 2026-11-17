@@ -3,6 +3,7 @@
 mod chat;
 mod launch;
 mod logging;
+mod preferences;
 mod shell;
 mod storage;
 mod ui;

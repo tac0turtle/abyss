@@ -46,6 +46,8 @@ pub struct CacheConfig {
 
 #[derive(Debug, Default)]
 pub struct CoreConfig {
+    /// Required for the real backend. Local storage unless explicitly opted in.
+    pub secret_storage: Option<crate::secret::SecretStorageConfig>,
     /// `None` runs without a disk cache.
     pub cache: Option<CacheConfig>,
     /// Faults for manual testing of the fake (`ABYSS_FAKE_FAULTS`).
@@ -93,6 +95,8 @@ pub enum BackendChoice {
 
 #[derive(Debug)]
 pub enum StartError {
+    /// The private secret storage location or preference is unavailable.
+    SecretStorage,
     Runtime(std::io::Error),
     Thread(std::io::Error),
     /// The persistence worker thread could not start.
@@ -266,7 +270,17 @@ pub fn start(config: CoreConfig, backend: BackendChoice) -> Result<CoreHandle, S
         }
         #[cfg(target_os = "macos")]
         BackendChoice::Grammers(env) => {
-            let store = crate::secret::KeychainStore::new();
+            let storage = config
+                .secret_storage
+                .as_ref()
+                .ok_or(StartError::SecretStorage)?;
+            let store = crate::secret::SwitchingStore::new(
+                crate::secret::SecretStorageConfig {
+                    dir: storage.dir.clone(),
+                    use_keychain: storage.use_keychain,
+                },
+                crate::secret::KeychainStore::new(),
+            );
             let slot = crate::credentials::CredentialSlot::new(env);
             let make = move |persist| GrammersBackend::new(slot, persist);
             start_with(config, make, store, || {})
@@ -642,6 +656,9 @@ mod tests {
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::SecretStorage => {
+                f.write_str("could not read the secret storage preference or locate its directory")
+            }
             Self::Runtime(_) => f.write_str("could not start the async runtime"),
             Self::Thread(_) => f.write_str("could not start the core thread"),
             Self::Persist(_) => f.write_str("could not start the session store"),
@@ -654,6 +671,7 @@ impl std::fmt::Display for StartError {
 impl std::error::Error for StartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::SecretStorage => None,
             Self::Runtime(e) | Self::Thread(e) | Self::Persist(e) => Some(e),
             #[cfg(not(target_os = "macos"))]
             Self::UnsupportedPlatform => None,

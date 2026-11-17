@@ -14,7 +14,7 @@
 //! The cache is disposable: a wrong key or unknown schema means "destroy and
 //! recreate", never "fail the app".
 
-mod backup;
+pub(crate) mod backup;
 mod db;
 
 use std::path::{Path, PathBuf};

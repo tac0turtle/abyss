@@ -22,7 +22,13 @@ pub(crate) const DESCRIPTOR: &str =
     "abyss is an unofficial Telegram client. It uses the Telegram API.";
 
 pub(crate) const APPEARANCE: &str = "Appearance";
-pub(crate) const APPEARANCE_MENU: &str = "Appearance…";
+pub(crate) const APPEARANCE_MENU: &str = "Settings…";
+pub(crate) const SETTINGS: &str = "Settings";
+pub(crate) const KEYCHAIN_STORAGE: &str = "Store secrets in Keychain";
+pub(crate) const KEYCHAIN_STORAGE_DETAIL: &str = "Off by default. When off, session secrets stay unencrypted in a private local file accessible to your macOS account. Changes apply next launch.";
+pub(crate) const KEYCHAIN_MIGRATION_NOTE: &str = "Switching storage may ask for access to existing Keychain items. With Keychain enabled, macOS controls access prompts.";
+pub(crate) const PREFERENCE_FAILED: &str =
+    "Couldn't read or save this setting. Click to retry, then restart abyss.";
 pub(crate) const APPEARANCE_NOTE: &str =
     "Pick a hue and how much of it. Lightness is fixed, so text stays readable in any hue.";
 pub(crate) const NIGHT: &str = "Night";
@@ -70,7 +76,7 @@ pub(crate) fn logged_out(remote: RemoteLogout, local: LocalDeletion) -> SharedSt
 /// A logout whose local deletion failed (plan section 5).
 pub(crate) const LOGOUT_INCOMPLETE_TITLE: &str = "Logout incomplete";
 pub(crate) const LOGOUT_INCOMPLETE_DETAIL: &str = "Some of this account's data couldn't be \
-     deleted from this Mac, and the session key may remain in the Keychain. Retry to finish \
+     deleted from this Mac, and the session key may remain in local storage. Retry to finish \
      before signing in again.";
 /// The remote half of an incomplete logout failed too.
 pub(crate) const LOGOUT_REMOTE_UNCONFIRMED: &str = "Telegram didn't confirm the sign-out: end \
@@ -79,20 +85,17 @@ pub(crate) const LOGOUT_REMOTE_UNCONFIRMED: &str = "Telegram didn't confirm the 
 /// The logout-pending marker could not be written, so nothing was done
 /// (review round 19).
 pub(crate) const LOGOUT_NOT_STARTED_TITLE: &str = "Couldn't start logout";
-pub(crate) const LOGOUT_NOT_STARTED_USER: &str = "abyss couldn't record the logout in the \
-     Keychain, so nothing was changed: you're still signed in on this Mac. Unlock the Keychain \
-     and retry.";
+pub(crate) const LOGOUT_NOT_STARTED_USER: &str = "abyss couldn't record the logout in local storage, so nothing was changed: you're still signed in on this Mac. Check local storage access and retry.";
 pub(crate) const LOGOUT_NOT_STARTED_SERVER: &str = "Telegram ended this session, but abyss \
-     couldn't record the logout in the Keychain, so nothing was deleted from this Mac yet. \
-     Unlock the Keychain and retry.";
+     couldn't record the logout in local storage, so nothing was deleted from this Mac yet. \
+     Check local storage access and retry.";
 pub(crate) const STAY_SIGNED_IN: &str = "Stay signed in";
 
 /// Startup couldn't read the logout-pending marker (review round 19). This
 /// is not a logout: nothing is deleted on it.
-pub(crate) const STARTUP_BLOCKED_TITLE: &str = "Couldn't read Keychain";
-pub(crate) const STARTUP_BLOCKED_DETAIL: &str = "abyss couldn't read its Keychain items, so it \
-     can't tell whether a logout is unfinished. Nothing was loaded or deleted. Unlock the \
-     Keychain and retry.";
+pub(crate) const STARTUP_BLOCKED_TITLE: &str = "Couldn't read local storage";
+pub(crate) const STARTUP_BLOCKED_DETAIL: &str = "abyss couldn't read its saved secrets, so it \
+     can't tell whether a logout is unfinished. Nothing was loaded or deleted. Check local storage access and retry.";
 
 /// Logout asks first: it deletes local data (plan section 17.3, task 6c).
 pub(crate) const LOGOUT_CONFIRM_TITLE: &str = "Log out?";
@@ -165,7 +168,7 @@ pub(crate) fn user_error(error: UserError) -> SharedString {
             "Too many sign-in attempts for this number. Try again later.".into()
         }
         UserError::CredentialsNotSaved(e) => format!(
-            "Your API credentials couldn't be saved to the Keychain ({}). abyss retries \
+            "Your API credentials couldn't be saved to local storage ({}). abyss retries \
              after the next sign-in step.",
             storage_error(e)
         )
@@ -182,8 +185,9 @@ pub(crate) fn user_error(error: UserError) -> SharedString {
 
 pub(crate) fn storage_error(error: StorageError) -> SharedString {
     match error {
+        StorageError::Local => "The private local storage file could not be accessed.".into(),
         StorageError::Keychain => "The Keychain refused the request.".into(),
-        StorageError::Corrupt => "Saved data was unreadable and was ignored.".into(),
+        StorageError::Corrupt => "Saved data could not be read.".into(),
         StorageError::Busy => "Too many saves at once; one was dropped.".into(),
         StorageError::Stopped => "Local storage stopped.".into(),
         StorageError::Random => "The system random number generator failed.".into(),
