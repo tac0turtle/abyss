@@ -254,12 +254,16 @@ fn directory_is_private_and_excluded_from_backup() {
     Cache::open(&dir, &key).unwrap();
     let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
-    let out = std::process::Command::new("tmutil")
-        .arg("isexcluded")
-        .arg(&dir)
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&out.stdout).contains("[Excluded]"));
+    // Backup exclusion is a Time Machine attribute; only macOS has it.
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("tmutil")
+            .arg("isexcluded")
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("[Excluded]"));
+    }
 }
 
 /// Task 9b: a symlinked cache directory is refused before anything is

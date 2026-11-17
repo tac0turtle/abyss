@@ -21,6 +21,7 @@ use crate::actor::{
 
 use crate::api::{Command, Event, LogoutStatus, SaveStatus, UserError};
 use crate::backend::Backend;
+#[cfg(target_os = "macos")]
 use crate::backend::grammers::GrammersBackend;
 use crate::events::{self, EpochObserver, EventReceiver, EventSender};
 use crate::secret::SecretStore;
@@ -96,6 +97,10 @@ pub enum StartError {
     Thread(std::io::Error),
     /// The persistence worker thread could not start.
     Persist(std::io::Error),
+    /// The real backend needs the macOS Keychain. Other hosts build and
+    /// test against the fake backend only.
+    #[cfg(not(target_os = "macos"))]
+    UnsupportedPlatform,
 }
 
 /// Why a command was not queued. Carries the command back.
@@ -247,6 +252,12 @@ impl CoreHandle {
 /// Starts core on its own thread.
 pub fn start(config: CoreConfig, backend: BackendChoice) -> Result<CoreHandle, StartError> {
     match backend {
+        #[cfg(not(target_os = "macos"))]
+        BackendChoice::Grammers(_) => {
+            let _ = config;
+            Err(StartError::UnsupportedPlatform)
+        }
+        #[cfg(target_os = "macos")]
         BackendChoice::Grammers(env) => {
             let store = crate::secret::KeychainStore::new();
             let slot = crate::credentials::CredentialSlot::new(env);
@@ -634,6 +645,8 @@ impl std::fmt::Display for StartError {
             Self::Runtime(_) => f.write_str("could not start the async runtime"),
             Self::Thread(_) => f.write_str("could not start the core thread"),
             Self::Persist(_) => f.write_str("could not start the session store"),
+            #[cfg(not(target_os = "macos"))]
+            Self::UnsupportedPlatform => f.write_str("the real backend needs macOS"),
         }
     }
 }
@@ -642,6 +655,8 @@ impl std::error::Error for StartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Runtime(e) | Self::Thread(e) | Self::Persist(e) => Some(e),
+            #[cfg(not(target_os = "macos"))]
+            Self::UnsupportedPlatform => None,
         }
     }
 }
