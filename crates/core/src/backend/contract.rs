@@ -4,9 +4,10 @@
 //! session, task 12).
 //!
 //! Checked: a build from stored state; the baseline before any update; dialog
-//! paging without overlap; history order and anchors; one `random_id` never
-//! producing two messages; read marks; `quit` stopping the runner; `retire`
-//! returning a usable snapshot. All values must pass the domain validators.
+//! paging without overlap; history order and anchors (`Around` and its
+//! bounds included); one `random_id` never producing two messages; read
+//! marks; `quit` stopping the runner; `retire` returning a usable snapshot.
+//! All values must pass the domain validators.
 //!
 //! Forums (Stage 2 task 3): topic pages in the reported order without
 //! overlap, pinned topics first, cursors carrying their page's order; by-id
@@ -19,8 +20,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use super::{
-    Backend, BackendError, Client, HistoryQuery, Instance, InstanceControl, Seed, SessionSeed,
-    SessionSnapshot, StreamError, StreamItem, Update, UpdateStream,
+    AROUND_CONTEXT, Backend, BackendError, Client, HistoryQuery, Instance, InstanceControl,
+    MAX_HISTORY_PAGE, Seed, SessionSeed, SessionSnapshot, StreamError, StreamItem, Update,
+    UpdateStream,
 };
 use crate::model::{
     ChatId, ChatKind, Message, MsgId, ThreadKey, TopicId, TopicOrder, TopicSnapshot,
@@ -346,7 +348,55 @@ async fn check_history(client: &impl Client, chat: ChatId) -> Option<MsgId> {
         got.starts_with(&expected),
         "After returns the anchor's successors: {got:?} vs {expected:?}"
     );
+    check_around(client, chat, &tail.messages).await;
     tail.messages.last().map(|m| m.id)
+}
+
+/// `Around` (Stage 2 plan section 17.6.4) at the tail's oldest message:
+/// at most `AROUND_CONTEXT` messages at or below it, ending with it, and
+/// the rest above it, starting with its successors from the tail. Outside
+/// its bounds it is refused: no successor, a negative anchor, or a limit
+/// outside `AROUND_CONTEXT < limit ≤ MAX_HISTORY_PAGE`.
+async fn check_around(client: &impl Client, chat: ChatId, tail: &[Message]) {
+    let thread = ThreadKey::whole(chat);
+    let Some(anchor) = tail.first().map(|m| m.id) else {
+        return;
+    };
+    let page = client
+        .history(thread, HistoryQuery::Around(anchor), PAGE)
+        .await
+        .expect("around");
+    assert_history(&page.messages, chat, PAGE);
+    let (below, above): (Vec<MsgId>, Vec<MsgId>) = page
+        .messages
+        .iter()
+        .map(|m| m.id)
+        .partition(|id| *id <= anchor);
+    assert!(below.len() <= usize::try_from(AROUND_CONTEXT).unwrap());
+    assert!(above.len() <= usize::try_from(PAGE - AROUND_CONTEXT).unwrap());
+    assert_eq!(below.last(), Some(&anchor), "the anchor closes the context");
+    let successors: Vec<MsgId> = tail.iter().skip(1).map(|m| m.id).collect();
+    assert!(
+        above.starts_with(&successors),
+        "Around continues with the anchor's successors: {above:?} vs {successors:?}"
+    );
+    for (anchor, limit) in [
+        (MsgId(i32::MAX), PAGE),
+        (MsgId(-1), PAGE),
+        (anchor, 0),
+        (anchor, AROUND_CONTEXT),
+        (anchor, MAX_HISTORY_PAGE + 1),
+    ] {
+        assert!(
+            matches!(
+                client
+                    .history(thread, HistoryQuery::Around(anchor), limit)
+                    .await,
+                Err(BackendError::Rejected(_))
+            ),
+            "Around({anchor:?}) of {limit} is refused"
+        );
+    }
 }
 
 /// Builds a new instance from the retired one's snapshot, carrying `chat`

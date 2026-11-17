@@ -118,6 +118,41 @@ pub enum HistoryQuery {
     Before(MsgId),
     /// Messages with id above the given one.
     After(MsgId),
+    /// A page anchored at the given id (Stage 2 plan section 17.6.4): up to
+    /// [`AROUND_CONTEXT`] messages at or below it, and up to the rest of the
+    /// page above it. Its bounds are [`around`]'s.
+    Around(MsgId),
+}
+
+/// Telegram's history page maximum.
+pub const MAX_HISTORY_PAGE: u32 = 100;
+/// How many messages at or below its anchor an `Around` page holds, at most.
+pub const AROUND_CONTEXT: u32 = 10;
+
+/// Where an `Around(anchor)` page of `limit` messages is taken from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AroundPage {
+    /// The anchor's successor: the page is requested from here down.
+    pub successor: MsgId,
+    /// Messages above the anchor, at most (`limit - AROUND_CONTEXT`).
+    pub above: u32,
+}
+
+/// The bounds of an `Around(anchor)` page of `limit` messages, which every
+/// backend applies before calling: `0 < limit ≤ MAX_HISTORY_PAGE`,
+/// `AROUND_CONTEXT < limit`, a non-negative anchor, and an anchor with a
+/// successor (`i32::MAX` has none: no message can be newer, and core opens
+/// the tail instead). Anything else is `Rejected`, without a call.
+pub fn around(anchor: MsgId, limit: u32) -> Result<AroundPage, BackendError> {
+    let refused = BackendError::Rejected(RejectReason::Other);
+    if limit == 0 || limit > MAX_HISTORY_PAGE || AROUND_CONTEXT >= limit || anchor.0 < 0 {
+        return Err(refused);
+    }
+    let successor = anchor.0.checked_add(1).ok_or(refused)?;
+    Ok(AroundPage {
+        successor: MsgId(successor),
+        above: limit - AROUND_CONTEXT,
+    })
 }
 
 #[derive(Debug)]
@@ -429,6 +464,8 @@ pub trait Client: Send + Sync + 'static {
         edit: FolderEdit,
     ) -> impl Future<Output = Result<(), BackendError>> + Send;
 
+    /// One page of `thread`'s history, ascending. `Around` is refused
+    /// without a call outside [`around`]'s bounds.
     fn history(
         &self,
         thread: ThreadKey,

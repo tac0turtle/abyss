@@ -3,6 +3,7 @@
 //! runtime; never blocks.
 
 mod admission;
+mod anchored;
 mod apply;
 mod auth;
 mod auth_outcome;
@@ -82,6 +83,7 @@ fn account_scoped(cmd: &Command) -> bool {
         cmd,
         Command::LoadDialogs
             | Command::OpenThread(_)
+            | Command::OpenThreadAt { .. }
             | Command::CloseThread(_)
             | Command::LoadOlder(_)
             | Command::LoadNewer(_)
@@ -153,6 +155,11 @@ pub(crate) struct Actor<B: Backend> {
     deferred: Vec<loads::Deferred>,
     /// The history load in flight that owes the UI its answer (task 10f).
     owed: Option<loads::Owed>,
+    /// The `OpenThreadAt` load in flight (`anchored`).
+    anchored: Option<anchored::Anchored>,
+    /// The tail in flight that restores the open window's cache continuity
+    /// (`anchored`, `TailMode::Restore`).
+    restoring: Option<Load>,
     /// Server history known to cover threads with `SentUnconfirmed` sends.
     covers: covered::Covers,
     /// Source of [`jobs::ReqId`]s.
@@ -260,6 +267,8 @@ impl<B: Backend> Actor<B> {
             history_busy: HashMap::new(),
             deferred: Vec::with_capacity(loads::MAX_DEFERRED),
             owed: None,
+            anchored: None,
+            restoring: None,
             covers: covered::Covers::default(),
             next_req: 0,
             dialogs_busy: false,
@@ -349,6 +358,7 @@ impl<B: Backend> Actor<B> {
             self.run_deferred_loads().await;
             self.run_cover_fetch().await;
             debug_assert!(self.owed_is_current(), "owed load of an old view");
+            debug_assert!(self.anchored_is_current(), "anchored load of an old view");
             debug_assert!(self.open_is_retained(), "open chat without its window");
             self.pump_topics().await;
             self.sync_members().await;
@@ -551,6 +561,7 @@ impl<B: Backend> Actor<B> {
                 Job::History { load, .. } => {
                     self.release_history(load);
                     self.covers.fetch_ended(load.thread, load.req);
+                    self.restoring.take_if(|l| *l == load);
                 }
                 Job::TopicsPage { call, .. } | Job::TopicsById { call, .. } => {
                     self.topics_job_purged(call);
@@ -626,9 +637,13 @@ impl<B: Backend> Actor<B> {
                 // it still runs (and answers), and a load of an old view or a
                 // background load answers nothing (task 10f).
                 self.covers.fetch_ended(load.thread, load.req);
+                self.restoring.take_if(|l| *l == load);
                 if self.take_owed(load).is_some() {
                     self.history_ended(load.thread, dir, Some(UserError::Internal))
                         .await;
+                }
+                if let Some(anchored) = self.anchored.take_if(|a| a.load == load) {
+                    self.anchored_failed(anchored, UserError::Internal).await;
                 }
                 self.snapshot_done(boot::Snapshot::Tail(load)).await;
             }
@@ -684,6 +699,7 @@ impl<B: Backend> Actor<B> {
         match cmd {
             Command::LoadDialogs => self.load_dialogs().await,
             Command::OpenThread(thread) => self.open_thread(thread).await,
+            Command::OpenThreadAt { thread, after } => self.open_thread_at(thread, after).await,
             Command::CloseThread(thread) => self.close_thread(thread).await,
             Command::OpenForum(chat) => self.open_forum(chat).await,
             Command::CloseForum(chat) => self.close_forum(chat),
@@ -791,19 +807,11 @@ impl<B: Backend> Actor<B> {
         if self.refuse_open(thread).await {
             return;
         }
-        if let Some(prev) = self.open.filter(|p| *p != thread) {
-            self.windows.close(prev);
-            self.forget_owed(prev);
-        }
-        self.forget_owed(thread);
         // A detached window is not what the user asked for: start from the tail.
         if self.windows.get(thread).is_some_and(Window::has_newer) {
             self.windows.invalidate(thread);
         }
-        let view = self.windows.open(thread);
-        self.note_kinds();
-        let prev = self.open.replace(thread);
-        self.follow_open_thread(prev).await;
+        let view = self.show_thread(thread).await;
         self.seed_view(thread, view).await;
         if self.is_fenced(thread.chat) {
             // The fence's lift loads the open thread's tail (`fences`).
@@ -811,13 +819,33 @@ impl<B: Backend> Actor<B> {
         }
         let load = self.begin_load(thread, view);
         self.claim_if_booting(load);
+        self.touch_cache(thread).await;
+        // The server tail is requested once the cache tail is shown.
+        self.start_tail(load, boot::TailVia::Cache).await;
+    }
+
+    /// Makes `thread` the open thread with a new view, closing the previous
+    /// one: loads of either thread's old views owe the UI nothing any more.
+    async fn show_thread(&mut self, thread: ThreadKey) -> ViewGen {
+        if let Some(prev) = self.open.filter(|p| *p != thread) {
+            self.windows.close(prev);
+            self.forget_owed(prev);
+        }
+        self.forget_owed(thread);
+        let view = self.windows.open(thread);
+        self.note_kinds();
+        let prev = self.open.replace(thread);
+        self.follow_open_thread(prev).await;
+        view
+    }
+
+    /// Marks `thread`'s chat as just used in the cache (its eviction order).
+    async fn touch_cache(&self, thread: ThreadKey) {
         if let Some(cache) = &self.cache {
             cache
                 .write(crate::cache::CacheCmd::Touch(thread.chat))
                 .await;
         }
-        // The server tail is requested once the cache tail is shown.
-        self.start_tail(load, boot::TailVia::Cache).await;
     }
 
     /// Emits the window `thread` retains as a complete `Tail` of `view`, so a

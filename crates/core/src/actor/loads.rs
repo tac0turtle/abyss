@@ -63,17 +63,16 @@ impl<B: Backend> Actor<B> {
         self.emit(Event::LoadEnded { target, error }).await;
     }
 
-    /// [`Self::load_ended`] for a history load.
+    /// [`Self::load_ended`] for a history load the UI asked for: a
+    /// `LoadOlder`/`LoadNewer`, or an `OpenThreadAt`'s load (`anchored`).
     pub(super) async fn history_ended(
         &self,
         thread: ThreadKey,
         dir: HistoryDir,
         error: Option<UserError>,
     ) {
-        if matches!(dir, HistoryDir::Older | HistoryDir::Newer) {
-            self.load_ended(LoadTarget::History { thread, dir }, error)
-                .await;
-        }
+        self.load_ended(LoadTarget::History { thread, dir }, error)
+            .await;
     }
 
     /// Remembers a `LoadOlder`/`LoadNewer` that arrived while another load
@@ -132,9 +131,11 @@ impl<B: Backend> Actor<B> {
 
     /// `thread`'s view changes (opened, closed, replaced or invalidated): a
     /// load of the old view owes the UI nothing, as the UI forgets its
-    /// pending loads with the old view.
+    /// pending loads with the old view. That includes an anchored open's
+    /// load (`anchored`): a new view of its thread drops the anchor.
     pub(super) fn forget_owed(&mut self, thread: ThreadKey) {
         self.owed.take_if(|o| o.load.thread == thread);
+        self.anchored.take_if(|a| a.load.thread == thread);
     }
 
     /// Invariant, checked once per actor loop turn: an owed load belongs

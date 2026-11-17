@@ -93,6 +93,11 @@ impl<B: Backend> Actor<B> {
                 self.history_ended(thread, HistoryDir::Newer, Some(UserError::Busy))
                     .await;
             }
+            // Its fallback (`OpenThread`) is the UI's.
+            Command::OpenThreadAt { thread, .. } => {
+                self.history_ended(thread, HistoryDir::Tail, Some(UserError::Busy))
+                    .await;
+            }
             Command::OpenForum(chat) | Command::LoadTopics(chat) => {
                 self.load_ended(LoadTarget::Topics(chat), Some(UserError::Busy))
                     .await;

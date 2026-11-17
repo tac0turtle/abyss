@@ -171,14 +171,45 @@ pub(crate) fn send_request(
     }
 }
 
-/// `messages.getHistory` arguments for a query: `(offset_id, add_offset, min_id)`.
-pub(crate) fn history_offsets(query: HistoryQuery, limit: i32) -> (i32, i32, i32) {
-    match query {
-        HistoryQuery::Tail => (0, 0, 0),
-        HistoryQuery::Before(id) => (id.0, 0, 0),
+/// The offset arguments `messages.getHistory` and `messages.getReplies`
+/// share, for one page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryOffsets {
+    pub(crate) offset_id: i32,
+    pub(crate) add_offset: i32,
+    pub(crate) limit: i32,
+    pub(crate) min_id: i32,
+}
+
+/// The offsets for `query` and a page of `limit` messages. `Tail`,
+/// `Before` and `After` clamp `limit` to `1..=MAX_PAGE`; `Around` is
+/// refused outside [`crate::backend::around`]'s bounds, without a call
+/// (Stage 2 plan section 17.6.4).
+pub(crate) fn history_offsets(
+    query: HistoryQuery,
+    limit: u32,
+) -> Result<HistoryOffsets, BackendError> {
+    let page = page_limit(limit);
+    let offsets = |offset_id, add_offset, min_id| HistoryOffsets {
+        offset_id,
+        add_offset,
+        limit: page,
+        min_id,
+    };
+    Ok(match query {
+        HistoryQuery::Tail => offsets(0, 0, 0),
+        HistoryQuery::Before(id) => offsets(id.0, 0, 0),
         // Newer than `id`: page backwards from it, and let `min_id` cut it off.
-        HistoryQuery::After(id) => (id.0, limit.saturating_neg(), id.0),
-    }
+        HistoryQuery::After(id) => offsets(id.0, page.saturating_neg(), id.0),
+        // From the anchor's successor, `above` messages back towards it
+        // and the rest at or below it (*live*: L1).
+        HistoryQuery::Around(anchor) => {
+            let around = crate::backend::around(anchor, limit)?;
+            let above = i32::try_from(around.above)
+                .map_err(|_| BackendError::Rejected(RejectReason::Other))?;
+            offsets(around.successor.0, above.saturating_neg(), 0)
+        }
+    })
 }
 
 /// The request for one page of a thread's history.
@@ -189,31 +220,28 @@ pub(crate) enum HistoryRequest {
     Topic(tl::functions::messages::GetReplies),
 }
 
-/// The history request for `thread`'s page. `history_offsets` applies to
-/// both calls, which take the same offset arguments (*live*: the `After`
-/// semantics for `getReplies`, as for `getHistory` in Stage 1).
+/// The history request for `thread`'s page at `offsets`
+/// ([`history_offsets`]), which both calls take alike (*live*: the `After`
+/// semantics for `getReplies`, as for `getHistory` in Stage 1, and `Around`
+/// for both, L1).
 pub(crate) fn history_request(
     peer: tl::enums::InputPeer,
     topic: Option<TopicId>,
-    query: HistoryQuery,
-    limit: i32,
+    offsets: HistoryOffsets,
 ) -> HistoryRequest {
     match topic {
-        None => {
-            let (offset_id, add_offset, min_id) = history_offsets(query, limit);
-            HistoryRequest::Chat(tl::functions::messages::GetHistory {
-                peer,
-                offset_id,
-                offset_date: 0,
-                add_offset,
-                limit,
-                max_id: 0,
-                min_id,
-                hash: 0,
-            })
-        }
-        Some(TopicId::GENERAL) => general_history(peer, query, limit),
-        Some(topic) => HistoryRequest::Topic(replies_request(peer, topic, query, limit)),
+        None => HistoryRequest::Chat(tl::functions::messages::GetHistory {
+            peer,
+            offset_id: offsets.offset_id,
+            offset_date: 0,
+            add_offset: offsets.add_offset,
+            limit: offsets.limit,
+            max_id: 0,
+            min_id: offsets.min_id,
+            hash: 0,
+        }),
+        Some(TopicId::GENERAL) => general_history(peer, offsets),
+        Some(topic) => HistoryRequest::Topic(replies_request(peer, topic, offsets)),
     }
 }
 
@@ -222,26 +250,24 @@ pub(crate) fn history_request(
 /// returns them is unverified. The fallback is `messages.search` with
 /// `top_msg_id = 1`, `q = ""` and an empty filter (same response type).
 /// Live verification flips this function only.
-fn general_history(peer: tl::enums::InputPeer, query: HistoryQuery, limit: i32) -> HistoryRequest {
-    HistoryRequest::Topic(replies_request(peer, TopicId::GENERAL, query, limit))
+fn general_history(peer: tl::enums::InputPeer, offsets: HistoryOffsets) -> HistoryRequest {
+    HistoryRequest::Topic(replies_request(peer, TopicId::GENERAL, offsets))
 }
 
 fn replies_request(
     peer: tl::enums::InputPeer,
     topic: TopicId,
-    query: HistoryQuery,
-    limit: i32,
+    offsets: HistoryOffsets,
 ) -> tl::functions::messages::GetReplies {
-    let (offset_id, add_offset, min_id) = history_offsets(query, limit);
     tl::functions::messages::GetReplies {
         peer,
         msg_id: topic.get(),
-        offset_id,
+        offset_id: offsets.offset_id,
         offset_date: 0,
-        add_offset,
-        limit,
+        add_offset: offsets.add_offset,
+        limit: offsets.limit,
         max_id: 0,
-        min_id,
+        min_id: offsets.min_id,
         hash: 0,
     }
 }
@@ -648,14 +674,15 @@ impl<I: Invoke> Calls<I> {
         limit: u32,
     ) -> Result<HistoryPage, BackendError> {
         require_thread(thread)?;
+        // Bounds first: an `Around` outside them is refused before any call.
+        let offsets = history_offsets(query, limit)?;
         let (peer, _in_flight) = self.resolve_used(thread.chat).await?;
-        let limit = page_limit(limit);
-        let resp = match history_request(peer, thread.topic, query, limit) {
+        let resp = match history_request(peer, thread.topic, offsets) {
             HistoryRequest::Chat(r) => call(&self.invoker, RetryClass::Read, &r).await,
             HistoryRequest::Topic(r) => call(&self.invoker, RetryClass::Read, &r).await,
         }
         .map_err(|e| fail(&e))?;
-        let limit = usize::try_from(limit).unwrap_or(0);
+        let limit = usize::try_from(offsets.limit).unwrap_or(0);
         let parts = map::messages_parts(&resp, limit).map_err(|map::Oversized| oversized())?;
         let dir = Directory::from_lists(parts.users, parts.chats);
         self.remember(&dir, &[]);

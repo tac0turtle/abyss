@@ -32,6 +32,18 @@ pub enum Command {
     /// Loads the first dialogs page, or the next page once one is loaded.
     LoadDialogs,
     OpenThread(ThreadKey),
+    /// Opens `thread` at its read position `after` (Stage 2 plan section
+    /// 17.6.5): no retained window or cached history is shown; only a page
+    /// fetched for this open proves where the first message above `after`
+    /// is. Answered by `History` of a new view in `Tail` (the server tail
+    /// reaches `after`, or holds the whole history) or `Around` (a detached
+    /// window around `after`), or by `LoadEnded { History { thread, dir:
+    /// Tail | Around } }` when that load fails (offline included). Refused
+    /// like `OpenThread`, and a negative `after` is `Rejected`.
+    OpenThreadAt {
+        thread: ThreadKey,
+        after: MsgId,
+    },
     CloseThread(ThreadKey),
     /// Scrolls the open window up (older history).
     LoadOlder(ThreadKey),
@@ -124,6 +136,11 @@ impl std::fmt::Debug for Command {
             Self::RetryPasswordParams => f.write_str("RetryPasswordParams"),
             Self::LoadDialogs => f.write_str("LoadDialogs"),
             Self::OpenThread(t) => f.debug_tuple("OpenThread").field(t).finish(),
+            Self::OpenThreadAt { thread, after } => f
+                .debug_struct("OpenThreadAt")
+                .field("thread", thread)
+                .field("after", after)
+                .finish(),
             Self::CloseThread(t) => f.debug_tuple("CloseThread").field(t).finish(),
             Self::LoadOlder(t) => f.debug_tuple("LoadOlder").field(t).finish(),
             Self::LoadNewer(t) => f.debug_tuple("LoadNewer").field(t).finish(),
@@ -277,7 +294,8 @@ pub enum UserError {
 pub enum LoadTarget {
     /// `LoadDialogs`.
     Dialogs,
-    /// `LoadOlder` (`dir: Older`) or `LoadNewer` (`dir: Newer`) of `thread`.
+    /// `LoadOlder` (`dir: Older`) or `LoadNewer` (`dir: Newer`) of
+    /// `thread`, or the load of an `OpenThreadAt` (`dir: Tail | Around`).
     History { thread: ThreadKey, dir: HistoryDir },
     /// `OpenForum` or `LoadTopics` of this forum.
     Topics(ChatId),
@@ -292,6 +310,11 @@ pub enum HistoryDir {
     Older,
     /// Newer history, including live messages (`has_more = false`).
     Newer,
+    /// A new view's window around an `OpenThreadAt` anchor, replacing the
+    /// window: up to `AROUND_CONTEXT` messages at or below the anchor and
+    /// the rest above it. It is detached (`has_more`: newer history exists;
+    /// `LoadNewer` pages towards the tail), and older history may exist.
+    Around,
 }
 
 #[derive(Debug)]

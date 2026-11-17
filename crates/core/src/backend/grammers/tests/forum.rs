@@ -777,6 +777,69 @@ async fn topic_history_uses_get_replies_and_general_follows_u1() {
     assert!(tl::functions::messages::GetHistory::from_boxed_bytes(&requests[2]).is_ok());
 }
 
+/// `Around` asks both calls from the anchor's successor, 40 messages back
+/// above it (10 at or below), keeps both sides of the anchor, and is
+/// refused without a call outside its bounds: no successor, a negative
+/// anchor, or a limit outside `AROUND_CONTEXT < limit ≤ 100`.
+#[tokio::test]
+async fn around_pages_ask_from_the_successor_in_both_calls() {
+    let mock = Mock::with(vec![
+        Ok(messages_reply(&[(9, Some(5)), (6, Some(5))])),
+        Ok(messages_reply(&[(2, None), (1, None)])),
+    ]);
+    let calls = setup(&mock).await;
+    let topic = calls
+        .history(thread(Some(5)), HistoryQuery::Around(MsgId(7)), 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        topic.messages.iter().map(|m| m.id.0).collect::<Vec<_>>(),
+        vec![6, 9],
+        "both sides of the anchor, ascending"
+    );
+    calls
+        .history(thread(None), HistoryQuery::Around(MsgId(0)), 50)
+        .await
+        .unwrap();
+    for (anchor, limit) in [(i32::MAX, 50), (-1, 50), (7, 0), (7, 10), (7, 101)] {
+        assert_eq!(
+            calls
+                .history(thread(Some(5)), HistoryQuery::Around(MsgId(anchor)), limit)
+                .await
+                .unwrap_err(),
+            BackendError::Rejected(RejectReason::Other),
+            "anchor {anchor}, limit {limit}"
+        );
+    }
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2, "refused pages make no call");
+    let replies = tl::functions::messages::GetReplies::from_boxed_bytes(&requests[0]).unwrap();
+    assert_eq!(
+        (
+            replies.msg_id,
+            replies.offset_id,
+            replies.add_offset,
+            replies.limit,
+            replies.max_id,
+            replies.min_id
+        ),
+        (5, 8, -40, 50, 0, 0)
+    );
+    let history = tl::functions::messages::GetHistory::from_boxed_bytes(&requests[1]).unwrap();
+    assert_eq!(
+        (
+            history.offset_id,
+            history.add_offset,
+            history.limit,
+            history.max_id,
+            history.min_id
+        ),
+        (1, -40, 50, 0, 0),
+        "an anchor of 0 asks for the oldest messages"
+    );
+}
+
 #[tokio::test]
 async fn sends_into_a_topic_reply_to_its_root_and_general_has_no_reply() {
     let short_sent = |id: i32| {

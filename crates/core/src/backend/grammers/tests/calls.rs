@@ -327,14 +327,13 @@ async fn read_history_sends_the_displayed_max_id() {
 
 #[test]
 fn history_offsets_per_query() {
-    assert_eq!(history_offsets(HistoryQuery::Tail, 50), (0, 0, 0));
+    let offsets =
+        |query| history_offsets(query, 50).map(|o| (o.offset_id, o.add_offset, o.limit, o.min_id));
+    assert_eq!(offsets(HistoryQuery::Tail), Ok((0, 0, 50, 0)));
+    assert_eq!(offsets(HistoryQuery::Before(MsgId(10))), Ok((10, 0, 50, 0)));
     assert_eq!(
-        history_offsets(HistoryQuery::Before(MsgId(10)), 50),
-        (10, 0, 0)
-    );
-    assert_eq!(
-        history_offsets(HistoryQuery::After(MsgId(10)), 50),
-        (10, -50, 10)
+        offsets(HistoryQuery::After(MsgId(10))),
+        Ok((10, -50, 50, 10))
     );
 }
 

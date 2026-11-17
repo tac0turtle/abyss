@@ -2,6 +2,7 @@
 
 use super::Actor;
 use super::FoldersLoad;
+use super::anchored::Anchored;
 use super::badges::Stated;
 use super::boot::{BootKind, Origin, Snapshot, TailVia};
 use super::jobs::{
@@ -77,6 +78,11 @@ pub(super) enum TailMode {
     Replace,
     /// Merge into the window in place (light refresh).
     Merge,
+    /// Merge into the window in place, keeping the view and its viewport,
+    /// and write the tail through to restore cache continuity (Stage 2 plan
+    /// section 17.6.6): the tail a `Newer` page asked for when it attached
+    /// a window whose cache isn't contiguous.
+    Restore,
 }
 
 /// A history response, unpacked.
@@ -105,6 +111,8 @@ pub(super) struct LoadEnd {
     cover_fetch: bool,
     /// It owed the UI its answer (`loads.rs`).
     owed: Option<Owed>,
+    /// It was an `OpenThreadAt` load (`anchored.rs`).
+    anchored: Option<Anchored>,
 }
 
 /// The ids a server page covered: its oldest and newest message as the
@@ -260,12 +268,14 @@ impl<B: Backend> Actor<B> {
             .map(|b| b.kind);
         self.release_history(load);
         // Whatever the outcome or the view, the load's metadata goes now: a
-        // stale reply must not leave a covering fetch or an owed answer
-        // behind (task 10f).
+        // stale reply must not leave a covering fetch, an owed answer or an
+        // anchored open behind (task 10f).
         let ended = LoadEnd {
             cover_fetch: self.covers.fetch_ended(load.thread, load.req),
             owed: self.take_owed(load),
+            anchored: self.anchored.take_if(|a| a.load == load),
         };
+        let restore = self.restoring.take_if(|l| *l == load).is_some();
         match res {
             Ok(HistoryPage { messages, has_more }) => {
                 // Normalized before anything reads it: coverage, the window
@@ -276,6 +286,8 @@ impl<B: Backend> Actor<B> {
                 };
                 let mode = if boot == Some(BootKind::Refresh) {
                     TailMode::Merge
+                } else if restore {
+                    TailMode::Restore
                 } else {
                     TailMode::Replace
                 };
@@ -301,6 +313,10 @@ impl<B: Backend> Actor<B> {
                 if ended.owed.is_some() {
                     self.history_ended(load.thread, req.dir, Some(user_error(e)))
                         .await;
+                }
+                // The anchored open's fallback is the UI's (`OpenThread`).
+                if let Some(anchored) = ended.anchored {
+                    self.anchored_failed(anchored, user_error(e)).await;
                 }
             }
         }
@@ -501,7 +517,7 @@ impl<B: Backend> Actor<B> {
         };
         let has_more = match dir {
             HistoryDir::Tail | HistoryDir::Older => w.has_older(),
-            HistoryDir::Newer => w.has_newer(),
+            HistoryDir::Newer | HistoryDir::Around => w.has_newer(),
         };
         let mut ids = change.inserted;
         ids.sort_unstable();
@@ -638,10 +654,15 @@ impl<B: Backend> Actor<B> {
                 .messages
                 .retain(|m| !boot.is_dead(p.thread.chat, m.id));
         }
+        if let Some(anchored) = ended.anchored {
+            return self.on_anchored(p, anchored).await;
+        }
         match p.dir {
-            HistoryDir::Tail if p.mode == TailMode::Merge => self.merge_tail(p).await,
-            HistoryDir::Tail => self.on_tail(p).await,
+            HistoryDir::Tail if p.mode == TailMode::Replace => self.on_tail(p).await,
+            HistoryDir::Tail => self.merge_tail(p).await,
             HistoryDir::Older => self.on_older(p, ended).await,
+            // Only an anchored open asks for one.
+            HistoryDir::Around => tracing::debug!("an Around page without its open dropped"),
             HistoryDir::Newer => {
                 let lo = match p.query {
                     HistoryQuery::After(id) => MsgId(id.0.saturating_add(1)),
@@ -657,6 +678,7 @@ impl<B: Backend> Actor<B> {
                 if let Ok(change) = self.windows.append_newer(p.thread, p.view, p.page) {
                     self.emit_history(p.thread, p.view, p.dir, change).await;
                 }
+                self.restore_if_attached(p.thread, p.view).await;
             }
         }
     }
@@ -769,30 +791,7 @@ impl<B: Backend> Actor<B> {
             .filter(|m| top.is_none_or(|t| m.id > t))
             .cloned();
         page.messages.extend(late);
-        // The cache is reconciled from the page's covered start (not from the
-        // first message tombstones left), or from the start of history when
-        // the page is all of it. A partial page that covered nothing proves
-        // nothing: the cache is left alone and is not contiguous.
-        //
-        // A tail requested before the window last lost continuity may
-        // predate messages that bypassed it: it neither writes the cache
-        // nor restores continuity (only a later tail does).
-        let from = match (page.has_more, range) {
-            (false, _) => Some(None),
-            (true, Some((lo, _))) => Some(Some(lo)),
-            (true, None) => None,
-        }
-        .filter(|_| self.windows.may_restore(thread, since));
-        if self.cache.is_some()
-            && let Some(from) = from
-        {
-            self.cache_write(CacheCmd::ReconcileTail {
-                thread,
-                messages: page.messages.clone(),
-                from,
-            })
-            .await;
-        }
+        let written = self.write_tail(thread, since, &page, range).await;
         let Some(view) = self.windows.invalidate(thread) else {
             return;
         };
@@ -800,7 +799,7 @@ impl<B: Backend> Actor<B> {
         // forgets them on the new view's `Tail` and asks again if needed.
         self.deferred.retain(|d| d.thread != thread);
         self.forget_owed(thread);
-        if self.cache.is_some() && from.is_some() {
+        if written {
             self.windows.set_cache_contiguous(thread);
         }
         if let Ok(change) = self.windows.prepend(thread, view, page) {
@@ -810,6 +809,43 @@ impl<B: Backend> Actor<B> {
         self.emit_reconciled(thread, view).await;
         self.tail_covers(thread, view, req, range.map(|(lo, _)| lo))
             .await;
+    }
+
+    /// Writes a server tail through to `thread`'s cache (`ReconcileTail`):
+    /// `page` is the server's page plus the window's messages above its
+    /// authoritative top (live messages that arrived after the request).
+    /// The cache is reconciled from the page's covered start (not from the
+    /// first message tombstones left), or from the start of history when
+    /// the page is all of it. A partial page that covered nothing proves
+    /// nothing: the cache is left alone and is not contiguous.
+    ///
+    /// A tail requested before the window last lost continuity may predate
+    /// messages that bypassed it: it neither writes the cache nor restores
+    /// continuity (only a later tail does). Returns whether it was written:
+    /// only then is the cache contiguous with the live tail.
+    pub(super) async fn write_tail(
+        &self,
+        thread: ThreadKey,
+        since: ContinuityMark,
+        page: &HistoryPage,
+        range: Option<(MsgId, MsgId)>,
+    ) -> bool {
+        let from = match (page.has_more, range) {
+            (false, _) => Some(None),
+            (true, Some((lo, _))) => Some(Some(lo)),
+            (true, None) => None,
+        }
+        .filter(|_| self.windows.may_restore(thread, since));
+        let Some(from) = from.filter(|_| self.cache.is_some()) else {
+            return false;
+        };
+        self.cache_write(CacheCmd::ReconcileTail {
+            thread,
+            messages: page.messages.clone(),
+            from,
+        })
+        .await;
+        true
     }
 
     /// Tells the UI that `view` of `thread` now matches the server's tail.

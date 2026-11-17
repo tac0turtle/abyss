@@ -449,6 +449,34 @@ impl Windows {
         Ok(change)
     }
 
+    /// Fills `thread`'s window with a page around an anchor (Stage 2 plan
+    /// section 17.6.5), replacing whatever it holds (live messages that
+    /// reached it while the open loaded, which the page need not continue).
+    /// The window is detached: newer history exists above the page, so live
+    /// messages stay out until `append_newer` reaches the tail, and older
+    /// history may exist below it.
+    pub fn anchor(
+        &mut self,
+        thread: ThreadKey,
+        view_gen: ViewGen,
+        page: HistoryPage,
+    ) -> Result<Change, Stale> {
+        self.current(thread, view_gen)?;
+        let mut change = Change::default();
+        while self.pop_one(thread, End::Newest, &mut change) {}
+        for m in sorted_unique(thread, page.messages, |_| true) {
+            let pos = self.by_thread.get(&thread).map_or(0, |w| w.messages.len());
+            self.insert_sorted(thread, pos, m, &mut change);
+        }
+        if let Some(w) = self.by_thread.get_mut(&thread) {
+            w.has_older = true;
+            w.has_newer = true;
+        }
+        self.trim(thread, End::Oldest, &mut change);
+        self.enforce_byte_budget(thread, End::Oldest, &mut change);
+        Ok(change)
+    }
+
     fn current(&mut self, thread: ThreadKey, view_gen: ViewGen) -> Result<&mut Window, Stale> {
         self.by_thread
             .get_mut(&thread)

@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{ClientGen, HistoryDir};
 use crate::backend::{
-    BackendError, Client, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, StreamError,
-    StreamItem, TopicsById, TopicsCursor, TopicsPage, UpdateStream,
+    AROUND_CONTEXT, BackendError, Client, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery,
+    MAX_HISTORY_PAGE, StreamError, StreamItem, TopicsById, TopicsCursor, TopicsPage, UpdateStream,
 };
 use crate::cache::CacheHandle;
 use crate::model::{
@@ -21,8 +21,11 @@ use crate::model::{
 };
 use crate::store::{BadgeSeq, ContinuityMark, FetchSeq, PageKind, TOPICS_PAGE, TopicsGen, ViewGen};
 
-/// Messages per history page (server and cache).
+/// Messages per history page (server and cache), `Around` pages included.
 pub(super) const PAGE: u32 = 50;
+// An `Around` page of `PAGE` messages is within its bounds (Stage 2 plan
+// section 17.6.4), so the backend never refuses one core asks for.
+const _: () = assert!(PAGE > 0 && PAGE <= MAX_HISTORY_PAGE && AROUND_CONTEXT < PAGE);
 /// Dialogs per page.
 pub(super) const DIALOGS_PAGE: u32 = 100;
 /// Waits between retries of a failing update stream (plan section 2): after the

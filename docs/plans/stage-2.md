@@ -1514,8 +1514,9 @@ A rejected topic read changes nothing. A snapshot also raises the pointer by the
   - It is emitted as `History { dir: HistoryDir::Around, has_more: true }`.
   - A page with no message above `after` (the unread messages were deleted, or the pointer was stale) is dropped, and the view's tail is applied instead: a second `Tail` load, applied whatever it covers.
 - **The cache, until the tail is reached:**
-  - Nothing is read, and nothing is written.
+  - The anchored window's history neither populates nor reconciles the cached message pages, and no page is served from them.
   - The window isn't `cache_contiguous`, so the existing gates (`reconcile`, live write-through, pages served from the cache) keep it out. No new cache path exists.
+  - Metadata maintenance (`Touch`) and authoritative deletions (live deletions, a topic's deletion) still reach the cache, as for any window (task 17 review).
   - This restriction ends explicitly at 17.6.6.
 - **Refresh, reconcile, rebuild, fence:**
   - A light refresh skips detached windows (`merge_tail`).
@@ -1540,9 +1541,10 @@ The rule:
   - **Checks:** its reply passes the same stale-view check as every history reply (`view_gen`). If the window is detached again by then, the restore is dropped: the next attaching page asks again.
   - **User loads** that arrive while it runs are deferred through the existing mechanism (`loads::MAX_DEFERRED`), as for any history load.
   - **Live messages** that cross it are handled as `on_tail` handles them: messages above the page's authoritative top are kept on top, and they are not written as contiguous unless `may_restore` holds.
+- **Recovery.** If the restoring tail fails or `may_restore` refuses it, the window stays attached but not contiguous. A later light refresh of that window (its tail requested with its own `ContinuityMark`, single-flight, fenced chats skipped) is merged the same way and restores continuity under the same rule (task 17 review).
 - **Never otherwise.** `cache_contiguous` is never set directly by attaching, by `Around`, or by a `Newer` page.
 - This applies to every window that pages back to the tail, Stage 1's scrolled-back windows included. Each return then costs one extra tail call.
-- This is where the anchored window's cache restriction (17.6.5) ends.
+- This is where the anchored window's cache restriction (17.6.5) ends: from here its history populates and reconciles the cached pages again.
 
 **17.6.7 Unchanged:** topic lists and their caps, drains and rates; the backend calls (no new one); `ChatFolder` apart from the `read_waived` argument (section 17.4); the folder writes; `HistoryDir` gains `Around`, and nothing else in `Event` changes.
 
@@ -1801,3 +1803,11 @@ The round 3 overlay fix is closed; the install-site list was checked against mai
 | 1 | P2: a successful read of an unlisted shown chat lost its pointer advance and its refresh trigger | Unlisted records keep a rising pointer floor (no count, no stamp; counts toward the eviction cutoff); the pane's unlisted chat is tracked as one extra badge record (budget `MAX_DIALOGS` + 1) |
 | 2 | P2: the extra badge record never lost its status on pane change or admission | `Badges::reconcile_extra` on every loop turn: kept only while shown and unlisted |
 | 3 | Pass | Accepted: an old-`ClientGen` read settles its intent without raising the pointer; forums ignore the overlay |
+
+#### Task 17: history anchored at a message (3 rounds; pass, no production P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 | P2: a failed or refused restoring tail left an attached window uncached indefinitely. P3: "anchored windows never touch the cache" overstated (Touch and authoritative deletions still apply) | A light refresh of an attached non-contiguous window restores continuity under its own `ContinuityMark`; wording qualified (17.6.5–6) |
+| 2 | P2 (tests): recovery tests raced on a 500 ms delay | Fake `hold(op, call)` gates; tests release after the observed event |
+| 3 | P2 (test harness): gate selection re-read a shared counter, so concurrent calls could pick the wrong gate | Count, fault, lead and gate taken in one critical section (`FakeClient::admit`), applied by the lead as specified by the reviewer |

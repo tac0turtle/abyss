@@ -19,10 +19,10 @@ use grammers_session::Session as _;
 use tokio::sync::{Notify, mpsc};
 
 use super::{
-    Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest, DialogsCursor,
-    DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl, PasswordChallenge,
-    RejectReason, Seed, SentCode, SessionSeed, SessionSnapshot, SignIn, StreamError, StreamItem,
-    TopicsById, TopicsCursor, TopicsPage, Update, UpdateStream,
+    AROUND_CONTEXT, Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest,
+    DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl,
+    PasswordChallenge, RejectReason, Seed, SentCode, SessionSeed, SessionSnapshot, SignIn,
+    StreamError, StreamItem, TopicsById, TopicsCursor, TopicsPage, Update, UpdateStream,
 };
 use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
 use crate::credentials::{CredentialSlot, EnvResolution};
@@ -453,9 +453,14 @@ struct State {
     /// Folder writes sent but not landed (`Fault::LandsLate`).
     in_transit: Vec<(i32, Option<ChatFolder>)>,
     history: HashMap<ChatId, Vec<Message>>,
+    /// History calls that reached the server, in arrival order (capped).
+    history_log: Vec<(ThreadKey, HistoryQuery)>,
     faults: HashMap<Op, VecDeque<Fault>>,
     /// Extra waits before the next calls' faults or answers (`lead`).
     leads: HashMap<Op, VecDeque<Duration>>,
+    /// Calls held until the test releases them (`hold`): the op, the
+    /// call's number (`calls` once counted) and its release.
+    holds: Vec<(Op, usize, Arc<Notify>)>,
     build_faults: VecDeque<BuildFault>,
     calls: HashMap<Op, usize>,
     sent: Vec<(ThreadKey, i64)>,
@@ -631,6 +636,19 @@ impl FakeHandle {
         });
     }
 
+    /// Holds the `call`-th data call of `op` (counted as [`Self::calls`]
+    /// counts it) before its fault (if any) applies, until the returned
+    /// gate is notified (`notify_one`, which a later wait also sees).
+    pub fn hold(&self, op: Op, call: usize) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        self.shared.with(|s| {
+            if s.holds.len() < MAX_FAULTS {
+                s.holds.push((op, call, Arc::clone(&gate)));
+            }
+        });
+        gate
+    }
+
     /// Queues a one-shot wait for the next data call of `op`, before its
     /// fault (if any) applies: with `inject`, a failure or panic that comes
     /// late.
@@ -787,6 +805,12 @@ impl FakeHandle {
     pub fn server_history(&self, chat: ChatId) -> Vec<Message> {
         self.shared
             .with(|s| s.history.get(&chat).cloned().unwrap_or_default())
+    }
+
+    /// `(thread, query)` of every history call that reached the server,
+    /// in arrival order, failed or hung ones included.
+    pub fn history_calls(&self) -> Vec<(ThreadKey, HistoryQuery)> {
+        self.shared.with(|s| s.history_log.clone())
     }
 
     /// The last peer set core asked an instance to retain.
@@ -1023,7 +1047,8 @@ pub struct FakeClient {
 }
 
 impl FakeClient {
-    /// Counts the call and takes its next injected fault.
+    /// Counts the call and takes its next injected fault (for calls that
+    /// honour no lead or gate).
     fn take_fault(&self, op: Op) -> Option<Fault> {
         self.shared.with(|s| {
             *s.calls.entry(op).or_default() += 1;
@@ -1031,16 +1056,39 @@ impl FakeClient {
         })
     }
 
-    /// Counts the call, applies latency, then any injected fault. A revoked
-    /// session gets `Unauthorized`.
-    async fn enter(&self, op: Op) -> Result<InFlight<'_>, BackendError> {
-        let fault = self.take_fault(op);
-        let lead = self
-            .shared
-            .with(|s| s.leads.get_mut(&op).and_then(VecDeque::pop_front));
+    /// Counts the call and takes its fault, lead and gate in one critical
+    /// section, so concurrent calls of one op each see their own number.
+    fn admit(&self, op: Op) -> (Option<Fault>, Option<Duration>, Option<Arc<Notify>>) {
+        self.shared.with(|s| {
+            let count = s.calls.entry(op).or_default();
+            *count += 1;
+            let call = *count;
+            let fault = s.faults.get_mut(&op).and_then(VecDeque::pop_front);
+            let lead = s.leads.get_mut(&op).and_then(VecDeque::pop_front);
+            let held = s
+                .holds
+                .iter()
+                .position(|(o, c, _)| *o == op && *c == call)
+                .map(|at| s.holds.swap_remove(at).2);
+            (fault, lead, held)
+        })
+    }
+
+    /// Waits out a call's gate, then its lead.
+    async fn wait_admitted(lead: Option<Duration>, held: Option<Arc<Notify>>) {
+        if let Some(gate) = held {
+            gate.notified().await;
+        }
         if let Some(wait) = lead {
             tokio::time::sleep(wait).await;
         }
+    }
+
+    /// Counts the call, applies latency, then any injected fault. A revoked
+    /// session gets `Unauthorized`.
+    async fn enter(&self, op: Op) -> Result<InFlight<'_>, BackendError> {
+        let (fault, lead, held) = self.admit(op);
+        Self::wait_admitted(lead, held).await;
         self.enter_with(fault).await
     }
 
@@ -1082,13 +1130,8 @@ impl FakeClient {
         op: Op,
         answer: impl FnOnce(&State) -> Result<T, BackendError>,
     ) -> Result<T, BackendError> {
-        let fault = self.take_fault(op);
-        let lead = self
-            .shared
-            .with(|s| s.leads.get_mut(&op).and_then(VecDeque::pop_front));
-        if let Some(wait) = lead {
-            tokio::time::sleep(wait).await;
-        }
+        let (fault, lead, held) = self.admit(op);
+        Self::wait_admitted(lead, held).await;
         let _guard = InFlight::new(&self.shared);
         let delay = match fault {
             None => Duration::ZERO,
@@ -1119,8 +1162,27 @@ impl FakeClient {
     }
 }
 
+/// One page of `all` (ascending). `Around` takes the messages above its
+/// anchor oldest first, up to `limit - AROUND_CONTEXT`, and those at or
+/// below it newest first, up to `AROUND_CONTEXT`; `has_more` says whether
+/// newer history is left above the page. Its bounds are checked before
+/// (`super::around`).
 fn page(all: &[&Message], query: HistoryQuery, limit: usize) -> HistoryPage {
     let (selected, has_more): (Vec<&Message>, bool) = match query {
+        HistoryQuery::Around(anchor) => {
+            let above_limit = limit.saturating_sub(to_usize(AROUND_CONTEXT));
+            let (below, above): (Vec<&Message>, Vec<&Message>) =
+                all.iter().copied().partition(|m| m.id <= anchor);
+            let more = above.len() > above_limit;
+            let mut page: Vec<&Message> = below
+                .into_iter()
+                .rev()
+                .take(to_usize(AROUND_CONTEXT))
+                .collect();
+            page.reverse();
+            page.extend(above.into_iter().take(above_limit));
+            (page, more)
+        }
         HistoryQuery::Tail => {
             let start = all.len().saturating_sub(limit);
             (all.iter().skip(start).copied().collect(), start > 0)
@@ -1292,6 +1354,12 @@ impl Client for FakeClient {
         query: HistoryQuery,
         limit: u32,
     ) -> Result<HistoryPage, BackendError> {
+        // Refused before the call, as the real backend does.
+        if let HistoryQuery::Around(anchor) = query {
+            super::around(anchor, limit)?;
+        }
+        self.shared
+            .with(|s| push_capped(&mut s.history_log, (thread, query)));
         let _g = self.enter(Op::History).await?;
         Ok(self
             .shared
@@ -1401,4 +1469,31 @@ impl FakeClient {
 
 fn to_usize(n: u32) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Around` takes the newest `AROUND_CONTEXT` messages at or below its
+    /// anchor and the oldest above it, up to the rest of the page, at both
+    /// ends of history; `has_more` says whether newer history is left.
+    #[test]
+    fn around_slices_the_context_newest_first_and_the_rest_oldest_first() {
+        let chat = ChatId {
+            kind: PeerKind::User,
+            id: 1,
+        };
+        let all: Vec<Message> = (1..=100).map(|id| text_message(chat, id, "m")).collect();
+        let refs: Vec<&Message> = all.iter().collect();
+        let around = |anchor: i32| {
+            let p = page(&refs, HistoryQuery::Around(MsgId(anchor)), 15);
+            let ids: Vec<i32> = p.messages.iter().map(|m| m.id.0).collect();
+            (ids, p.has_more)
+        };
+        assert_eq!(around(50), ((41..=55).collect(), true));
+        assert_eq!(around(3), ((1..=8).collect(), true), "few below");
+        assert_eq!(around(97), ((88..=100).collect(), false), "few above");
+        assert_eq!(around(0), ((1..=5).collect(), true), "the oldest");
+    }
 }

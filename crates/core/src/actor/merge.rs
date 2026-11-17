@@ -2,15 +2,22 @@
 //! place, so the user's view is not reset every few minutes. Falls back to
 //! replacing the window when the tail reveals messages missing inside it (a
 //! silent gap), which a merge cannot place.
+//!
+//! A restoring tail (`TailMode::Restore`, Stage 2 plan section 17.6.6)
+//! merges the same way, and also writes the tail through to the cache,
+//! restoring the window's cache continuity when nothing bypassed it since
+//! the request. So does a light refresh of an attached window whose cache
+//! isn't contiguous: it is the recovery when a restoring tail failed or
+//! was refused, at the refresh's cadence.
 
 use std::collections::VecDeque;
 
 use super::Actor;
-use super::apply::HistoryReply;
+use super::apply::{HistoryReply, TailMode};
 use crate::api::{Event, HistoryDir};
 use crate::backend::{Backend, HistoryPage};
 use crate::model::{Message, MsgId};
-use crate::store::Change;
+use crate::store::{Change, Window};
 
 /// How a server tail differs from the window it refreshes.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -88,13 +95,16 @@ pub(super) fn tail_diff(
 }
 
 impl<B: Backend> Actor<B> {
-    /// Applies a refresh tail to the open window (see the module docs).
+    /// Applies a refresh or restoring tail to the open window (see the
+    /// module docs). A window detached by then is left alone: scrolling
+    /// back down loads current pages, and a restoring tail is asked again
+    /// by the next page that attaches it.
     pub(super) async fn merge_tail(&mut self, p: HistoryReply) {
         let Some(w) = self.windows.get(p.thread) else {
             return;
         };
         if w.has_newer() {
-            return; // detached: scrolling back down loads current pages
+            return;
         }
         let range = p.authoritative_range();
         let diff = tail_diff(w.messages(), &p.page, range);
@@ -102,8 +112,17 @@ impl<B: Backend> Actor<B> {
             return self.on_tail(p).await;
         }
         let (thread, view) = (p.thread, p.view);
-        if let Some((lo, top)) = range {
-            self.reconcile(thread, lo, top, &p.page.messages).await;
+        // A contiguous window's refresh only reconciles its range. Any other
+        // tail merged here restores continuity: a restoring tail, or a
+        // light refresh of an attached window whose restoring tail failed
+        // or was refused (task 17 review). Either way under the tail's own
+        // mark, taken when it was requested.
+        if p.mode == TailMode::Merge && self.windows.is_cache_contiguous(thread) {
+            if let Some((lo, top)) = range {
+                self.reconcile(thread, lo, top, &p.page.messages).await;
+            }
+        } else {
+            self.restore_continuity(&p, range).await;
         }
         let removed = self.windows.delete(thread.chat, &diff.deleted);
         if !removed.is_empty() {
@@ -128,6 +147,27 @@ impl<B: Backend> Actor<B> {
         self.emit_reconciled(thread, view).await;
         self.tail_covers(thread, view, p.req, range.map(|(lo, _)| lo))
             .await;
+    }
+
+    /// Writes a restoring tail through as `on_tail` does (the page plus the
+    /// window's live messages above its authoritative top), and restores
+    /// the window's cache continuity only if that write was made.
+    async fn restore_continuity(&mut self, p: &HistoryReply, range: Option<(MsgId, MsgId)>) {
+        let top = p.authoritative_top();
+        let late = self
+            .windows
+            .get(p.thread)
+            .into_iter()
+            .flat_map(Window::messages)
+            .filter(|m| top.is_none_or(|t| m.id > t))
+            .cloned();
+        let page = HistoryPage {
+            messages: p.page.messages.iter().cloned().chain(late).collect(),
+            has_more: p.page.has_more,
+        };
+        if self.write_tail(p.thread, p.since, &page, range).await {
+            self.windows.set_cache_contiguous(p.thread);
+        }
     }
 }
 

@@ -226,6 +226,9 @@ impl<B: Backend> Actor<B> {
             // Deferred loads were for windows that are invalidated now.
             self.deferred.clear();
             self.owed = None;
+            // The open thread reloads its tail: an anchor is dropped.
+            self.anchored = None;
+            self.restoring = None;
             for (thread, _) in self.windows.invalidate_all() {
                 self.emit(Event::ThreadInvalidated(thread)).await;
             }

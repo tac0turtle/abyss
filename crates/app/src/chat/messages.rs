@@ -145,7 +145,7 @@ impl Pending {
         match dir {
             HistoryDir::Older => Some(&mut self.older),
             HistoryDir::Newer => Some(&mut self.newer),
-            HistoryDir::Tail => None,
+            HistoryDir::Tail | HistoryDir::Around => None,
         }
     }
 
@@ -276,6 +276,12 @@ impl MessageWindow {
             HistoryDir::Newer => {
                 self.has_newer = b.has_more;
                 self.has_older |= trimmed;
+            }
+            // A detached window around a read position; the app asks for
+            // none yet (`OpenThreadAt`, Stage 2 task 18).
+            HistoryDir::Around => {
+                self.has_older = true;
+                self.has_newer = b.has_more;
             }
         }
         let end = if b.dir == HistoryDir::Older {

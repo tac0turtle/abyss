@@ -7,6 +7,7 @@
     reason = "test harness helpers are not #[test] items, so allow-*-in-tests does not cover them"
 )]
 
+mod anchored;
 mod auth;
 mod chat_folders;
 mod folders;

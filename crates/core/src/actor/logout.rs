@@ -523,6 +523,8 @@ impl<B: Backend> Actor<B> {
         self.viewing = None;
         // Loads of the old account's views owe the UI nothing (round 20).
         self.owed = None;
+        self.anchored = None;
+        self.restoring = None;
         self.deferred.clear();
         self.reads.clear();
         self.sends = super::sends::PendingSends::default();

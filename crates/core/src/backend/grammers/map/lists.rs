@@ -341,7 +341,9 @@ pub(crate) fn history(
         .filter_map(|m| message(m, dir))
         .filter(|m| in_thread(m, thread) && m.is_valid())
         .filter(|m| match query {
-            HistoryQuery::Tail => true,
+            // `Around` keeps both sides of its anchor; core checks what
+            // lies above it.
+            HistoryQuery::Tail | HistoryQuery::Around(_) => true,
             HistoryQuery::Before(id) => m.id < id,
             HistoryQuery::After(id) => m.id > id,
         })
