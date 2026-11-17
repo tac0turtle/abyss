@@ -219,7 +219,8 @@ async fn reconcile_tail_gap_replaces_only_its_thread() {
 
 /// Section 11: migration 3 → 4 drops messages and their LRU rows and adds
 /// the topic column. It keeps the chat list, but the upgrade continues to
-/// version 5, which drops it (`ChatSummary::folder`, folders plan part A).
+/// version 5, which drops it (`ChatSummary::folder`, folders plan part A),
+/// and on to version 6.
 #[test]
 fn version_3_messages_and_chats_are_dropped() {
     let (_t, dir, key_) = setup();
@@ -261,7 +262,7 @@ fn version_3_messages_and_chats_are_dropped() {
         .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     db.put_messages(key(forum(), 2), &posts(2, [1])).unwrap();
     assert_eq!(ids(&db.tail(key(forum(), 2), 10).unwrap()), [1]);
 }

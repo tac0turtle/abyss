@@ -1235,3 +1235,363 @@ fn sent_ids_come_only_from_our_random_id() {
     assert_eq!(lists::sent_id(&full(6), 5), None);
     assert_eq!(lists::sent_id(&U::TooLong, 5), None);
 }
+
+// --- chat folders ---
+
+fn text(s: &str) -> tl::enums::TextWithEntities {
+    tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+        text: s.into(),
+        entities: vec![],
+    })
+}
+
+fn input_user(id: i64) -> tl::enums::InputPeer {
+    tl::enums::InputPeer::User(tl::types::InputPeerUser {
+        user_id: id,
+        access_hash: 1,
+    })
+}
+
+fn raw_folder(id: i32, title: &str) -> tl::types::DialogFilter {
+    tl::types::DialogFilter {
+        contacts: false,
+        non_contacts: false,
+        groups: false,
+        broadcasts: false,
+        bots: false,
+        exclude_muted: false,
+        exclude_read: false,
+        exclude_archived: false,
+        title_noanimate: false,
+        id,
+        title: text(title),
+        emoticon: None,
+        color: None,
+        pinned_peers: vec![],
+        include_peers: vec![],
+        exclude_peers: vec![],
+    }
+}
+
+fn filters(list: Vec<tl::enums::DialogFilter>) -> tl::enums::messages::DialogFilters {
+    tl::enums::messages::DialogFilters::Filters(tl::types::messages::DialogFilters {
+        tags_enabled: false,
+        filters: list,
+    })
+}
+
+#[test]
+fn chat_folders_map_rules_peers_and_titles() {
+    use crate::backend::grammers::map::folders;
+    use crate::model::FolderRules;
+    let mut work = raw_folder(2, "Wo\u{202e}rk");
+    work.groups = true;
+    work.exclude_read = true;
+    work.pinned_peers = vec![tl::enums::InputPeer::PeerSelf];
+    work.include_peers = vec![
+        input_user(7),
+        tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: 3 }),
+        input_user(-1),
+        tl::enums::InputPeer::Empty,
+    ];
+    work.exclude_peers = vec![tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+        channel_id: 10,
+        access_hash: 1,
+    })];
+    let shared = tl::enums::DialogFilter::Chatlist(tl::types::DialogFilterChatlist {
+        has_my_invites: false,
+        title_noanimate: false,
+        id: 3,
+        title: text("Shared"),
+        emoticon: None,
+        color: None,
+        pinned_peers: vec![],
+        include_peers: vec![input_user(8)],
+    });
+    let resp = filters(vec![
+        tl::enums::DialogFilter::Default,
+        tl::enums::DialogFilter::Filter(work),
+        shared,
+    ]);
+    let raw = folders::raw_folders(&resp).unwrap();
+    let out = folders::chat_folders(raw, Some(42));
+    assert_eq!(out.len(), 2, "the All position is not a folder");
+    let w = &out[0];
+    assert_eq!((w.id, w.title.as_str(), w.shared), (2, "Work", false));
+    assert!(w.rules.has(FolderRules::GROUPS) && w.rules.has(FolderRules::EXCLUDE_READ));
+    assert!(!w.rules.has(FolderRules::CONTACTS));
+    assert_eq!(w.pinned, vec![uid(42)], "self is the signed-in user");
+    assert_eq!(w.include, vec![uid(7), gid(3)], "unmappable peers dropped");
+    assert_eq!(w.exclude, vec![cid(10)]);
+    assert!(out[1].shared && out[1].include == vec![uid(8)]);
+    assert!(
+        folders::chat_folders(raw, None)[0].pinned.is_empty(),
+        "self unknown: dropped"
+    );
+}
+
+#[test]
+fn oversized_folder_responses_are_rejected() {
+    use crate::backend::grammers::map::folders::{self, MAX_FOLDER_PEERS, MAX_FOLDERS};
+    let many = (0..=MAX_FOLDERS)
+        .map(|i| tl::enums::DialogFilter::Filter(raw_folder(i32::try_from(i).unwrap(), "f")))
+        .collect();
+    assert!(folders::raw_folders(&filters(many)).is_err());
+    let mut big = raw_folder(2, "f");
+    big.include_peers = (0..=i64::try_from(MAX_FOLDER_PEERS).unwrap())
+        .map(input_user)
+        .collect();
+    assert!(folders::raw_folders(&filters(vec![tl::enums::DialogFilter::Filter(big)])).is_err());
+}
+
+#[test]
+fn folder_changes_ask_for_a_refetch() {
+    use tl::enums::Update as U;
+    let changed = [
+        U::DialogFilters,
+        U::DialogFilterOrder(tl::types::UpdateDialogFilterOrder { order: vec![2, 3] }),
+        U::DialogFilter(tl::types::UpdateDialogFilter {
+            id: 2,
+            filter: None,
+        }),
+    ];
+    for u in &changed {
+        assert!(matches!(
+            lists::update(u, &Directory::default()),
+            Some(Update::ChatFoldersChanged)
+        ));
+    }
+}
+
+#[test]
+fn muted_follows_mute_until_and_contacts_their_flag() {
+    let mut ann = user(7, "Ann", "");
+    ann.contact = true;
+    let users = users(vec![ann, user(8, "Bob", "")]);
+    let mute = |until| {
+        tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
+            mute_until: until,
+            ..super::notify_settings_raw()
+        })
+    };
+    let mut muted = dialog(peer_user(7), 1);
+    muted.notify_settings = mute(Some(2_000));
+    let mut expired = dialog(peer_user(8), 2);
+    expired.notify_settings = mute(Some(1_000));
+    let dialogs: Vec<_> = [muted, expired]
+        .into_iter()
+        .map(tl::enums::Dialog::Dialog)
+        .collect();
+    let dir = Directory::from_lists(&users, &[]);
+    let out = lists::dialogs(&parts(&dialogs, &[], &users, &[]), &dir, 100);
+    assert_eq!(
+        (out.chats[0].muted_until, out.chats[1].muted_until),
+        (2_000, 1_000),
+        "the date is kept"
+    );
+    assert!(out.chats[0].muted_at(1_500) && !out.chats[1].muted_at(1_500));
+    assert_eq!(out.chats[0].kind, ChatKind::Private { contact: true });
+    assert_eq!(out.chats[1].kind, ChatKind::Private { contact: false });
+}
+
+// --- chat folder edits ---
+
+fn edit_raw() -> Vec<tl::enums::DialogFilter> {
+    let mut work = raw_folder(2, "Work");
+    work.groups = true;
+    work.emoticon = Some("💼".into());
+    work.pinned_peers = vec![input_user(7)];
+    // A peer abyss cannot map is sent back unchanged.
+    work.include_peers = vec![input_user(8), tl::enums::InputPeer::Empty];
+    work.exclude_peers = vec![input_user(9)];
+    let shared = tl::enums::DialogFilter::Chatlist(tl::types::DialogFilterChatlist {
+        has_my_invites: false,
+        title_noanimate: false,
+        id: 3,
+        title: text("Shared"),
+        emoticon: None,
+        color: None,
+        pinned_peers: vec![],
+        include_peers: vec![],
+    });
+    vec![
+        tl::enums::DialogFilter::Default,
+        tl::enums::DialogFilter::Filter(work),
+        shared,
+    ]
+}
+
+/// The tag of raw folder `id` as the UI would have it.
+fn tag_of(raw: &[tl::enums::DialogFilter], id: i32) -> crate::model::FolderTag {
+    crate::backend::grammers::map::folders::chat_folders(raw, None)
+        .into_iter()
+        .find(|f| f.id == id)
+        .expect("a mapped folder")
+        .tag()
+}
+
+fn filter_of(f: Option<tl::enums::DialogFilter>) -> tl::types::DialogFilter {
+    match f {
+        Some(tl::enums::DialogFilter::Filter(f)) => f,
+        other => panic!("not a regular folder: {:?}", other.is_some()),
+    }
+}
+
+fn user_ids(peers: &[tl::enums::InputPeer]) -> Vec<Option<i64>> {
+    peers
+        .iter()
+        .map(|p| match p {
+            tl::enums::InputPeer::User(u) => Some(u.user_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn adding_a_chat_names_it_and_keeps_everything_else() {
+    use crate::backend::grammers::map::folders::edited;
+    use crate::model::FolderEdit;
+    let raw = edit_raw();
+    let tag = tag_of(&raw, 2);
+    let add = |chat| FolderEdit::AddChat {
+        folder: 2,
+        tag: tag.clone(),
+        chat,
+    };
+    let (id, f) = edited(&raw, &add(uid(9)), Some(input_user(9)), None).unwrap();
+    let f = filter_of(f);
+    assert_eq!(id, 2);
+    assert!(f.exclude_peers.is_empty(), "no longer excluded");
+    assert_eq!(user_ids(&f.include_peers), [Some(8), None, Some(9)]);
+    assert_eq!(f.emoticon.as_deref(), Some("💼"));
+    assert!(f.groups);
+    // Already named (pinned): nothing added.
+    let (_, f) = edited(&raw, &add(uid(7)), Some(input_user(7)), None).unwrap();
+    assert_eq!(filter_of(f).include_peers.len(), 2);
+}
+
+#[test]
+fn removing_a_chat_excludes_it_when_rules_would_take_it_in() {
+    use crate::backend::grammers::map::folders::edited;
+    use crate::model::FolderEdit;
+    let raw = edit_raw();
+    let tag = tag_of(&raw, 2);
+    let remove = |chat| FolderEdit::RemoveChat {
+        folder: 2,
+        tag: tag.clone(),
+        chat,
+    };
+    let (_, f) = edited(&raw, &remove(uid(7)), Some(input_user(7)), None).unwrap();
+    let f = filter_of(f);
+    assert!(f.pinned_peers.is_empty());
+    assert_eq!(
+        user_ids(&f.exclude_peers),
+        [Some(9), Some(7)],
+        "groups rule set"
+    );
+    let (_, f) = edited(&raw, &remove(uid(8)), Some(input_user(8)), None).unwrap();
+    assert_eq!(user_ids(&filter_of(f).include_peers), [None]);
+}
+
+#[test]
+fn creating_and_deleting_folders() {
+    use crate::backend::grammers::map::folders::{EditError, edited};
+    use crate::model::FolderEdit;
+    let raw = edit_raw();
+    let create = FolderEdit::Create {
+        title: "New".into(),
+        chat: uid(5),
+    };
+    let (id, f) = edited(&raw, &create, Some(input_user(5)), None).unwrap();
+    assert_eq!(id, 4, "the smallest free id from 2");
+    let tag = tag_of(&raw, 2);
+    let f = filter_of(f);
+    assert_eq!(user_ids(&f.include_peers), [Some(5)]);
+    assert!(!f.groups && !f.contacts);
+    assert_eq!(
+        edited(
+            &raw,
+            &FolderEdit::Delete {
+                folder: 2,
+                tag: tag.clone()
+            },
+            None,
+            None
+        ),
+        Ok((2, None))
+    );
+    let shared = FolderEdit::AddChat {
+        folder: 3,
+        tag: tag.clone(),
+        chat: uid(5),
+    };
+    assert_eq!(
+        edited(&raw, &shared, Some(input_user(5)), None),
+        Err(EditError::Shared)
+    );
+    assert_eq!(
+        edited(
+            &raw,
+            &FolderEdit::Delete {
+                folder: 9,
+                tag: tag.clone()
+            },
+            None,
+            None
+        ),
+        Err(EditError::Unknown)
+    );
+    assert_eq!(
+        edited(&[], &FolderEdit::Delete { folder: 2, tag }, None, None),
+        Err(EditError::Unknown),
+        "nothing fetched yet"
+    );
+}
+
+#[test]
+fn edits_for_a_replaced_folder_or_past_the_bounds_are_refused() {
+    use crate::backend::grammers::map::folders::{
+        EditError, MAX_FOLDER_PEERS, MAX_FOLDERS, edited,
+    };
+    use crate::model::FolderEdit;
+    let raw = edit_raw();
+    let tag = tag_of(&raw, 2);
+    // Folder 2 replaced by another (same id, new title).
+    let replaced: Vec<_> = vec![tl::enums::DialogFilter::Filter(raw_folder(2, "Other"))];
+    assert_eq!(
+        edited(
+            &replaced,
+            &FolderEdit::Delete { folder: 2, tag },
+            None,
+            None
+        ),
+        Err(EditError::Changed)
+    );
+    // A folder already naming the most peers takes no more.
+    let mut full = raw_folder(2, "Work");
+    full.include_peers = (1..=i64::try_from(MAX_FOLDER_PEERS).unwrap())
+        .map(input_user)
+        .collect();
+    let full = vec![tl::enums::DialogFilter::Filter(full)];
+    let add = FolderEdit::AddChat {
+        folder: 2,
+        tag: tag_of(&full, 2),
+        chat: uid(9999),
+    };
+    assert_eq!(
+        edited(&full, &add, Some(input_user(9999)), None),
+        Err(EditError::Limit)
+    );
+    // No folder is made past the folder bound.
+    let many: Vec<_> = (0..i32::try_from(MAX_FOLDERS).unwrap())
+        .map(|i| tl::enums::DialogFilter::Filter(raw_folder(i + 2, "f")))
+        .collect();
+    let create = FolderEdit::Create {
+        title: "New".into(),
+        chat: uid(5),
+    };
+    assert_eq!(
+        edited(&many, &create, Some(input_user(5)), None),
+        Err(EditError::Limit)
+    );
+}

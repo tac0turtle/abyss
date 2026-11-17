@@ -3,8 +3,8 @@
 
 use std::time::Instant;
 
-use abyss_core::api::UserError;
-use abyss_core::model::{ChatId, ChatSummary, PeerFolder, Preview};
+use abyss_core::api::{Event, UserError};
+use abyss_core::model::{ChatFolder, ChatId, ChatSummary, PeerFolder, Preview};
 use abyss_core::store::{MAX_DIALOGS, bump_moves};
 use gpui::SharedString;
 
@@ -39,14 +39,17 @@ struct Paging {
     retry: Backoff,
 }
 
-/// Which of Telegram's two peer folders the sidebar shows. Core keeps one
-/// list holding both, in server order; each is a view of it.
+/// Which view of the chat list the sidebar shows. Core keeps one list
+/// holding both of Telegram's peer folders, in server order; every view is
+/// a filter over it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Shown {
     /// The main list, led by an entry that opens the archive.
     #[default]
     Main,
     Archive,
+    /// A chat folder, by id: its chats from both peer folders.
+    Folder(i32),
 }
 
 /// The main list's entry for the archive.
@@ -70,6 +73,8 @@ pub(crate) struct ChatList {
     chats: Vec<ChatSummary>,
     paging: Paging,
     shown: Shown,
+    /// The account's chat folders, in server order.
+    folders: Vec<ChatFolder>,
 }
 
 /// Whether a `ChatBumped` summary `new` moved its chat in core: core's own
@@ -105,6 +110,21 @@ impl ChatList {
         self.paging.wanted |= self.row_count() == 0;
     }
 
+    pub(crate) fn folders(&self) -> &[ChatFolder] {
+        &self.folders
+    }
+
+    /// Core's chat folders. A shown folder that is gone falls back to the
+    /// main list.
+    pub(crate) fn set_folders(&mut self, folders: Vec<ChatFolder>) {
+        self.folders = folders;
+        if let Shown::Folder(id) = self.shown
+            && !self.folders.iter().any(|f| f.id == id)
+        {
+            self.show(Shown::Main);
+        }
+    }
+
     /// The archive's entry in the main list, once an archived chat is loaded.
     fn archive_entry(&self) -> Option<ArchiveEntry> {
         let (chats, unread) = self
@@ -115,30 +135,59 @@ impl ChatList {
         (chats > 0).then_some(ArchiveEntry { chats, unread })
     }
 
-    /// The chats of the shown view, in core's order.
-    fn shown_chats(&self) -> impl Iterator<Item = &ChatSummary> {
-        let folder = match self.shown {
-            Shown::Main => PeerFolder::Main,
-            Shown::Archive => PeerFolder::Archive,
-        };
-        self.chats.iter().filter(move |c| c.folder == folder)
+    /// The chats of the shown view: a peer folder in core's order, or a
+    /// chat folder's matching chats with its pinned ones first, in its order.
+    fn shown_chats(&self) -> Vec<&ChatSummary> {
+        let peer = |folder: PeerFolder| self.chats.iter().filter(move |c| c.folder == folder);
+        match self.shown {
+            Shown::Main => peer(PeerFolder::Main).collect(),
+            Shown::Archive => peer(PeerFolder::Archive).collect(),
+            Shown::Folder(id) => {
+                let Some(folder) = self.folders.iter().find(|f| f.id == id) else {
+                    return Vec::new();
+                };
+                // Mutes are checked against the clock, so one that expired
+                // stops counting at the next render.
+                let now = super::format::now();
+                let pinned = folder.pinned.iter().filter_map(|&p| self.get(p));
+                let rest = self
+                    .chats
+                    .iter()
+                    .filter(|c| !folder.pinned.contains(&c.id) && folder.contains(c, now));
+                pinned.chain(rest).collect()
+            }
+        }
     }
 
     /// The sidebar's rows: the main list starts with the archive's entry.
     pub(crate) fn rows(&self) -> Vec<SidebarRow<'_>> {
         let entry = match self.shown {
             Shown::Main => self.archive_entry().map(SidebarRow::Archive),
-            Shown::Archive => None,
+            Shown::Archive | Shown::Folder(_) => None,
         };
         entry
             .into_iter()
-            .chain(self.shown_chats().map(SidebarRow::Chat))
+            .chain(self.shown_chats().into_iter().map(SidebarRow::Chat))
             .collect()
     }
 
     pub(crate) fn row_count(&self) -> usize {
         let entry = self.shown == Shown::Main && self.archive_entry().is_some();
-        usize::from(entry) + self.shown_chats().count()
+        usize::from(entry) + self.shown_chats().len()
+    }
+
+    /// Applies a chat-list event from core; other events are not its own.
+    pub(crate) fn apply(&mut self, event: Event) {
+        match event {
+            Event::DialogsReset(chats) => self.reset(chats),
+            Event::DialogsAppended(chats) => self.upsert_page(chats),
+            Event::DialogsPaging { has_more } => {
+                self.paged(if has_more { Pages::More } else { Pages::Done });
+            }
+            Event::ChatBumped(chat) => self.bump(chat),
+            Event::ChatFolders(folders) => self.set_folders(folders),
+            _ => {}
+        }
     }
 
     /// Core's whole list (it merges a reloaded first page into later pages).
@@ -308,7 +357,7 @@ pub(crate) fn initials(title: &str) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    use abyss_core::model::{ChatKind, MediaKind, MsgId, PeerKind};
+    use abyss_core::model::{ChatKind, FolderRules, MediaKind, MsgId, PeerKind};
 
     use super::*;
 
@@ -323,7 +372,7 @@ mod tests {
         ChatSummary {
             id: id(n),
             title: format!("c{n}"),
-            kind: ChatKind::Private,
+            kind: ChatKind::Private { contact: false },
             pinned: false,
             unread: 0,
             unread_mentions: 0,
@@ -331,6 +380,7 @@ mod tests {
             last_date: 0,
             last_id: None,
             can_send: true,
+            muted_until: 0,
             folder: PeerFolder::Main,
         }
     }
@@ -535,6 +585,144 @@ mod tests {
                 unread: 1
             })
         ));
+    }
+
+    fn folder(id: i32, rules: FolderRules) -> ChatFolder {
+        ChatFolder {
+            id,
+            title: format!("f{id}"),
+            rules,
+            pinned: Vec::new(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            shared: false,
+        }
+    }
+
+    #[test]
+    fn a_folder_shows_its_chats_from_both_peer_folders() {
+        let mut list = ChatList::default();
+        let group = |n| ChatSummary {
+            kind: ChatKind::Group,
+            ..chat(n)
+        };
+        let muted = |n| ChatSummary {
+            muted_until: i64::from(i32::MAX),
+            ..group(n)
+        };
+        list.reset(vec![chat(1), group(2), archived(3), muted(4), group(5)]);
+        let mut groups = folder(7, FolderRules::GROUPS.with(FolderRules::EXCLUDE_MUTED));
+        groups.pinned = vec![id(5)];
+        groups.include = vec![id(3)];
+        groups.exclude = vec![id(2)];
+        list.set_folders(vec![groups]);
+        list.show(Shown::Folder(7));
+        assert_eq!(
+            row_ids(&list),
+            [5, 3],
+            "pinned first, then included (archived too); excluded and muted out"
+        );
+        // The folder is deleted elsewhere: back to the main list.
+        list.set_folders(Vec::new());
+        assert_eq!(list.shown(), Shown::Main);
+    }
+
+    #[test]
+    fn folder_rules_follow_telegram() {
+        let contact = ChatSummary {
+            kind: ChatKind::Private { contact: true },
+            ..chat(1)
+        };
+        let stranger = chat(2);
+        let bot = ChatSummary {
+            kind: ChatKind::Bot,
+            ..chat(3)
+        };
+        let read = FolderRules::CONTACTS.with(FolderRules::EXCLUDE_READ);
+        let f = folder(1, FolderRules::CONTACTS.with(FolderRules::BOTS));
+        assert!(f.contains(&contact, 0) && f.contains(&bot, 0) && !f.contains(&stranger, 0));
+        let unread = ChatSummary {
+            unread: 1,
+            ..contact.clone()
+        };
+        assert!(!folder(1, read).contains(&contact, 0) && folder(1, read).contains(&unread, 0));
+        let archive = FolderRules::NON_CONTACTS.with(FolderRules::EXCLUDE_ARCHIVED);
+        assert!(!folder(1, archive).contains(&archived(2), 0));
+        let mut both = folder(1, FolderRules::NON_CONTACTS);
+        both.include = vec![id(2)];
+        both.exclude = vec![id(2)];
+        assert!(!both.contains(&stranger, 0), "an exclusion wins");
+    }
+
+    /// "Exclude muted" keeps a muted chat with an unread mention, unless it
+    /// is archived (Telegram Desktop's `ChatFilter::contains`); a mute that
+    /// has expired no longer counts.
+    #[test]
+    fn muted_chats_with_mentions_and_expired_mutes() {
+        let f = folder(
+            1,
+            FolderRules::NON_CONTACTS.with(FolderRules::EXCLUDE_MUTED),
+        );
+        let muted = ChatSummary {
+            muted_until: 1_000,
+            ..chat(1)
+        };
+        let mentioned = ChatSummary {
+            unread_mentions: 1,
+            unread: 1,
+            ..muted.clone()
+        };
+        let archived_mention = ChatSummary {
+            folder: PeerFolder::Archive,
+            ..mentioned.clone()
+        };
+        assert!(!f.contains(&muted, 500), "muted, no mention: out");
+        assert!(f.contains(&mentioned, 500), "muted with a mention: in");
+        assert!(
+            !f.contains(&archived_mention, 500),
+            "archived: no exception"
+        );
+        assert!(f.contains(&muted, 1_000), "the mute has expired");
+    }
+
+    /// Forums are supergroups, so a "groups" folder takes them in, as
+    /// Telegram Desktop does (megagroups count as groups), archived or
+    /// not. Broadcast channels never reach the list, so a folder naming one
+    /// shows nothing for it.
+    #[test]
+    fn forums_are_groups_and_broadcasts_never_show() {
+        let forum = |n| ChatSummary {
+            id: ChatId {
+                kind: PeerKind::Channel,
+                id: n,
+            },
+            kind: ChatKind::Supergroup {
+                forum: true,
+                gigagroup: false,
+            },
+            ..chat(n)
+        };
+        let groups = folder(7, FolderRules::GROUPS);
+        assert!(groups.contains(&forum(1), 0));
+        let archived_forum = ChatSummary {
+            folder: PeerFolder::Archive,
+            ..forum(2)
+        };
+        assert!(groups.contains(&archived_forum, 0));
+        let mut list = ChatList::default();
+        list.reset(vec![forum(1), archived_forum, chat(3)]);
+        let broadcast = ChatId {
+            kind: PeerKind::Channel,
+            id: 50,
+        };
+        let mut named = folder(8, FolderRules::default());
+        named.pinned = vec![broadcast];
+        named.include = vec![broadcast, id(3)];
+        list.set_folders(vec![groups, named]);
+        list.show(Shown::Folder(7));
+        assert_eq!(row_ids(&list), [1, 2]);
+        list.show(Shown::Folder(8));
+        assert_eq!(row_ids(&list), [3], "the unlisted broadcast is not shown");
     }
 
     #[test]

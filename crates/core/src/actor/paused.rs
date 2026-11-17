@@ -11,6 +11,8 @@
 //!   server cannot be taken back; it ends as usual.
 //! - Its live tail counts as unseen: core forgets `ViewingTail`, and a new
 //!   one is refused until the UI shows the chat again.
+//! - No archive move or folder edit starts: new ones are refused (`Busy`),
+//!   and those not yet handed to the server are dropped (`folder_writes`).
 //! - Everything else acts as if it had come before the Logout.
 //!
 //! "Stay signed in" resumes what waited. A logout that starts tears it all
@@ -24,9 +26,12 @@ use crate::backend::Backend;
 
 impl<B: Backend> Actor<B> {
     /// The account was just hidden: its tail is unseen, and send jobs not
-    /// yet handed to the server are taken back.
-    pub(super) fn hide_account(&mut self) {
+    /// yet handed to the server are taken back. Returns whether folder
+    /// writes were dropped.
+    #[must_use]
+    pub(super) fn hide_account(&mut self) -> bool {
         self.viewing = None;
+        let dropped = self.drop_unstarted_folder_writes();
         let queue = std::mem::take(&mut self.queue);
         let (sends, rest): (Vec<Job>, Vec<Job>) = queue
             .into_iter()
@@ -37,12 +42,14 @@ impl<B: Backend> Actor<B> {
                 self.sends.unqueue(local_id);
             }
         }
+        dropped
     }
 
     /// "Stay signed in": resumes the sends that waited (flood waits that
     /// ended, replays).
     pub(super) async fn show_account(&mut self) {
         self.resume_flooded_sends().await;
+        self.next_folder_write().await;
         if self.life.phase == Phase::Live {
             self.replay_sends().await;
         }
@@ -89,6 +96,10 @@ impl<B: Backend> Actor<B> {
             Command::OpenForum(chat) | Command::LoadTopics(chat) => {
                 self.load_ended(LoadTarget::Topics(chat), Some(UserError::Busy))
                     .await;
+            }
+            // Not made: nothing changes, and the UI waits on nothing.
+            Command::SetPeerFolder { .. } | Command::EditChatFolder(_) => {
+                self.folder_write_refused().await;
             }
             // Nothing waits on these.
             _ => {}

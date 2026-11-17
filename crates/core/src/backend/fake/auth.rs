@@ -211,7 +211,7 @@ impl FakeClient {
             }
             Some(Fault::Error(e)) => Err(e.into()),
             Some(Fault::Auth(e)) => Err(e),
-            Some(Fault::Hang) => std::future::pending().await,
+            Some(Fault::Hang | Fault::LandsLate) => std::future::pending().await,
             Some(Fault::CompleteThenHang) => Ok(Answer::Lose),
             Some(Fault::Queued(d)) => Ok(Answer::Queued(d)),
             Some(Fault::Panic) => injected_panic("login call"),

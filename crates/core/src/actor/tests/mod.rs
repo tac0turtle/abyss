@@ -8,6 +8,7 @@
 )]
 
 mod auth;
+mod chat_folders;
 mod folders;
 mod lifecycle;
 mod logout;

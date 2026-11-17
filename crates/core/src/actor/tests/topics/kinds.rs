@@ -158,3 +158,29 @@ async fn an_archived_forum_is_still_a_forum() {
     opened(&mut h, topic_key(f, 2)).await;
     h.stop().await;
 }
+
+/// Folders plan part C: archiving a forum from the client (the server
+/// accepts, core applies the move) leaves it a forum.
+#[tokio::test(start_paused = true)]
+async fn a_forum_archived_from_here_is_still_a_forum() {
+    let f = forum(100);
+    let mut script = FakeScript::demo(1, 1);
+    add_big_forum(&mut script, f, 2);
+    let mut h = online(script).await;
+    h.until(|e| matches!(e, Event::DialogsReset(c) if c.iter().any(|c| c.id == f)))
+        .await;
+    h.send(Command::SetPeerFolder {
+        chat: f,
+        folder: PeerFolder::Archive,
+    })
+    .await;
+    let (ev, _) = h
+        .until(|e| matches!(e, Event::ChatBumped(s) if s.id == f))
+        .await;
+    assert!(
+        matches!(ev, Event::ChatBumped(s) if s.folder == PeerFolder::Archive && s.kind == forum_summary(f).kind)
+    );
+    refused(&mut h, ThreadKey::whole(f)).await;
+    opened(&mut h, topic_key(f, 2)).await;
+    h.stop().await;
+}

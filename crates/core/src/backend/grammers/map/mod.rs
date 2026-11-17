@@ -6,6 +6,7 @@
 //! [`RichText::from_entities`](crate::rich_text::RichText::from_entities), and
 //! every server id is range-checked before use.
 
+pub(crate) mod folders;
 pub(crate) mod lists;
 pub(crate) mod message;
 pub(crate) mod peers;

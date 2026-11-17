@@ -187,6 +187,7 @@ impl Session {
             }
         );
         let online = matches!(event, Event::Connection(ConnState::Online));
+        let folders = matches!(event, Event::ChatFolders(_));
         let paged = online
             || matches!(
                 event,
@@ -201,6 +202,9 @@ impl Session {
             self.shell.load_ended(target, error, now);
         } else {
             self.shell.apply(event);
+        }
+        if folders {
+            self.recheck_folder_menu(window, cx);
         }
         if flood {
             self.start_countdown(window, cx);

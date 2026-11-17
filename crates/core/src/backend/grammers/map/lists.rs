@@ -223,11 +223,20 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
         // did not map (excluded or invalid).
         last_id: (d.top_message > 0).then_some(MsgId(d.top_message)),
         can_send: entry.can_send,
+        muted_until: muted_until(&d.notify_settings),
         folder: peer_folder(d.folder_id.unwrap_or(0)),
     };
     if summary.is_valid() {
         out.chats.push(summary);
     }
+}
+
+/// Until when notifications are muted (Unix seconds; `0`: not muted).
+/// Telegram mutes until a date (`i32::MAX` for good); the date is kept, so
+/// an expired mute stops counting without a new page.
+fn muted_until(settings: &tl::enums::PeerNotifySettings) -> i64 {
+    let tl::enums::PeerNotifySettings::Settings(s) = settings;
+    s.mute_until.map_or(0, |until| i64::from(until.max(0)))
 }
 
 pub(super) fn count(n: i32) -> u32 {
@@ -383,6 +392,11 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
             topic: None,
             still_unread: count(u.still_unread_count),
         }),
+        // A chat folder was created, edited, deleted or reordered: core
+        // refetches the list (folders plan, part B).
+        U::DialogFilter(_) | U::DialogFilterOrder(_) | U::DialogFilters => {
+            Some(Update::ChatFoldersChanged)
+        }
         // Archived or unarchived, here or on another device.
         U::FolderPeers(u) => {
             let moves: Vec<(ChatId, PeerFolder)> = u

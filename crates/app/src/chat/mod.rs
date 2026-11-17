@@ -26,7 +26,7 @@ use abyss_core::store::ViewGen;
 use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, Task, px};
 
 pub(crate) use self::commands::{Admit, Refused};
-use self::list::{ChatList, Pages};
+use self::list::ChatList;
 use self::messages::{Applied, Batch, MessageWindow, RowOp};
 use self::retry::{Backoff, earliest};
 use self::sends::{Echo, Echoes};
@@ -299,13 +299,11 @@ impl ChatShell {
     )]
     pub(crate) fn apply(&mut self, event: Event) {
         match event {
-            Event::DialogsReset(chats) => self.list.reset(chats),
-            Event::DialogsAppended(chats) => self.list.upsert_page(chats),
-            Event::DialogsPaging { has_more } => {
-                self.list
-                    .paged(if has_more { Pages::More } else { Pages::Done });
-            }
-            Event::ChatBumped(chat) => self.list.bump(chat),
+            list @ (Event::DialogsReset(_)
+            | Event::DialogsAppended(_)
+            | Event::DialogsPaging { .. }
+            | Event::ChatBumped(_)
+            | Event::ChatFolders(_)) => self.list.apply(list),
             Event::History {
                 thread,
                 view,

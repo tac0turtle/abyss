@@ -10,8 +10,8 @@
 
 use abyss_core::backend::fake::FakeScript;
 use abyss_core::model::{
-    Body, ChatId, ChatKind, ChatSummary, MediaKind, Message, MsgId, PeerFolder, PeerKind, Preview,
-    Sender, ThreadKey, TopicOrder,
+    Body, ChatFolder, ChatId, ChatKind, ChatSummary, FolderRules, MediaKind, Message, MsgId,
+    PeerFolder, PeerKind, Preview, Sender, ThreadKey, TopicOrder,
 };
 use abyss_core::rich_text::{EntityKind, MAX_ENTITIES, RawEntity, RichText};
 use abyss_core::sanitize::display_name;
@@ -47,7 +47,9 @@ fn kind_of(n: i64) -> ChatKind {
         },
         4 => ChatKind::Group,
         _ if n % 7 == 0 => ChatKind::Bot,
-        _ => ChatKind::Private,
+        _ => ChatKind::Private {
+            contact: n % 3 == 0,
+        },
     }
 }
 
@@ -83,6 +85,7 @@ fn summary(n: i64, now: i64) -> ChatSummary {
                 ..
             }
         ),
+        muted_until: if n % 4 == 3 { i64::from(i32::MAX) } else { 0 },
         // Every sixth chat is archived, so the demo has an archive to open.
         folder: if n > 3 && n % 6 == 5 {
             PeerFolder::Archive
@@ -239,7 +242,35 @@ pub(crate) fn script(now: i64) -> FakeScript {
         };
         script.history.insert(id, history);
     }
+    script.folders = folders();
     script
+}
+
+/// Three chat folders: one by rules, one by rules with exclusions, and one
+/// of named chats with a pinned one.
+fn folders() -> Vec<ChatFolder> {
+    let folder = |id, title: &str, rules| ChatFolder {
+        id,
+        title: display_name(title),
+        rules,
+        pinned: Vec::new(),
+        include: Vec::new(),
+        exclude: Vec::new(),
+        shared: false,
+    };
+    let people = FolderRules::CONTACTS.with(FolderRules::NON_CONTACTS);
+    let unread = people
+        .with(FolderRules::GROUPS)
+        .with(FolderRules::EXCLUDE_READ)
+        .with(FolderRules::EXCLUDE_MUTED);
+    let mut work = folder(4, "Work", FolderRules::default());
+    work.pinned = vec![chat_id(2)];
+    work.include = [1, 4, 9, 14, 24].map(chat_id).to_vec();
+    vec![
+        folder(2, "People", people),
+        folder(3, "Unread", unread),
+        work,
+    ]
 }
 
 #[cfg(test)]
@@ -251,6 +282,7 @@ mod tests {
         let script = script(1_794_837_900);
         assert_eq!(script.dialogs.len(), 1000);
         assert!(script.dialogs.iter().all(ChatSummary::is_valid));
+        assert!(script.folders.iter().all(ChatFolder::is_valid));
         let showcase = &script.history[&chat_id(1)];
         assert_eq!(showcase.len(), 2000);
         assert!(showcase.iter().all(Message::is_valid));

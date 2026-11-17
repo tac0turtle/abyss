@@ -342,8 +342,9 @@ pub(super) async fn retire<B: Backend>(
     Retired { snapshot, dones }
 }
 
-/// Keeps the completions retirement must hand back; a send whose task was
-/// aborted or panicked has an unknown outcome.
+/// Keeps the completions retirement must hand back; a send (or folder write)
+/// whose task was aborted or panicked has an unknown outcome. Folder writes
+/// are handed back so the account's write slot is freed (`folder_writes`).
 fn keep(
     joined: Result<(Id, Done), JoinError>,
     kinds: &mut HashMap<Id, TaskKind>,
@@ -356,23 +357,32 @@ fn keep(
             if done.parked.is_some()
                 || matches!(
                     done.outcome,
-                    Outcome::Send { .. } | Outcome::SendExpired { .. }
+                    Outcome::Send { .. }
+                        | Outcome::SendExpired { .. }
+                        | Outcome::FolderWrite { .. }
                 )
             {
                 dones.push(done);
             }
         }
         Err(e) => {
-            if let Some(TaskKind::Send(local_id)) = kinds.remove(&e.id()) {
-                dones.push(Done {
-                    cgen,
-                    parked: None,
-                    outcome: Outcome::Send {
-                        local_id,
-                        res: Err(CallError::Dropped),
-                    },
-                });
-            }
+            let outcome = match kinds.remove(&e.id()) {
+                Some(TaskKind::Send(local_id)) => Outcome::Send {
+                    local_id,
+                    res: Err(CallError::Dropped),
+                },
+                Some(TaskKind::FolderWrite(write)) => Outcome::FolderWrite {
+                    write,
+                    moved: None,
+                    res: Err(CallError::Dropped),
+                },
+                _ => return,
+            };
+            dones.push(Done {
+                cgen,
+                parked: None,
+                outcome,
+            });
         }
     }
 }
@@ -408,6 +418,8 @@ impl<B: Backend> Actor<B> {
             // with the last known snapshot.
             (Err(_), Phase::Retiring(after)) => {
                 self.admission.release_parked();
+                self.folder_writes_lost_with_retirement().await;
+                self.folder_transport_retired().await;
                 self.after_retire(after).await;
             }
             (Ok(Step::SignedOut { remote, retired }), _) => {
@@ -565,6 +577,7 @@ impl<B: Backend> Actor<B> {
         }
         // The runner has completed: grammers' queues are gone with it.
         self.admission.release_parked();
+        self.folder_transport_retired().await;
         self.after_retire(after).await;
     }
 

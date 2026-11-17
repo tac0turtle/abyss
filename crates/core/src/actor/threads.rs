@@ -30,9 +30,10 @@ use crate::store::{ForumStatus, MAX_TOPIC_LISTS, MAX_WINDOWS, Route, normalize};
 fn kind_status(kind: ChatKind) -> ForumStatus {
     match kind {
         ChatKind::Supergroup { forum: true, .. } => ForumStatus::Forum,
-        ChatKind::Private | ChatKind::Bot | ChatKind::Group | ChatKind::Supergroup { .. } => {
-            ForumStatus::NotForum
-        }
+        ChatKind::Private { .. }
+        | ChatKind::Bot
+        | ChatKind::Group
+        | ChatKind::Supergroup { .. } => ForumStatus::NotForum,
     }
 }
 

@@ -523,8 +523,13 @@ impl<B: Backend> Actor<B> {
         self.reads.clear();
         self.sends = super::sends::PendingSends::default();
         self.queue.clear();
+        // A folders load queued or running for the old account never
+        // reports back; left `Running`, no load would start again.
+        self.folders = super::FoldersLoad::Idle;
+        self.forget_folder_writes();
         self.dialogs_loaded = false;
         self.dialogs_next = None;
         self.emit(Event::DialogsReset(Vec::new())).await;
+        self.emit(Event::ChatFolders(Vec::new())).await;
     }
 }

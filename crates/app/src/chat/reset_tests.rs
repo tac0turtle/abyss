@@ -19,7 +19,7 @@ fn summary(title: &str) -> ChatSummary {
     ChatSummary {
         id: SHARED,
         title: title.into(),
-        kind: ChatKind::Private,
+        kind: ChatKind::Private { contact: false },
         pinned: false,
         unread: 1,
         unread_mentions: 0,
@@ -27,6 +27,7 @@ fn summary(title: &str) -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
+        muted_until: 0,
         folder: PeerFolder::Main,
     }
 }

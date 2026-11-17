@@ -1,6 +1,7 @@
 //! Applying completions and live updates to the store, cache and UI.
 
 use super::Actor;
+use super::FoldersLoad;
 use super::boot::{BootKind, Origin, Snapshot, TailVia};
 use super::jobs::{
     CallError, CallResult, DialogsStep, Done, Job, Load, Outcome, PAGE, ReqId, StreamEnd,
@@ -9,16 +10,23 @@ use super::lifecycle::Reason;
 use super::loads::Owed;
 use crate::api::{Event, HistoryDir, LoadTarget, UserError, WindowState};
 use crate::backend::{
-    Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, StreamError, Update,
+    Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, RejectReason, StreamError,
+    Update,
 };
 use crate::cache::CacheCmd;
-use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerFolder, ThreadKey};
+use crate::model::{ChatFolder, ChatId, ChatSummary, Message, MsgId, PeerFolder, ThreadKey};
 use crate::store::{
     Bump, Change, ContinuityMark, DialogsSeq, Guarded, Last, Rest, Route, Unread, ViewGen, Window,
 };
 
 pub(super) fn user_error(e: CallError) -> UserError {
     match e {
+        CallError::Backend(BackendError::Rejected(RejectReason::FolderChanged)) => {
+            UserError::FolderChanged
+        }
+        CallError::Backend(BackendError::Rejected(RejectReason::FolderLimit)) => {
+            UserError::FolderLimit
+        }
         CallError::Backend(BackendError::Rejected(_) | BackendError::Unauthorized) => {
             UserError::Rejected
         }
@@ -39,7 +47,9 @@ fn call_error(outcome: &Outcome) -> Option<CallError> {
         | Outcome::Send { res: Err(e), .. }
         | Outcome::TopicsPage { res: Err(e), .. }
         | Outcome::TopicsById { res: Err(e), .. }
-        | Outcome::Read(Err(e)) => Some(*e),
+        | Outcome::Read(Err(e))
+        | Outcome::ChatFolders(Err(e))
+        | Outcome::FolderWrite { res: Err(e), .. } => Some(*e),
         _ => None,
     }
 }
@@ -149,6 +159,11 @@ impl<B: Backend> Actor<B> {
         match done.outcome {
             Outcome::Send { local_id, res } => self.on_send(local_id, res).await,
             Outcome::SendExpired { local_id } => self.send_window_closed(local_id).await,
+            // Before the generation check: a write from a retired instance
+            // still frees the account's one write slot (`folder_writes`).
+            Outcome::FolderWrite { write, moved, res } => {
+                self.on_folder_write(write, done.cgen, moved, res).await;
+            }
             _ if !current => {}
             Outcome::Dialogs { step, seq, res } => {
                 self.on_dialogs(step, seq, res).await;
@@ -176,6 +191,7 @@ impl<B: Backend> Actor<B> {
             Outcome::TopicsById { call, res } => self.on_topics_by_id(call, res).await,
             // Read marks are best effort; the next read covers a lost one.
             Outcome::Read(_) | Outcome::UpdatesEnded(StreamEnd::Cancelled) => {}
+            Outcome::ChatFolders(res) => self.on_chat_folders(res).await,
             Outcome::CacheChats(chats) => self.on_cache_chats(chats).await,
             Outcome::CacheHistory {
                 load,
@@ -343,6 +359,9 @@ impl<B: Backend> Actor<B> {
                     self.emit(event).await;
                     let has_more = self.dialogs_next.is_some();
                     self.emit(Event::DialogsPaging { has_more }).await;
+                    if step == DialogsStep::First {
+                        self.load_folders();
+                    }
                 }
             }
             Err(e) => {
@@ -357,6 +376,20 @@ impl<B: Backend> Actor<B> {
         }
         if std::mem::take(&mut self.dialogs_queued) {
             self.load_dialogs().await;
+        }
+    }
+
+    /// The chat folders arrived (or failed to: they stay as they were, and
+    /// the next first page asks again; nothing is shown to the user).
+    async fn on_chat_folders(&mut self, res: CallResult<Vec<ChatFolder>>) {
+        let again = self.folders == FoldersLoad::Again;
+        self.folders = FoldersLoad::Idle;
+        match res {
+            Ok(folders) => self.emit(Event::ChatFolders(folders)).await,
+            Err(e) => tracing::debug!(?e, "chat folders not loaded"),
+        }
+        if again {
+            self.load_folders();
         }
     }
 
@@ -764,13 +797,14 @@ impl<B: Backend> Actor<B> {
             | Update::TopicsPinned { .. }
             | Update::ChatChanged { .. } => {}
             Update::Folders(moves) => self.on_folders(moves).await,
+            Update::ChatFoldersChanged => self.load_folders(),
         }
     }
 
     /// Chats moved into or out of the archive: each listed one changes in
     /// place (`ChatBumped` without a newer message never moves a row), and
     /// the cached list follows, so a restart shows the same split.
-    async fn on_folders(&mut self, moves: Vec<(ChatId, PeerFolder)>) {
+    pub(super) async fn on_folders(&mut self, moves: Vec<(ChatId, PeerFolder)>) {
         let mut changed = Vec::new();
         for (chat, folder) in moves {
             if let Some(summary) = self.dialogs.set_folder(chat, folder) {

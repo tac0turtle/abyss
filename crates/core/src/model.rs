@@ -125,10 +125,17 @@ impl ThreadKey {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatKind {
-    Private,
+    /// `contact`: the user is in the account's contacts (chat folders' rules
+    /// tell contacts from other people).
+    Private {
+        contact: bool,
+    },
     Bot,
     Group,
-    Supergroup { forum: bool, gigagroup: bool },
+    Supergroup {
+        forum: bool,
+        gigagroup: bool,
+    },
 }
 
 /// Telegram's peer folders (not chat folders): every chat is in exactly one.
@@ -167,6 +174,11 @@ pub struct ChatSummary {
     /// without relying on timestamps, which collide within a second.
     pub last_id: Option<MsgId>,
     pub can_send: bool,
+    /// Notifications are muted until this time (Unix seconds; `0`: not
+    /// muted, `i32::MAX`: for good). Checked against the clock when used
+    /// ([`ChatSummary::muted_at`]), so an expired mute stops counting.
+    /// Chat folders can leave muted chats out.
+    pub muted_until: i64,
     /// The main list or the archive. The list holds both; the UI shows one
     /// at a time.
     pub folder: PeerFolder,
@@ -248,6 +260,208 @@ pub struct TopicSnapshot {
     /// edited, or there is none). Orders a live edit of the top message
     /// against this snapshot's preview.
     pub top_version: i64,
+}
+
+/// The rules of a chat folder (`dialogFilter` flags): which chats it takes
+/// in beyond those it names, and which of those it leaves out.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FolderRules(u8);
+
+impl FolderRules {
+    pub const CONTACTS: Self = Self(1);
+    pub const NON_CONTACTS: Self = Self(1 << 1);
+    pub const GROUPS: Self = Self(1 << 2);
+    pub const BROADCASTS: Self = Self(1 << 3);
+    pub const BOTS: Self = Self(1 << 4);
+    pub const EXCLUDE_MUTED: Self = Self(1 << 5);
+    pub const EXCLUDE_READ: Self = Self(1 << 6);
+    pub const EXCLUDE_ARCHIVED: Self = Self(1 << 7);
+
+    #[must_use]
+    pub fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub fn has(self, rule: Self) -> bool {
+        self.0 & rule.0 == rule.0
+    }
+}
+
+impl ChatSummary {
+    /// Whether notifications are muted at `now` (Unix seconds).
+    pub fn muted_at(&self, now: i64) -> bool {
+        self.muted_until > now
+    }
+}
+
+/// Which chat folder an edit was made for: its id, title, rules and shared
+/// flag as the UI last saw them, compared field by field (no hash, so no
+/// collisions). Best-effort detection of an observable identity change: a
+/// folder replaced (on another device) by one with the same id and another
+/// title, rules or shared flag has another tag, so a queued edit is
+/// refused instead of changing the wrong folder. A replacement identical in
+/// those fields (a "Work" deleted and recreated as it was) has the same tag
+/// and is not detected. Changes to its chats keep the tag. Bounded by the
+/// title's bound; opaque, and never logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FolderTag {
+    id: i32,
+    title: String,
+    rules: FolderRules,
+    shared: bool,
+}
+
+impl std::fmt::Debug for FolderTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FolderTag(..)")
+    }
+}
+
+/// A chat folder (`dialogFilter`): a user-defined, synced view of the chat
+/// list. `pinned` and `include` are always in it, `exclude` never; other
+/// chats are in it when they match `rules`. Ids are the server's.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChatFolder {
+    pub id: i32,
+    /// Sanitized via [`crate::sanitize::display_name`].
+    pub title: String,
+    pub rules: FolderRules,
+    /// Shown first, in this order.
+    pub pinned: Vec<ChatId>,
+    pub include: Vec<ChatId>,
+    pub exclude: Vec<ChatId>,
+    /// A shared folder (chat list invite): read-only here.
+    pub shared: bool,
+}
+
+impl ChatFolder {
+    /// Whether `chat` is in this folder at `now` (Unix seconds, for mutes),
+    /// by Telegram's rule as Telegram Desktop applies it
+    /// (`ChatFilter::contains`): excluded chats never are, named ones always
+    /// are, and any other is when its kind matches and no exclusion applies.
+    /// "Exclude muted" keeps a muted chat with an unread mention unless it
+    /// is archived.
+    pub fn contains(&self, chat: &ChatSummary, now: i64) -> bool {
+        if self.exclude.contains(&chat.id) {
+            return false;
+        }
+        if self.pinned.contains(&chat.id) || self.include.contains(&chat.id) {
+            return true;
+        }
+        let r = self.rules;
+        let kind = match chat.kind {
+            ChatKind::Private { contact: true } => r.has(FolderRules::CONTACTS),
+            ChatKind::Private { contact: false } => r.has(FolderRules::NON_CONTACTS),
+            ChatKind::Bot => r.has(FolderRules::BOTS),
+            ChatKind::Group | ChatKind::Supergroup { .. } => r.has(FolderRules::GROUPS),
+        };
+        let mentioned = chat.unread_mentions > 0 && chat.folder == PeerFolder::Main;
+        kind && !(r.has(FolderRules::EXCLUDE_MUTED) && chat.muted_at(now) && !mentioned)
+            && !(r.has(FolderRules::EXCLUDE_READ) && chat.unread == 0 && chat.unread_mentions == 0)
+            && !(r.has(FolderRules::EXCLUDE_ARCHIVED) && chat.folder == PeerFolder::Archive)
+    }
+
+    /// Heap bytes retained, for byte budgets.
+    pub fn retained_bytes(&self) -> usize {
+        let ids = self.pinned.capacity() + self.include.capacity() + self.exclude.capacity();
+        self.title.capacity() + ids * std::mem::size_of::<ChatId>()
+    }
+
+    pub fn is_valid(&self) -> bool {
+        is_clean(&self.title, MAX_NAME_BYTES)
+    }
+
+    /// This folder's [`FolderTag`].
+    pub fn tag(&self) -> FolderTag {
+        FolderTag {
+            id: self.id,
+            title: self.title.clone(),
+            rules: self.rules,
+            shared: self.shared,
+        }
+    }
+}
+
+/// The longest chat folder title Telegram accepts, in characters.
+pub const MAX_FOLDER_TITLE: usize = 12;
+
+/// A change to the account's chat folders (folders plan, part C). Only
+/// regular folders can be changed; shared ones are read-only. An edit of an
+/// existing folder carries the [`FolderTag`] the UI saw, checked against
+/// the folder as fetched right before the write (best-effort: see
+/// [`FolderTag`] for what it cannot tell apart).
+#[derive(Clone, PartialEq, Eq)]
+pub enum FolderEdit {
+    /// Puts `chat` in the folder by name (and out of its exclusions).
+    AddChat {
+        folder: i32,
+        tag: FolderTag,
+        chat: ChatId,
+    },
+    /// Takes `chat` out of the folder: off its named chats, and onto its
+    /// exclusions when its rules would still take it in.
+    RemoveChat {
+        folder: i32,
+        tag: FolderTag,
+        chat: ChatId,
+    },
+    /// A new folder holding `chat`. `title` is sanitized and at most
+    /// [`MAX_FOLDER_TITLE`] characters.
+    Create {
+        title: String,
+        chat: ChatId,
+    },
+    Delete {
+        folder: i32,
+        tag: FolderTag,
+    },
+}
+
+impl FolderEdit {
+    /// The existing folder the edit is for, and its expected tag.
+    pub fn target(&self) -> Option<(i32, &FolderTag)> {
+        match self {
+            Self::AddChat { folder, tag, .. }
+            | Self::RemoveChat { folder, tag, .. }
+            | Self::Delete { folder, tag } => Some((*folder, tag)),
+            Self::Create { .. } => None,
+        }
+    }
+}
+
+/// Titles and tags stay out of logs.
+impl std::fmt::Debug for FolderEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddChat { folder, chat, .. } => f
+                .debug_struct("AddChat")
+                .field("folder", folder)
+                .field("chat", chat)
+                .finish_non_exhaustive(),
+            Self::RemoveChat { folder, chat, .. } => f
+                .debug_struct("RemoveChat")
+                .field("folder", folder)
+                .field("chat", chat)
+                .finish_non_exhaustive(),
+            Self::Create { chat, .. } => f
+                .debug_struct("Create")
+                .field("chat", chat)
+                .finish_non_exhaustive(),
+            Self::Delete { folder, .. } => f
+                .debug_struct("Delete")
+                .field("folder", folder)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// A folder title as Telegram takes it: sanitized, trimmed, non-empty and
+/// at most [`MAX_FOLDER_TITLE`] characters. `None` otherwise.
+pub fn folder_title(raw: &str) -> Option<String> {
+    let title = crate::sanitize::display_name(raw.trim());
+    let title = title.trim();
+    let n = title.chars().count();
+    (n > 0 && n <= MAX_FOLDER_TITLE).then(|| title.to_owned())
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]

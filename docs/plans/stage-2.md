@@ -704,7 +704,7 @@ Topic lists are not counted in `MAX_STORE_BYTES`. The budget is **retained paylo
 **Schema version 4.**
 - `messages` gains `topic INTEGER NOT NULL`: 0 for `topic: None`, otherwise `TopicId::get()`, which is ≥ 1, so 0 can't collide.
 - The primary key stays `(kind, chat, id)`, since ids are unique per chat. A new index `messages_thread ON messages (kind, chat, topic, id)` serves thread pages.
-- **Migration 3 → 4:** delete all messages and `cached_chats` rows, then recreate. Version 3 rows have unnormalized topics (`route` didn't exist), and the cache is disposable (S1 §16). Chats survive. (Migration 4 → 5, from [folders.md](folders.md) part A, then drops the chat list, so a version 3 cache ends at version 5 with neither.)
+- **Migration 3 → 4:** delete all messages and `cached_chats` rows, then recreate. Version 3 rows have unnormalized topics (`route` didn't exist), and the cache is disposable (S1 §16). Chats survive. (Migrations 4 → 5 and 5 → 6, from [folders.md](folders.md) parts A and B, then drop the chat list, so a version 3 cache ends at the current version with neither.)
 
 **Thread-scoped operations.** Everything that reads, extends or replaces a run of history takes a `ThreadKey` and filters on `topic`:
 - `tail`, `before`, `after` (pages of one thread).

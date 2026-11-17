@@ -783,3 +783,56 @@ async fn responses_before_reconciliation_do_not_evict_handed_off_pages() {
     assert_eq!(calls.pin_state().1, 0);
     assert_eq!(carried_users(&retire(calls.session())).len(), 200);
 }
+
+/// A `messages.dialogFilters` reply holding regular folders with these ids.
+fn folders_reply(ids: &[i32]) -> Vec<u8> {
+    let filter = |id: i32| {
+        tl::enums::DialogFilter::Filter(tl::types::DialogFilter {
+            contacts: false,
+            non_contacts: false,
+            groups: false,
+            broadcasts: false,
+            bots: false,
+            exclude_muted: false,
+            exclude_read: false,
+            exclude_archived: false,
+            title_noanimate: false,
+            id,
+            title: tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+                text: format!("f{id}"),
+                entities: vec![],
+            }),
+            emoticon: None,
+            color: None,
+            pinned_peers: vec![],
+            include_peers: vec![],
+            exclude_peers: vec![],
+        })
+    };
+    tl::enums::messages::DialogFilters::Filters(tl::types::messages::DialogFilters {
+        tags_enabled: false,
+        filters: ids.iter().map(|&id| filter(id)).collect(),
+    })
+    .to_bytes()
+}
+
+/// An edit on an instance that has not fetched the folders yet (a rebuild
+/// keeps queued edits) fetches them first: a new folder takes a free id
+/// instead of overwriting folder 2.
+#[tokio::test(start_paused = true)]
+async fn folder_edits_start_from_freshly_fetched_folders() {
+    use crate::model::FolderEdit;
+    let mock = Mock::with(vec![Ok(folders_reply(&[2, 3])), Ok(true.to_bytes())]);
+    let calls = setup(&mock).await;
+    let create = FolderEdit::Create {
+        title: "New".into(),
+        chat: ANN,
+    };
+    calls.edit_chat_folder(create).await.unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    tl::functions::messages::GetDialogFilters::from_boxed_bytes(&requests[0]).unwrap();
+    let update =
+        tl::functions::messages::UpdateDialogFilter::from_boxed_bytes(&requests[1]).unwrap();
+    assert_eq!(update.id, 4, "folders 2 and 3 exist");
+}

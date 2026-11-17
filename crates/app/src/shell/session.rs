@@ -114,16 +114,25 @@ pub(crate) struct Session {
     /// `CredentialItem`): a failure shows Retry.
     pub(super) cred_item: CredentialItem,
     pub(super) composer: Entity<TextInput>,
+    /// A new chat folder's title (`folder_menu`).
+    pub(super) folder_name: Entity<TextInput>,
+    /// The open archive/folder menu, if any (`folder_menu`).
+    pub(super) menu: Option<super::folder_menu::Menu>,
     /// Chat list, open chat and pending sends (`crate::chat`, `shell::chats`).
     pub(super) shell: ChatShell,
     pub(super) conn: Option<ConnState>,
     pub(super) notice: Option<SharedString>,
     notice_gen: u64,
+    /// A logout cancelled waiting archive moves or folder edits: told for as
+    /// long as any logout screen shows ("Logging out", "Couldn't start
+    /// logout", the logout itself, "Logout incomplete"), then as a passing
+    /// notice once the logout is over ("Stay signed in", or it finished).
+    pub(super) writes_cancelled: bool,
     pub(super) closing: Closing,
     _pump: Task<()>,
     #[cfg(feature = "fake")]
     fake: Option<abyss_core::backend::fake::FakeHandle>,
-    _subscriptions: [Subscription; 6],
+    _subscriptions: [Subscription; 7],
     _chat_wiring: [Subscription; 2],
 }
 
@@ -133,6 +142,7 @@ impl Session {
         let phone = text_input(Limits::PHONE, copy::PHONE_PLACEHOLDER, cx);
         let code = text_input(Limits::CODE, copy::CODE_PLACEHOLDER, cx);
         let composer = text_input(Limits::COMPOSER, copy::COMPOSER_PLACEHOLDER, cx);
+        let (folder_name, folder_sub) = super::folder_menu::title_field(window, cx);
         let password = cx.new(|cx| PasswordInput::new(window, cx));
         let api_id = text_input(Limits::API_ID, copy::onboarding::API_ID_PLACEHOLDER, cx);
         let api_hash = cx.new(|cx| PasswordInput::api_hash(window, cx));
@@ -160,6 +170,7 @@ impl Session {
                     root.with_session(|s, cx| s.submit_message(window, cx), cx);
                 },
             ),
+            folder_sub,
         ];
         let pump = spawn_pump(started.events, window, cx);
         let shell = ChatShell::default();
@@ -178,10 +189,13 @@ impl Session {
             source: None,
             cred_item: CredentialItem::Settled,
             composer,
+            folder_name,
+            menu: None,
             shell,
             conn: None,
             notice: None,
             notice_gen: 0,
+            writes_cancelled: false,
             closing: Closing::Open,
             _pump: pump,
             #[cfg(feature = "fake")]
@@ -289,6 +303,9 @@ impl Session {
         self.shell.reset();
         self.composer
             .update(cx, |input, cx| input.clear(window, cx));
+        self.folder_name
+            .update(cx, |input, cx| input.clear(window, cx));
+        self.menu = None;
         self.logout_prompt = false;
     }
 
@@ -420,7 +437,26 @@ impl Session {
         let projection = project(state, &self.auth, Instant::now());
         self.needs_params = projection.needs_params;
         self.set_auth(projection.view, window, cx);
-        if let Some(notice) = projection.notice {
+        // Kept up until the logout is over: it either finished (a login
+        // screen) or did not happen ("Stay signed in").
+        let logging_out = matches!(
+            self.auth,
+            AuthView::LogoutStarting
+                | AuthView::LogoutNotStarted { .. }
+                | AuthView::LoggingOut
+                | AuthView::LogoutIncomplete { .. }
+        );
+        let mut notice = projection.notice;
+        if self.writes_cancelled && !logging_out {
+            // Told now, after the logout's own notice if it has one.
+            self.writes_cancelled = false;
+            let cancelled = copy::user_error(UserError::FolderWritesCancelled);
+            notice = Some(match notice {
+                Some(first) => format!("{first} {cancelled}").into(),
+                None => cancelled,
+            });
+        }
+        if let Some(notice) = notice {
             self.show_notice(notice, window, cx);
         }
         #[cfg(feature = "fake")]
@@ -432,6 +468,12 @@ impl Session {
     fn on_error(&mut self, error: UserError, window: &mut Window, cx: &mut Context<'_, Root>) {
         // Errors never end a load: core says which ended (`LoadEnded`).
         tracing::info!(?error, "core reported an error");
+        if error == UserError::FolderWritesCancelled {
+            // Kept up through the logout screen (`on_auth`).
+            self.writes_cancelled = true;
+            cx.notify();
+            return;
+        }
         match self.auth.with_error(error, Instant::now()) {
             Some(next) => self.set_auth(next, window, cx),
             None => self.show_notice(copy::user_error(error), window, cx),

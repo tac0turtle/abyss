@@ -395,7 +395,7 @@ mod tests {
         ChatSummary {
             id: id(n),
             title: format!("c{n}"),
-            kind: ChatKind::Private,
+            kind: ChatKind::Private { contact: false },
             pinned: false,
             unread: 0,
             unread_mentions: 0,
@@ -403,6 +403,7 @@ mod tests {
             last_date: 0,
             last_id: None,
             can_send: true,
+            muted_until: 0,
             folder: PeerFolder::Main,
         }
     }

@@ -9,6 +9,7 @@ mod auth_outcome;
 mod binding;
 mod boot;
 mod covered;
+mod folder_writes;
 mod jobs;
 mod lifecycle;
 mod loads;
@@ -38,7 +39,7 @@ pub use admission::MAX_CONCURRENT;
 use auth::AuthMachine;
 pub(crate) use binding::{Identity, provision_cache};
 use boot::Boot;
-use jobs::{CallCtx, Done, Job, Load, ReqId, TaskKind};
+use jobs::{CallCtx, Done, FolderJob, Job, Load, ReqId, TaskKind};
 use lifecycle::{Lifecycle, Live, LiveEvent, Phase, Reason};
 use loads::Deferred;
 pub(crate) use logout::CacheParts;
@@ -52,7 +53,7 @@ use crate::backend::{Backend, DialogsCursor, HistoryQuery, StreamItem};
 use crate::cache::CacheHandle;
 use crate::core::ShutdownReport;
 use crate::events::EventSender;
-use crate::model::{MsgId, ThreadKey};
+use crate::model::{FolderEdit, MsgId, ThreadKey};
 use crate::session::{PersistHandle, SessionSnapshot};
 use crate::store::{Dialogs, DialogsSeq, MAX_DIALOGS, ViewGen, Window, Windows};
 
@@ -89,6 +90,8 @@ fn account_scoped(cmd: &Command) -> bool {
             | Command::OpenForum(_)
             | Command::CloseForum(_)
             | Command::LoadTopics(_)
+            | Command::SetPeerFolder { .. }
+            | Command::EditChatFolder(_)
     )
 }
 
@@ -105,6 +108,16 @@ pub(crate) struct Stamped {
 pub(crate) enum Internal {
     /// The system woke from sleep: rebuild rather than trust old sockets.
     Wake,
+}
+
+/// The chat folders load (`Job::ChatFolders`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FoldersLoad {
+    Idle,
+    /// Queued or running.
+    Running,
+    /// Queued or running, and another load is wanted after it.
+    Again,
 }
 
 pub(crate) struct Actor<B: Backend> {
@@ -143,6 +156,9 @@ pub(crate) struct Actor<B: Backend> {
     next_req: u64,
     dialogs_busy: bool,
     dialogs_queued: bool,
+    folders: FoldersLoad,
+    /// Archive moves and folder edits: one at a time (`folder_writes`).
+    folder_writes: folder_writes::FolderWrites,
     dialogs_loaded: bool,
     dialogs_next: Option<DialogsCursor>,
     open: Option<ThreadKey>,
@@ -236,6 +252,8 @@ impl<B: Backend> Actor<B> {
             next_req: 0,
             dialogs_busy: false,
             dialogs_queued: false,
+            folders: FoldersLoad::Idle,
+            folder_writes: folder_writes::FolderWrites::default(),
             dialogs_loaded: false,
             dialogs_next: None,
             open: None,
@@ -472,7 +490,17 @@ impl<B: Backend> Actor<B> {
     /// What a purged load owed the UI is left to the caller: retirement
     /// answers it, and a full bootstrap invalidates its view (task 10g).
     fn purge_queued(&mut self) {
-        let keep = |job: &Job| matches!(job, Job::Send { .. } | Job::Read { .. });
+        // Sends, read marks and folder changes are the user's intent: they
+        // run on the next instance.
+        let keep = |job: &Job| {
+            matches!(
+                job,
+                Job::Send { .. }
+                    | Job::Read { .. }
+                    | Job::Folders(FolderJob::SetPeerFolder { .. } | FolderJob::Edit { .. })
+            )
+        };
+        self.folders = FoldersLoad::Idle;
         let (kept, purged): (Vec<Job>, Vec<Job>) = self.queue.drain(..).partition(keep);
         self.queue = kept.into();
         let purged: Vec<Job> = self.priority.drain(..).chain(purged).collect();
@@ -486,7 +514,7 @@ impl<B: Backend> Actor<B> {
                 Job::TopicsPage { call, .. } | Job::TopicsById { call, .. } => {
                     self.topics_job_purged(call);
                 }
-                Job::Send { .. } | Job::Read { .. } => {}
+                Job::Send { .. } | Job::Read { .. } | Job::Folders(_) => {}
             }
         }
     }
@@ -534,6 +562,15 @@ impl<B: Backend> Actor<B> {
     /// released by unwinding; clear the state it held and keep running.
     async fn on_panic(&mut self, kind: Option<TaskKind>) {
         match kind {
+            Some(TaskKind::ChatFolders) => {
+                // A load wanted after this one still runs.
+                let again = self.folders == FoldersLoad::Again;
+                self.folders = FoldersLoad::Idle;
+                if again {
+                    self.load_folders();
+                }
+            }
+            Some(TaskKind::FolderWrite(write)) => self.folder_write_panicked(write).await,
             Some(TaskKind::Dialogs) => {
                 self.dialogs_busy = false;
                 self.load_ended(LoadTarget::Dialogs, Some(UserError::Internal))
@@ -625,6 +662,11 @@ impl<B: Backend> Actor<B> {
             Command::Window(state) => self.on_window(state).await,
             Command::MarkRead { thread, max_id } => self.mark_read(thread, max_id).await,
             Command::ViewingTail(thread) => self.viewing = thread,
+            Command::SetPeerFolder { chat, folder } => {
+                self.folder_write(folder_writes::FolderWrite::Move { chat, folder })
+                    .await;
+            }
+            Command::EditChatFolder(edit) => self.edit_chat_folder(edit).await,
             Command::SubmitPhone(phone) => {
                 let phone = zeroize::Zeroizing::new(phone);
                 self.submit_phone(&phone).await;
@@ -643,6 +685,35 @@ impl<B: Backend> Actor<B> {
             Command::Back => self.back().await,
             Command::RetryStartup => self.retry_startup().await,
         }
+    }
+
+    /// Loads the chat folders in the background: after each first dialogs
+    /// page and when they change. At most one load runs, with at most one
+    /// more after it; a full queue drops it quietly (the next first page
+    /// asks again).
+    fn load_folders(&mut self) {
+        match self.folders {
+            FoldersLoad::Running | FoldersLoad::Again => self.folders = FoldersLoad::Again,
+            FoldersLoad::Idle if self.queue.len() < MAX_QUEUED => {
+                self.queue.push_back(Job::Folders(FolderJob::Load));
+                self.folders = FoldersLoad::Running;
+            }
+            FoldersLoad::Idle => {}
+        }
+    }
+
+    /// Takes a folder change (it waits its turn, `folder_writes`); a new
+    /// folder's title must be one Telegram takes.
+    async fn edit_chat_folder(&mut self, edit: FolderEdit) {
+        let edit = match edit {
+            FolderEdit::Create { title, chat } => match crate::model::folder_title(&title) {
+                Some(title) => FolderEdit::Create { title, chat },
+                None => return self.error(UserError::Rejected).await,
+            },
+            other => other,
+        };
+        self.folder_write(folder_writes::FolderWrite::Edit(edit))
+            .await;
     }
 
     async fn load_dialogs(&mut self) {

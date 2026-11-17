@@ -167,8 +167,8 @@ impl LogoutGate {
     }
 
     /// While the account is hidden, the logout counts as begun for what
-    /// would act for the account: a send, a retry, or a report that its
-    /// tail is on screen, as during the teardown (review rounds 19, 25 and
+    /// would act for the account: a send, a retry, an archive move or folder
+    /// edit, or a report that its tail is on screen, as during the teardown (review rounds 19, 25 and
     /// 28). The rest acts as if it had come before the Logout (the account
     /// is unchanged until the marker is durable, and the teardown ends what
     /// is in flight then): reads and loads are answered as usual, and a
@@ -177,7 +177,11 @@ impl LogoutGate {
         self.hides_account()
             && matches!(
                 cmd,
-                Command::SendText { .. } | Command::RetrySend(_) | Command::ViewingTail(Some(_))
+                Command::SendText { .. }
+                    | Command::RetrySend(_)
+                    | Command::ViewingTail(Some(_))
+                    | Command::SetPeerFolder { .. }
+                    | Command::EditChatFolder(_)
             )
     }
 
@@ -223,8 +227,11 @@ impl<B: Backend> Actor<B> {
     /// logout starts only when the write succeeded (`on_logout_marked`).
     pub(super) async fn begin_marking(&mut self, marking: Marking) {
         self.logout_gate.marking = Some(marking);
-        self.hide_account();
+        let dropped = self.hide_account();
         self.emit_auth().await;
+        if dropped {
+            self.error(UserError::FolderWritesCancelled).await;
+        }
         let persist = self.persist.clone();
         let tx = self.auth.sender();
         let shutdown = self.cancel.clone();

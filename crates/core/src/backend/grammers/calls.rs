@@ -27,7 +27,9 @@ use crate::backend::{
     BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, RejectReason, TopicsById,
     TopicsCursor, TopicsPage,
 };
-use crate::model::{ChatId, ChatSummary, MsgId, PeerKind, ThreadKey, TopicId};
+use crate::model::{
+    ChatFolder, ChatId, ChatSummary, FolderEdit, MsgId, PeerFolder, PeerKind, ThreadKey, TopicId,
+};
 use crate::session::{AbyssSession, PinRequest, Pinned};
 use crate::store::{MAX_PEER_DIALOGS, MAX_TOPICS_BY_ID};
 
@@ -549,6 +551,92 @@ impl<I: Invoke> Calls<I> {
             chats: mapped.chats,
             next: mapped.next,
         })
+    }
+
+    /// `messages.getDialogFilters`, size-checked: the raw folders.
+    async fn fetch_raw_folders(&self) -> Result<Vec<tl::enums::DialogFilter>, BackendError> {
+        let request = tl::functions::messages::GetDialogFilters {};
+        let resp = call(&self.invoker, RetryClass::Read, &request)
+            .await
+            .map_err(|e| fail(&e))?;
+        let raw = map::folders::raw_folders(&resp).map_err(|map::Oversized| oversized())?;
+        Ok(raw.to_vec())
+    }
+
+    /// `messages.getDialogFilters`. `inputPeerSelf` maps to the signed-in
+    /// user, read from the session.
+    pub(crate) async fn chat_folders(&self) -> Result<Vec<ChatFolder>, BackendError> {
+        let raw = self.fetch_raw_folders().await?;
+        let self_id = self.session.snapshot().self_id().ok().flatten();
+        Ok(map::folders::chat_folders(&raw, self_id))
+    }
+
+    /// `folders.editPeerFolders` for one chat. Idempotent, so retried like
+    /// a read.
+    pub(crate) async fn set_peer_folder(
+        &self,
+        chat: ChatId,
+        folder: PeerFolder,
+    ) -> Result<(), BackendError> {
+        let (peer, _in_flight) = self.resolve_used(chat).await?;
+        let folder_id = match folder {
+            PeerFolder::Main => 0,
+            PeerFolder::Archive => map::folders::ARCHIVE,
+        };
+        let request = tl::functions::folders::EditPeerFolders {
+            folder_peers: vec![tl::enums::InputFolderPeer::Peer(
+                tl::types::InputFolderPeer { peer, folder_id },
+            )],
+        };
+        call(&self.invoker, RetryClass::Read, &request)
+            .await
+            .map(drop)
+            .map_err(|e| fail(&e))
+    }
+
+    /// `messages.updateDialogFilter` made from the raw folders, fetched by
+    /// this call right before the write (never a copy shared with other
+    /// calls). It sets a whole folder, so it is retried like a read.
+    ///
+    /// The fresh fetch matters: a copy fetched earlier may miss a change
+    /// made since (on another device, or by this account's previous write),
+    /// which the whole-folder write would undo, and an instance that never
+    /// fetched would pick id 2 for a new folder. Core admits one folder
+    /// write at a time, so this account sends no other write between the
+    /// fetch and the write; an earlier write with an unknown outcome may
+    /// still be applied by the server in between (folders plan, part C,
+    /// "Risks").
+    pub(crate) async fn edit_chat_folder(&self, edit: FolderEdit) -> Result<(), BackendError> {
+        let chat = match &edit {
+            FolderEdit::AddChat { chat, .. }
+            | FolderEdit::RemoveChat { chat, .. }
+            | FolderEdit::Create { chat, .. } => Some(*chat),
+            FolderEdit::Delete { .. } => None,
+        };
+        let (peer, _in_flight) = match chat {
+            Some(chat) => {
+                let (peer, guard) = self.resolve_used(chat).await?;
+                (Some(peer), Some(guard))
+            }
+            None => (None, None),
+        };
+        let raw = self.fetch_raw_folders().await?;
+        let self_id = self.session.snapshot().self_id().ok().flatten();
+        let (id, filter) = map::folders::edited(&raw, &edit, peer, self_id).map_err(|e| {
+            tracing::debug!(?e, "folder edit refused");
+            BackendError::Rejected(match e {
+                map::folders::EditError::Unknown | map::folders::EditError::Changed => {
+                    RejectReason::FolderChanged
+                }
+                map::folders::EditError::Limit => RejectReason::FolderLimit,
+                map::folders::EditError::Shared => RejectReason::Other,
+            })
+        })?;
+        let request = tl::functions::messages::UpdateDialogFilter { id, filter };
+        call(&self.invoker, RetryClass::Read, &request)
+            .await
+            .map(drop)
+            .map_err(|e| fail(&e))
     }
 
     /// One page of `thread`'s history. Messages of other threads in the

@@ -1,7 +1,8 @@
 //! Commands the UI sends to core and events core sends back.
 
 use crate::model::{
-    ChatId, ChatSummary, LocalId, Message, MsgId, ThreadKey, Topic, TopicId, TopicOrder,
+    ChatFolder, ChatId, ChatSummary, FolderEdit, LocalId, Message, MsgId, PeerFolder, ThreadKey,
+    Topic, TopicId, TopicOrder,
 };
 use crate::store::{TopicsGen, ViewGen};
 
@@ -71,6 +72,16 @@ pub enum Command {
     /// The next topics page of the shown forum. Answered by `TopicsPaging`
     /// after the page, or by `LoadEnded { Topics }`.
     LoadTopics(ChatId),
+    /// Moves a chat into or out of the archive. On success core applies the
+    /// move (`ChatBumped`); a failure is sent as `Error`.
+    SetPeerFolder {
+        chat: ChatId,
+        folder: PeerFolder,
+    },
+    /// Changes a chat folder. On success core fetches the folders again
+    /// (`ChatFolders`); a failure is sent as `Error`. A `Create` title that
+    /// [`crate::model::folder_title`] refuses is `Rejected` unsent.
+    EditChatFolder(FolderEdit),
     /// Signs out: remote `auth.logOut`, then local deletion of the session
     /// item and the cache (plan sections 5, 16). While signed out, it retries
     /// the local deletion only.
@@ -135,6 +146,12 @@ impl std::fmt::Debug for Command {
             Self::OpenForum(c) => f.debug_tuple("OpenForum").field(c).finish(),
             Self::CloseForum(c) => f.debug_tuple("CloseForum").field(c).finish(),
             Self::LoadTopics(c) => f.debug_tuple("LoadTopics").field(c).finish(),
+            Self::SetPeerFolder { chat, folder } => f
+                .debug_struct("SetPeerFolder")
+                .field("chat", chat)
+                .field("folder", folder)
+                .finish(),
+            Self::EditChatFolder(edit) => f.debug_tuple("EditChatFolder").field(edit).finish(),
             Self::Logout => f.write_str("Logout"),
             Self::SubmitCredentials { .. } => f.write_str("SubmitCredentials(<redacted>)"),
             Self::ForgetStoredCredentials => f.write_str("ForgetStoredCredentials"),
@@ -235,6 +252,18 @@ pub enum UserError {
     Credentials(CredentialError),
     /// Device-local storage (Keychain, cache) failed.
     Storage(StorageError),
+    /// A folder edit was refused because the folder visibly changed since
+    /// the UI showed it (deleted, renamed, its rules changed, or replaced by
+    /// a different-looking folder): try again. Best-effort: a replacement
+    /// identical in id, title, rules and shared flag is not noticed.
+    FolderChanged,
+    /// A folder edit was refused because it would pass Telegram's folder
+    /// limits (abyss's bounds: 64 folders, 512 chats named per folder).
+    FolderLimit,
+    /// A logout hid the account while archive moves or folder edits waited
+    /// to be sent: they were cancelled, and nothing of them reached the
+    /// server.
+    FolderWritesCancelled,
     /// A bug: a contained panic or broken invariant.
     Internal,
 }
@@ -290,6 +319,10 @@ pub enum Event {
     /// moves an unpinned chat to the top of the unpinned section exactly when
     /// `last_id` grew; read-state changes keep `last_id`.
     ChatBumped(ChatSummary),
+    /// The account's chat folders, in server order, replacing the UI's
+    /// copy. Sent after each first dialogs page and whenever they change;
+    /// empty after a logout.
+    ChatFolders(Vec<ChatFolder>),
     History {
         thread: ThreadKey,
         view: ViewGen,
@@ -418,6 +451,10 @@ impl Event {
         BASE + match self {
             Event::DialogsReset(v) | Event::DialogsAppended(v) => chats(v),
             Event::ChatBumped(c) => c.retained_bytes(),
+            Event::ChatFolders(v) => {
+                std::mem::size_of_val(v.as_slice())
+                    + v.iter().map(ChatFolder::retained_bytes).sum::<usize>()
+            }
             Event::History {
                 messages, removed, ..
             } => {

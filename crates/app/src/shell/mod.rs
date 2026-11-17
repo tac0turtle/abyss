@@ -6,6 +6,7 @@ mod auth;
 mod bridge;
 mod chat_view;
 mod chats;
+mod folder_menu;
 mod onboarding;
 mod session;
 mod shutdown;

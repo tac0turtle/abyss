@@ -15,7 +15,10 @@ use crate::backend::{
     StreamItem, TopicsById, TopicsCursor, TopicsPage, UpdateStream,
 };
 use crate::cache::CacheHandle;
-use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId, ThreadKey, TopicId};
+use crate::model::{
+    ChatFolder, ChatId, ChatSummary, FolderEdit, LocalId, Message, MsgId, PeerFolder, ThreadKey,
+    TopicId,
+};
 use crate::store::{
     ContinuityMark, DialogsSeq, FetchSeq, PageKind, TOPICS_PAGE, TopicsGen, ViewGen,
 };
@@ -101,6 +104,32 @@ pub(super) enum Job {
         call: TopicsCall,
         ids: Vec<TopicId>,
     },
+    Folders(FolderJob),
+}
+
+/// Archive and chat folder calls (folders plan, parts B and C).
+#[derive(Debug)]
+pub(super) enum FolderJob {
+    /// Load the chat folders.
+    Load,
+    /// Archive or unarchive a chat.
+    SetPeerFolder {
+        write: u64,
+        chat: ChatId,
+        folder: PeerFolder,
+    },
+    /// Change a chat folder.
+    Edit { write: u64, edit: FolderEdit },
+}
+
+impl FolderJob {
+    /// The id of a folder write (`folder_writes`), `None` for a load.
+    pub(super) fn write(&self) -> Option<u64> {
+        match self {
+            Self::Load => None,
+            Self::SetPeerFolder { write, .. } | Self::Edit { write, .. } => Some(*write),
+        }
+    }
 }
 
 impl Job {
@@ -172,6 +201,14 @@ pub(super) enum Outcome {
         call: TopicsCall,
         res: CallResult<TopicsById>,
     },
+    ChatFolders(CallResult<Vec<ChatFolder>>),
+    /// A folder write ended. `moved`: the archive move it made, if it was
+    /// one (an edit, or a write retirement dropped, has none).
+    FolderWrite {
+        write: u64,
+        moved: Option<(ChatId, PeerFolder)>,
+        res: CallResult<()>,
+    },
     CacheChats(Option<Vec<ChatSummary>>),
     CacheHistory {
         load: Load,
@@ -201,6 +238,9 @@ pub(super) enum TaskKind {
     Read,
     TopicsPage(TopicsCall),
     TopicsById(TopicsCall),
+    ChatFolders,
+    /// An archive move or a folder change, by write id.
+    FolderWrite(u64),
     CacheChats,
     Updates,
     /// A login call (task 6b), for panic handling.
@@ -283,16 +323,7 @@ pub(super) fn job_future<C: Client>(
         cancel,
     };
     match job {
-        Job::Dialogs { cursor, seq } => {
-            let step = if cursor.is_none() {
-                DialogsStep::First
-            } else {
-                DialogsStep::Next
-            };
-            let call = async move { client.dialogs(cursor, DIALOGS_PAGE).await };
-            let fut = admitted.run(call, move |res| Outcome::Dialogs { step, seq, res });
-            (TaskKind::Dialogs, Box::pin(fut))
-        }
+        Job::Dialogs { cursor, seq } => dialogs(client, admitted, cursor, seq),
         Job::History {
             load,
             dir,
@@ -342,6 +373,44 @@ pub(super) fn job_future<C: Client>(
             (TaskKind::TopicsPage(call), Box::pin(fut))
         }
         Job::TopicsById { call, ids } => topics_by_id(client, admitted, call, ids),
+        Job::Folders(job) => folder_future(client, admitted, job),
+    }
+}
+
+/// The future for an admitted [`FolderJob`], plus its kind.
+fn folder_future<C: Client>(
+    client: Arc<C>,
+    admitted: Admitted,
+    job: FolderJob,
+) -> (TaskKind, DoneFuture) {
+    match job {
+        FolderJob::Load => {
+            let call = async move { client.chat_folders().await };
+            let fut = admitted.run(call, Outcome::ChatFolders);
+            (TaskKind::ChatFolders, Box::pin(fut))
+        }
+        FolderJob::SetPeerFolder {
+            write,
+            chat,
+            folder,
+        } => {
+            let call = async move { client.set_peer_folder(chat, folder).await };
+            let fut = admitted.run(call, move |res| Outcome::FolderWrite {
+                write,
+                moved: Some((chat, folder)),
+                res,
+            });
+            (TaskKind::FolderWrite(write), Box::pin(fut))
+        }
+        FolderJob::Edit { write, edit } => {
+            let call = async move { client.edit_chat_folder(edit).await };
+            let fut = admitted.run(call, move |res| Outcome::FolderWrite {
+                write,
+                moved: None,
+                res,
+            });
+            (TaskKind::FolderWrite(write), Box::pin(fut))
+        }
     }
 }
 
@@ -371,6 +440,22 @@ fn topics_by_id<C: Client>(
     let topics = async move { client.topics_by_id(call.chat, &ids).await };
     let fut = admitted.run(topics, move |res| Outcome::TopicsById { call, res });
     (TaskKind::TopicsById(call), Box::pin(fut))
+}
+
+fn dialogs<C: Client>(
+    client: Arc<C>,
+    admitted: Admitted,
+    cursor: Option<DialogsCursor>,
+    seq: DialogsSeq,
+) -> (TaskKind, DoneFuture) {
+    let step = if cursor.is_none() {
+        DialogsStep::First
+    } else {
+        DialogsStep::Next
+    };
+    let call = async move { client.dialogs(cursor, DIALOGS_PAGE).await };
+    let fut = admitted.run(call, move |res| Outcome::Dialogs { step, seq, res });
+    (TaskKind::Dialogs, Box::pin(fut))
 }
 
 /// Reads a page from the cache. `anchor` is the window edge for older/newer reads.

@@ -220,3 +220,39 @@ async fn a_page_older_than_an_evicted_move_is_dropped() {
     );
     h.stop().await;
 }
+
+/// Folders plan part C: a local archive goes through the same path as
+/// `updateFolderPeers`, so a page dispatched before it cannot undo it.
+#[tokio::test(start_paused = true)]
+async fn a_local_archive_is_guarded_against_an_older_page() {
+    let (_dir, mut h, cache) = cached_list().await;
+    let target = chat(2);
+    h.fake
+        .inject(Op::Dialogs, Fault::Delay(Duration::from_secs(2)));
+    h.send(Command::LoadDialogs).await;
+    dialogs_calls(&h, 2).await;
+    h.send(Command::SetPeerFolder {
+        chat: target,
+        folder: PeerFolder::Archive,
+    })
+    .await;
+    h.until(
+        |e| matches!(e, Event::ChatBumped(s) if s.id == target && s.folder == PeerFolder::Archive),
+    )
+    .await;
+    assert_eq!(
+        next_page(&mut h, target).await,
+        Some(PeerFolder::Archive),
+        "the older page keeps the move"
+    );
+    assert_eq!(
+        next_page(&mut h, target).await,
+        Some(PeerFolder::Archive),
+        "the refetched first page agrees"
+    );
+    assert_eq!(
+        cached_folder(&cache, target).await,
+        Some(PeerFolder::Archive)
+    );
+    h.stop().await;
+}

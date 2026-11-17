@@ -27,8 +27,8 @@ use super::{
 use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
 use crate::credentials::{CredentialSlot, EnvResolution};
 use crate::model::{
-    Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerFolder, PeerKind, ThreadKey, TopicId,
-    TopicOrder, TopicSnapshot,
+    Body, ChatFolder, ChatId, ChatKind, ChatSummary, FolderEdit, FolderRules, Message, MsgId,
+    PeerFolder, PeerKind, ThreadKey, TopicId, TopicOrder, TopicSnapshot,
 };
 use crate::rich_text::RichText;
 use crate::session::AbyssSession;
@@ -50,6 +50,9 @@ const MAX_LOG: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
     Dialogs,
+    ChatFolders,
+    SetPeerFolder,
+    EditChatFolder,
     History,
     Send,
     Read,
@@ -83,6 +86,12 @@ pub enum Fault {
     CompleteThenHang,
     /// Panics inside the call (a bug in the Telegram library).
     Panic,
+    /// Folder edits: the request was sent but sits in transit. The call
+    /// never answers (the caller times out), and the write survives that:
+    /// it lands when the instance's connection closes (its retirement), or
+    /// when the test lands it ([`FakeHandle::land_in_transit`]). Other
+    /// calls treat it as `Hang`.
+    LandsLate,
     /// Succeeds after the given extra delay. `Dialogs`, `Topics`, `TopicsById`
     /// and `PeerDialogs` answer with the server state *at call time*, so changes
     /// made during the delay cross the response as live updates.
@@ -135,6 +144,8 @@ pub enum QuitBehavior {
 #[derive(Clone, Debug)]
 pub struct FakeScript {
     pub dialogs: Vec<ChatSummary>,
+    /// Chat folders, in server order.
+    pub folders: Vec<ChatFolder>,
     /// Per chat, ascending by id. Messages carry the topic the way the
     /// server states it: `None` for General and non-forum chats, `Some(t)`
     /// for every other topic (a topic's creation message included).
@@ -163,6 +174,7 @@ impl Default for FakeScript {
     fn default() -> Self {
         Self {
             dialogs: Vec::new(),
+            folders: Vec::new(),
             history: HashMap::new(),
             topics: HashMap::new(),
             topic_order: HashMap::new(),
@@ -271,7 +283,7 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
                 gigagroup: false,
             }
         } else {
-            ChatKind::Private
+            ChatKind::Private { contact: false }
         },
         pinned: false,
         unread: 0,
@@ -280,7 +292,115 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
+        muted_until: 0,
         folder: PeerFolder::Main,
+    }
+}
+
+/// The folder a write sets, made the way the real backend makes it
+/// (`grammers::map::folders::edited`): from the folders as they are when
+/// the call starts, as a whole folder (`None` deletes) that replaces the
+/// one with its id when the write lands. Between the two, other writes can
+/// land (`Fault::Delay`), as on the server.
+fn fake_edit(
+    folders: &[ChatFolder],
+    edit: &FolderEdit,
+) -> Result<(i32, Option<ChatFolder>), RejectReason> {
+    let kind_rules = [
+        FolderRules::CONTACTS,
+        FolderRules::NON_CONTACTS,
+        FolderRules::GROUPS,
+        FolderRules::BROADCASTS,
+        FolderRules::BOTS,
+    ];
+    let bounded = |f: ChatFolder| {
+        let peers = f.pinned.len() + f.include.len() + f.exclude.len();
+        if peers > FAKE_FOLDER_PEERS {
+            Err(RejectReason::FolderLimit)
+        } else {
+            Ok((f.id, Some(f)))
+        }
+    };
+    if let Some((id, tag)) = edit.target() {
+        match folders.iter().find(|f| f.id == id) {
+            None => return Err(RejectReason::FolderChanged),
+            Some(f) if f.shared => return Err(RejectReason::Other),
+            Some(f) if f.tag() != *tag => return Err(RejectReason::FolderChanged),
+            Some(_) => {}
+        }
+    }
+    let current = |id: i32| {
+        folders
+            .iter()
+            .find(|f| f.id == id)
+            .cloned()
+            .ok_or(RejectReason::FolderChanged)
+    };
+    match edit {
+        FolderEdit::AddChat { folder, chat, .. } => {
+            let mut f = current(*folder)?;
+            f.exclude.retain(|c| c != chat);
+            if !f.pinned.contains(chat) && !f.include.contains(chat) {
+                f.include.push(*chat);
+            }
+            bounded(f)
+        }
+        FolderEdit::RemoveChat { folder, chat, .. } => {
+            let mut f = current(*folder)?;
+            f.pinned.retain(|c| c != chat);
+            f.include.retain(|c| c != chat);
+            if kind_rules.iter().any(|&r| f.rules.has(r)) && !f.exclude.contains(chat) {
+                f.exclude.push(*chat);
+            }
+            bounded(f)
+        }
+        FolderEdit::Create { title, chat } => {
+            if folders.len() >= FAKE_MAX_FOLDERS {
+                return Err(RejectReason::FolderLimit);
+            }
+            let id = (2..=255)
+                .find(|id| !folders.iter().any(|f| f.id == *id))
+                .ok_or(RejectReason::FolderLimit)?;
+            let f = ChatFolder {
+                id,
+                title: title.clone(),
+                rules: FolderRules::default(),
+                pinned: Vec::new(),
+                include: vec![*chat],
+                exclude: Vec::new(),
+                shared: false,
+            };
+            Ok((id, Some(f)))
+        }
+        FolderEdit::Delete { folder, .. } => Ok((*folder, None)),
+    }
+}
+
+/// The real backend's bounds (`grammers::map::folders`), which the fake
+/// cannot import (it builds without grammers).
+const FAKE_MAX_FOLDERS: usize = 64;
+const FAKE_FOLDER_PEERS: usize = 512;
+
+/// Lands every folder write in transit (`Fault::LandsLate`), in order.
+fn land_in_transit(s: &mut State) {
+    for (id, folder) in std::mem::take(&mut s.in_transit) {
+        put_folder(&mut s.folders, id, folder);
+    }
+}
+
+/// Lands a write made by [`fake_edit`]: replaces, adds or removes the
+/// folder with that id.
+fn put_folder(folders: &mut Vec<ChatFolder>, id: i32, folder: Option<ChatFolder>) {
+    let at = folders.iter().position(|f| f.id == id);
+    match (at, folder) {
+        (Some(at), Some(f)) => {
+            if let Some(slot) = folders.get_mut(at) {
+                *slot = f;
+            }
+        }
+        (Some(at), None) => drop(folders.remove(at)),
+        (None, Some(f)) => folders.push(f),
+        (None, None) => {}
     }
 }
 
@@ -319,6 +439,9 @@ enum StreamCmd {
 #[derive(Debug, Default)]
 struct State {
     dialogs: Vec<ChatSummary>,
+    folders: Vec<ChatFolder>,
+    /// Folder writes sent but not landed (`Fault::LandsLate`).
+    in_transit: Vec<(i32, Option<ChatFolder>)>,
     history: HashMap<ChatId, Vec<Message>>,
     faults: HashMap<Op, VecDeque<Fault>>,
     /// Extra waits before the next calls' faults or answers (`lead`).
@@ -348,6 +471,8 @@ struct State {
     seeds: Vec<Seed>,
     /// The most recently retired instance's session, for late-write tests.
     retired_session: Option<Arc<AbyssSession>>,
+    /// The next instance retirement panics (`panic_next_retire`).
+    panic_retire: bool,
     quit: Option<QuitBehavior>,
     runner: Option<mpsc::Sender<RunnerCmd>>,
     /// The account's critical state, from `Backend::use_account`.
@@ -402,6 +527,7 @@ impl FakeBackend {
             state: Mutex::new(State {
                 high_water,
                 dialogs: script.dialogs,
+                folders: script.folders,
                 history: script.history,
                 topics: script.topics,
                 topic_order: script.topic_order,
@@ -519,6 +645,12 @@ impl FakeHandle {
     /// Makes the current runner return (the connection driver died).
     pub fn runner_exit(&self) {
         self.runner_cmd(RunnerCmd::Exit);
+    }
+
+    /// Makes the next instance retirement panic once its runner has ended
+    /// (`InstanceControl::retire`): what it would hand back is lost.
+    pub fn panic_next_retire(&self) {
+        self.shared.with(|s| s.panic_retire = true);
     }
 
     /// Makes the current runner panic (a connection-task panic re-raised).
@@ -658,6 +790,27 @@ impl FakeHandle {
         self.shared.with(|s| f(&mut s.dialogs));
     }
 
+    /// Replaces the server's chat folders (push
+    /// [`Update::ChatFoldersChanged`] to have core fetch them).
+    pub fn set_folders(&self, folders: Vec<ChatFolder>) {
+        self.shared.with(|s| s.folders = folders);
+    }
+
+    /// Lands the folder writes in transit (`Fault::LandsLate`) now.
+    pub fn land_in_transit(&self) {
+        self.shared.with(land_in_transit);
+    }
+
+    /// The server's chat folders.
+    pub fn folders(&self) -> Vec<ChatFolder> {
+        self.shared.with(|s| s.folders.clone())
+    }
+
+    /// The server's dialog list.
+    pub fn dialogs(&self) -> Vec<ChatSummary> {
+        self.shared.with(|s| s.dialogs.clone())
+    }
+
     /// Replaces a chat's server-side history (e.g. simulate deletions).
     pub fn set_history(&self, chat: ChatId, messages: Vec<Message>) {
         self.shared.with(|s| {
@@ -790,7 +943,12 @@ impl InstanceControl for FakeControl {
     }
 
     fn retire(self) -> SessionSnapshot {
+        if self.shared.with(|s| std::mem::take(&mut s.panic_retire)) {
+            injected_panic("retirement");
+        }
         self.retired.store(true, Ordering::SeqCst);
+        // What the closing connection had sent reaches the server now.
+        self.shared.with(land_in_transit);
         self.shared.retired.fetch_add(1, Ordering::SeqCst);
         // Revoke first: a late write through this instance must not reach the
         // snapshot the next instance is built from.
@@ -872,7 +1030,9 @@ impl FakeClient {
             Some(Fault::Delay(d) | Fault::Queued(d)) => tokio::time::sleep(d).await,
             Some(Fault::Error(e)) => return Err(e),
             Some(Fault::Auth(_)) => return Err(BackendError::Rejected(RejectReason::Other)),
-            Some(Fault::Hang | Fault::CompleteThenHang) => std::future::pending().await,
+            Some(Fault::Hang | Fault::CompleteThenHang | Fault::LandsLate) => {
+                std::future::pending::<()>().await;
+            }
             Some(Fault::Panic) => injected_panic("call"),
         }
         if self.shared.with(|s| s.auth.authorized) {
@@ -914,7 +1074,9 @@ impl FakeClient {
                     .after_latency(BackendError::Rejected(RejectReason::Other))
                     .await);
             }
-            Some(Fault::Hang | Fault::CompleteThenHang) => std::future::pending().await,
+            Some(Fault::Hang | Fault::CompleteThenHang | Fault::LandsLate) => {
+                std::future::pending().await
+            }
             Some(Fault::Panic) => injected_panic("call"),
         };
         let result = self.shared.with(|s| {
@@ -1034,6 +1196,69 @@ impl Client for FakeClient {
             Ok(DialogsPage { chats, next })
         })
         .await
+    }
+
+    async fn chat_folders(&self) -> Result<Vec<ChatFolder>, BackendError> {
+        let _g = self.enter(Op::ChatFolders).await?;
+        Ok(self.shared.with(|s| s.folders.clone()))
+    }
+
+    async fn set_peer_folder(&self, chat: ChatId, folder: PeerFolder) -> Result<(), BackendError> {
+        let _g = self.enter(Op::SetPeerFolder).await?;
+        self.shared.with(|s| {
+            if let Some(c) = s.dialogs.iter_mut().find(|c| c.id == chat) {
+                c.folder = folder;
+            }
+        });
+        Ok(())
+    }
+
+    /// Fetch, then write: the edit is made from the folders at call time
+    /// and lands after any `Delay`, so writes can interleave. Faults: an
+    /// `Error` or `Hang` lands nothing; `CompleteThenHang` lands the write
+    /// and never answers (an uncertain outcome).
+    async fn edit_chat_folder(&self, edit: FolderEdit) -> Result<(), BackendError> {
+        let fault = self.take_fault(Op::EditChatFolder);
+        let lead = self.shared.with(|s| {
+            s.leads
+                .get_mut(&Op::EditChatFolder)
+                .and_then(VecDeque::pop_front)
+        });
+        if let Some(wait) = lead {
+            tokio::time::sleep(wait).await;
+        }
+        let _guard = InFlight::new(&self.shared);
+        let made = self.shared.with(|s| {
+            if s.auth.authorized {
+                fake_edit(&s.folders, &edit).map_err(BackendError::Rejected)
+            } else {
+                Err(BackendError::Unauthorized)
+            }
+        });
+        match fault {
+            None => {}
+            Some(Fault::Delay(d) | Fault::Queued(d)) => tokio::time::sleep(d).await,
+            Some(Fault::Error(e)) => return Err(e),
+            Some(Fault::Auth(_)) => return Err(BackendError::Rejected(RejectReason::Other)),
+            Some(Fault::Hang) => std::future::pending().await,
+            Some(Fault::LandsLate) => {
+                if let Ok(write) = &made {
+                    self.shared.with(|s| s.in_transit.push(write.clone()));
+                }
+                std::future::pending::<()>().await;
+            }
+            Some(Fault::CompleteThenHang) => {
+                if let Ok((id, folder)) = &made {
+                    self.shared
+                        .with(|s| put_folder(&mut s.folders, *id, folder.clone()));
+                }
+                std::future::pending::<()>().await;
+            }
+            Some(Fault::Panic) => injected_panic("call"),
+        }
+        let (id, folder) = made?;
+        self.shared.with(|s| put_folder(&mut s.folders, id, folder));
+        Ok(())
     }
 
     async fn history(

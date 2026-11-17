@@ -28,8 +28,8 @@ pub use seed::{MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 use crate::api::{CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
 pub use crate::credentials::CredentialSlot;
 use crate::model::{
-    ChatId, ChatSummary, Message, MsgId, PeerFolder, ThreadKey, Topic, TopicId, TopicOrder,
-    TopicSnapshot, Visibility,
+    ChatFolder, ChatId, ChatSummary, FolderEdit, Message, MsgId, PeerFolder, ThreadKey, Topic,
+    TopicId, TopicOrder, TopicSnapshot, Visibility,
 };
 use crate::store::PostClosed;
 
@@ -173,6 +173,9 @@ pub enum Update {
     /// `updateFolderPeers`: chats moved into or out of the archive, here or
     /// on another device.
     Folders(Vec<(ChatId, PeerFolder)>),
+    /// `updateDialogFilter(s)`, `updateDialogFilterOrder`: the chat folders
+    /// changed; fetch them again.
+    ChatFoldersChanged,
     /// `updateMessageID`: the server assigned `id` to the send carrying
     /// `random_id` (plan section 9). Correlated with the pending-send table.
     MessageId {
@@ -193,6 +196,13 @@ pub enum RejectReason {
     /// `CHANNEL_FORUM_MISSING`: a topics call for a chat that is not a forum
     /// (a forum-flag trigger, plan section 6.6).
     NotForum,
+    /// A folder edit's folder is gone, or its [`crate::model::FolderTag`]
+    /// differs (its title, rules or shared flag changed, or it was replaced
+    /// by a folder that differs in them): refused without a write.
+    FolderChanged,
+    /// A folder edit would pass the folder bounds (folders or peers per
+    /// folder): refused without a write.
+    FolderLimit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,6 +402,30 @@ pub trait Client: Send + Sync + 'static {
         cursor: Option<DialogsCursor>,
         limit: u32,
     ) -> impl Future<Output = Result<DialogsPage, BackendError>> + Send;
+
+    /// The account's chat folders (`messages.getDialogFilters`), in server
+    /// order, without the "All chats" position.
+    fn chat_folders(&self) -> impl Future<Output = Result<Vec<ChatFolder>, BackendError>> + Send;
+
+    /// Moves `chat` into or out of the archive (`folders.editPeerFolders`).
+    /// Idempotent: setting the folder a chat is in changes nothing.
+    fn set_peer_folder(
+        &self,
+        chat: ChatId,
+        folder: PeerFolder,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send;
+
+    /// Changes a chat folder (`messages.updateDialogFilter`). Each edit
+    /// fetches the folders itself (`messages.getDialogFilters`) right before
+    /// its write and builds the write from that response alone, so what
+    /// abyss does not model is sent back unchanged. Refused before writing:
+    /// `Rejected(FolderChanged)` for a folder that is gone or whose
+    /// [`crate::model::FolderTag`] differs, `Rejected(FolderLimit)` past the
+    /// bounds, `Rejected(Other)` for a shared folder.
+    fn edit_chat_folder(
+        &self,
+        edit: FolderEdit,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send;
 
     fn history(
         &self,

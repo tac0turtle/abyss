@@ -247,7 +247,7 @@ fn user_entry(u: &tl::types::User) -> Option<(ChatId, PeerEntry)> {
         kind: if u.bot {
             ChatKind::Bot
         } else {
-            ChatKind::Private
+            ChatKind::Private { contact: u.contact }
         },
         broadcast: false,
         can_send: !u.deleted,

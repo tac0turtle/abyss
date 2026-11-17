@@ -29,6 +29,7 @@ Notes:
 - **Stage 2:** the model already carries `ThreadKey { chat, topic }`, with `topic` always `None` for now. Forum chats show "Topics arrive in a later version."
 - **Stage 3:** until signing lands, every rebuild of the ad-hoc-signed dev binary triggers Keychain ACL prompts (stage-1.md section 14, risk 3).
 - **Archive and chat folders:** proposed in [plans/folders.md](plans/folders.md) as three PRs: the archive as its own view (A), chat folders read-only (B), then archiving and folder editing (C).
+- **Risk (folders, part C):** folder edits are recovered best-effort after an unknown outcome. An uncertain write that the server applies after the next edit's fetch can lose one of the two changes, because `messages.updateDialogFilter` replaces the whole folder with no version check (folders.md, part C, "Risks"). After an uncertain write, the next folder edit waits for the instance's retirement to complete, like every other client operation under the single rebuild mechanism; a retirement that hangs holds it too.
 - **Stage 4:** images decode through one hardened path: a pure-Rust decoder (not ImageIO), strict size and pixel caps, downscaling and the encrypted cache, optionally in a sandboxed process. See stage-1.md section 0.
 
 ## Task 12: live verification (Stage 1)

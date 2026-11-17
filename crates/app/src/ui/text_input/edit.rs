@@ -58,6 +58,13 @@ impl Limits {
         max_utf16: 10,
     };
 
+    /// A chat folder title: Telegram takes at most 12 characters.
+    pub(crate) const FOLDER_TITLE: Limits = Limits {
+        filter: CharFilter::Any,
+        lines: Lines::Single,
+        max_utf16: 24,
+    };
+
     pub(crate) const COMPOSER: Limits = Limits {
         filter: CharFilter::Any,
         lines: Lines::Multi,

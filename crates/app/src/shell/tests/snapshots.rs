@@ -137,6 +137,7 @@ impl Shot {
         }))?;
         let script = demo::script(format::now());
         self.core_says(Event::DialogsReset(script.dialogs))?;
+        self.core_says(Event::ChatFolders(script.folders))?;
         Ok(())
     }
 
@@ -238,6 +239,31 @@ fn archive(dir: &Path) -> Result<()> {
     shot.save(Mode::Night, "archive-night.png")
 }
 
+/// A chat folder's tab selected: its pinned chat first, then its own.
+fn folder(dir: &Path) -> Result<()> {
+    let mut shot = Shot::open(dir)?;
+    shot.sign_in()?;
+    shot.root.update(&mut shot.cx, |root, window, cx| {
+        root.with_session(|s, cx| s.show_chats(Shown::Folder(4), window, cx), cx);
+    })?;
+    shot.cx.run_until_parked();
+    shot.save(Mode::Day, "folder-day.png")?;
+    // Right-click on the Work folder's pinned forum: in Work only.
+    let forum = ChatId {
+        kind: abyss_core::model::PeerKind::Channel,
+        id: 2,
+    };
+    shot.root.update(&mut shot.cx, |root, window, cx| {
+        root.with_session(
+            |s, cx| s.open_chat_menu(forum, point(px(160.), px(115.)), window, cx),
+            cx,
+        );
+    })?;
+    shot.cx.run_until_parked();
+    shot.save(Mode::Day, "menu-day.png")?;
+    shot.save(Mode::Night, "menu-night.png")
+}
+
 #[test]
 fn snapshots() -> Result<()> {
     let Some(dir) = std::env::var_os(DIR_VAR).map(PathBuf::from) else {
@@ -248,5 +274,6 @@ fn snapshots() -> Result<()> {
     signin(&dir)?;
     chat(&dir)?;
     archive(&dir)?;
+    folder(&dir)?;
     list_deep(&dir)
 }

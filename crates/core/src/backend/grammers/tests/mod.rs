@@ -286,7 +286,12 @@ pub(super) fn reply_header(msg: Option<i32>, top: Option<i32>) -> tl::types::Mes
 }
 
 pub(super) fn notify_settings() -> tl::enums::PeerNotifySettings {
-    tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
+    tl::enums::PeerNotifySettings::Settings(notify_settings_raw())
+}
+
+/// Default notification settings: never muted.
+pub(super) fn notify_settings_raw() -> tl::types::PeerNotifySettings {
+    tl::types::PeerNotifySettings {
         show_previews: None,
         silent: None,
         mute_until: None,
@@ -298,7 +303,7 @@ pub(super) fn notify_settings() -> tl::enums::PeerNotifySettings {
         stories_ios_sound: None,
         stories_android_sound: None,
         stories_other_sound: None,
-    })
+    }
 }
 
 /// The archive folder's entry in the main list, led by `peer`'s top message.

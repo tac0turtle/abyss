@@ -288,7 +288,7 @@ pub(crate) fn peer_dialogs_parts(
 }
 
 /// The summaries of the `requested` chats, mapped like a dialogs page (kind
-/// from `chats`, unread, top message; broadcasts excluded). Dialogs for
+/// from `chats`, unread, top message, mute; broadcasts excluded). Dialogs for
 /// chats nobody asked about are dropped: they are not this call's answer.
 pub(crate) fn peer_dialogs(
     parts: &DialogsParts<'_>,

@@ -98,7 +98,7 @@ fn summary(c: ChatId, title: &str) -> ChatSummary {
     ChatSummary {
         id: c,
         title: title.into(),
-        kind: ChatKind::Private,
+        kind: ChatKind::Private { contact: false },
         pinned: false,
         unread: 0,
         unread_mentions: 0,
@@ -106,6 +106,7 @@ fn summary(c: ChatId, title: &str) -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
+        muted_until: 0,
         folder: PeerFolder::Main,
     }
 }
@@ -353,12 +354,12 @@ fn version_1_messages_are_dropped_on_upgrade() {
         .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 /// Version 2 → 3 drops the chat list; the upgrade then continues to
 /// version 4, which drops messages (see `version_3_messages_and_chats_are_dropped`),
-/// and version 5.
+/// then versions 5 and 6.
 #[test]
 fn version_2_chat_list_is_dropped_on_upgrade() {
     let (_t, dir, key) = setup();
@@ -393,7 +394,28 @@ fn version_4_chat_list_is_dropped_on_upgrade() {
         .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
+}
+
+#[test]
+fn version_5_chat_list_is_dropped_on_upgrade() {
+    let (_t, dir, key) = setup();
+    let c = user(1);
+    {
+        let mut db = Cache::open(&dir, &key).unwrap();
+        db.put_chats(&[summary(c, "c")]).unwrap();
+        db.put_messages(ThreadKey::whole(c), &[msg(c, 1, "kept")])
+            .unwrap();
+        db.conn().execute_batch("PRAGMA user_version = 5").unwrap();
+    }
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert!(db.chats().unwrap().is_empty());
+    assert_eq!(ids(&db.tail(ThreadKey::whole(c), 10).unwrap()), [1]);
+    let version: i64 = db
+        .conn()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 6);
 }
 
 #[test]
@@ -402,6 +424,8 @@ fn peer_folder_round_trips() {
     let c = user(1);
     let archived = ChatSummary {
         folder: PeerFolder::Archive,
+        muted_until: i64::from(i32::MAX),
+        kind: ChatKind::Private { contact: true },
         ..summary(c, "c")
     };
     let mut db = Cache::open(&dir, &key).unwrap();

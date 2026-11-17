@@ -8,9 +8,9 @@ use std::time::Instant;
 use abyss_core::model::{Body, ChatKind, ChatSummary, Message, MsgId};
 use abyss_core::rich_text::RichText;
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, FontWeight, Hsla, Rgba,
-    SharedString, Stateful, StyledText, WeakEntity, Window, canvas, div, font, list, prelude::*,
-    px, transparent_black, uniform_list,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, FontWeight, Hsla,
+    MouseButton, MouseDownEvent, Rgba, SharedString, Stateful, StyledText, WeakEntity, Window,
+    canvas, div, font, list, prelude::*, px, transparent_black, uniform_list,
 };
 use jiff::tz::TimeZone;
 
@@ -79,13 +79,15 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
         let empty = match shown {
             Shown::Main => copy::NO_CHATS,
             Shown::Archive => copy::NO_ARCHIVED,
+            Shown::Folder(_) => copy::NO_FOLDER_CHATS,
         };
         centered().child(muted(empty)).into_any_element()
     } else {
         // Each view keeps its own scroll position.
-        let id = match shown {
-            Shown::Main => "chats-main",
-            Shown::Archive => "chats-archive",
+        let id: ElementId = match shown {
+            Shown::Main => "chats-main".into(),
+            Shown::Archive => "chats-archive".into(),
+            Shown::Folder(f) => ("chats-folder", u64::from(f.cast_unsigned())).into(),
         };
         uniform_list(id, rows.len(), cx.processor(chat_rows))
             .flex_1()
@@ -128,6 +130,7 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
                         .child(appearance_button(cx)),
                 ),
         )
+        .children(folder_tabs(session, theme, cx))
         .child(body)
         // Last, so it paints over the rows and takes their clicks.
         .children(retry)
@@ -137,7 +140,7 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
 /// leads back.
 fn sidebar_title(shown: Shown, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     match shown {
-        Shown::Main => div()
+        Shown::Main | Shown::Folder(_) => div()
             .flex()
             .items_center()
             .gap_2()
@@ -150,6 +153,79 @@ fn sidebar_title(shown: Shown, theme: &Theme, cx: &mut Context<'_, Root>) -> Any
             )
             .into_any_element(),
         Shown::Archive => back_button(cx).into_any_element(),
+    }
+}
+
+/// The chat folder tabs ("All", then each folder in server order), when the
+/// account has folders and the archive is not shown.
+fn folder_tabs(
+    session: &Session,
+    theme: &Theme,
+    cx: &mut Context<'_, Root>,
+) -> Option<Stateful<Div>> {
+    let list = &session.shell.list;
+    let shown = list.shown();
+    if list.folders().is_empty() || shown == Shown::Archive {
+        return None;
+    }
+    let all = std::iter::once((Shown::Main, SharedString::from(copy::ALL_CHATS)));
+    let folders = list
+        .folders()
+        .iter()
+        .map(|f| (Shown::Folder(f.id), SharedString::from(f.title.clone())));
+    let tabs = all.chain(folders).enumerate().map(|(ix, (target, title))| {
+        let selected = target == shown;
+        let mark: Hsla = if selected {
+            theme.text.into()
+        } else {
+            transparent_black()
+        };
+        div()
+            .id(("folder-tab", ix))
+            .flex_none()
+            .px_2()
+            .pb_1()
+            .border_b_2()
+            .border_color(mark)
+            .text_sm()
+            .cursor_pointer()
+            .child(title)
+            .when(!selected, |d| d.text_color(theme::quiet(theme.text)))
+            .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
+                root.with_session(|s, cx| s.show_chats(target, window, cx), cx);
+            }))
+            .when_some(folder_id(target), |d, folder| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |root, ev: &MouseDownEvent, window, cx| {
+                        root.with_session(
+                            |s, cx| s.open_folder_menu(folder, ev.position, window, cx),
+                            cx,
+                        );
+                    }),
+                )
+            })
+    });
+    Some(
+        div()
+            .id("folder-tabs")
+            .flex()
+            .flex_none()
+            .gap_1()
+            .px_1()
+            .pt_1()
+            .overflow_x_scroll()
+            .bg(theme.surface(Depth::NOW))
+            .text_color(theme.text)
+            .children(tabs),
+    )
+}
+
+/// The chat folder a tab shows, if it is one.
+fn folder_id(shown: Shown) -> Option<i32> {
+    match shown {
+        Shown::Folder(id) => Some(id),
+        Shown::Main | Shown::Archive => None,
     }
 }
 
@@ -318,6 +394,12 @@ impl ChatRow<'_> {
             .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
                 root.with_session(|s, cx| s.select_chat(id, window, cx), cx);
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |root, ev: &MouseDownEvent, window, cx| {
+                    root.with_session(|s, cx| s.open_chat_menu(id, ev.position, window, cx), cx);
+                }),
+            )
             .child(avatar(chat, ink))
             .child(
                 div()
@@ -536,7 +618,7 @@ fn message_row(
         tz: format::local_tz(),
         groupish: shell
             .selected_chat()
-            .is_some_and(|c| !matches!(c.kind, ChatKind::Private | ChatKind::Bot)),
+            .is_some_and(|c| !matches!(c.kind, ChatKind::Private { .. } | ChatKind::Bot)),
     };
     let prev_date = ix
         .checked_sub(1)

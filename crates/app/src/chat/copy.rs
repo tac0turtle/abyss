@@ -14,6 +14,24 @@ pub(crate) const WORDMARK: &str = "abyss";
 pub(crate) const SELECT_CHAT: &str = "Select a chat";
 pub(crate) const NO_CHATS: &str = "No chats yet";
 pub(crate) const NO_ARCHIVED: &str = "No archived chats";
+pub(crate) const NO_FOLDER_CHATS: &str = "No chats in this folder";
+pub(crate) const ARCHIVE_CHAT: &str = "Archive";
+pub(crate) const UNARCHIVE_CHAT: &str = "Unarchive";
+pub(crate) const NEW_FOLDER: &str = "New folder with this chat…";
+pub(crate) const FOLDER_NAME_PLACEHOLDER: &str = "Folder name, then Enter";
+pub(crate) const FOLDER_TITLE_INVALID: &str = "A folder name has 1 to 12 characters.";
+pub(crate) const SHARED_FOLDER: &str = "Shared folders can't be changed in abyss yet.";
+
+pub(crate) fn delete_folder(title: &str) -> SharedString {
+    format!("Delete folder “{title}”").into()
+}
+
+pub(crate) fn confirm_delete_folder(title: &str) -> SharedString {
+    format!("Click again to delete “{title}”").into()
+}
+
+/// The first folder tab: the main list, archive entry included.
+pub(crate) const ALL_CHATS: &str = "All";
 pub(crate) const ARCHIVE: &str = "Archive";
 /// The archive view's title, which leads back to the main list.
 pub(crate) const ARCHIVE_BACK: &str = "‹ Archive";
@@ -79,7 +97,7 @@ pub(crate) fn conn_label(conn: Option<ConnState>) -> SharedString {
 /// The kind tag next to a chat title; private chats have none.
 pub(crate) fn kind_label(kind: ChatKind) -> Option<&'static str> {
     match kind {
-        ChatKind::Private => None,
+        ChatKind::Private { .. } => None,
         ChatKind::Bot => Some("bot"),
         ChatKind::Group
         | ChatKind::Supergroup {
