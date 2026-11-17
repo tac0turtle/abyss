@@ -27,8 +27,8 @@ use super::{
 use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
 use crate::credentials::{CredentialSlot, EnvResolution};
 use crate::model::{
-    Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey, TopicId, TopicOrder,
-    TopicSnapshot,
+    Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerFolder, PeerKind, ThreadKey, TopicId,
+    TopicOrder, TopicSnapshot,
 };
 use crate::rich_text::RichText;
 use crate::session::AbyssSession;
@@ -83,8 +83,8 @@ pub enum Fault {
     CompleteThenHang,
     /// Panics inside the call (a bug in the Telegram library).
     Panic,
-    /// Succeeds after the given extra delay. `Topics`, `TopicsById` and
-    /// `PeerDialogs` answer with the server state *at call time*, so changes
+    /// Succeeds after the given extra delay. `Dialogs`, `Topics`, `TopicsById`
+    /// and `PeerDialogs` answer with the server state *at call time*, so changes
     /// made during the delay cross the response as live updates.
     Delay(Duration),
     /// Login calls (`sign_in`, `check_password`): the request sits in the
@@ -280,6 +280,7 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
+        folder: PeerFolder::Main,
     }
 }
 
@@ -1011,10 +1012,11 @@ impl Client for FakeClient {
         cursor: Option<DialogsCursor>,
         limit: u32,
     ) -> Result<DialogsPage, BackendError> {
-        let _g = self.enter(Op::Dialogs).await?;
+        // Answered with the server state at call time, so a change made
+        // during a `Delay` crosses the response as a live update.
         let start = cursor.map_or(0, |c| to_usize(c.index));
         let limit = to_usize(limit);
-        Ok(self.shared.with(|s| {
+        self.snapshot(Op::Dialogs, |s| {
             let chats: Vec<ChatSummary> = s
                 .dialogs
                 .iter()
@@ -1029,8 +1031,9 @@ impl Client for FakeClient {
                 offset_peer: None,
                 index: u32::try_from(end).unwrap_or(u32::MAX),
             });
-            DialogsPage { chats, next }
-        }))
+            Ok(DialogsPage { chats, next })
+        })
+        .await
     }
 
     async fn history(

@@ -28,6 +28,7 @@ Notes:
 - **Stage 1** is specified in [plans/stage-1.md](plans/stage-1.md). Its review log (section 15) runs through round 37.
 - **Stage 2:** the model already carries `ThreadKey { chat, topic }`, with `topic` always `None` for now. Forum chats show "Topics arrive in a later version."
 - **Stage 3:** until signing lands, every rebuild of the ad-hoc-signed dev binary triggers Keychain ACL prompts (stage-1.md section 14, risk 3).
+- **Archive and chat folders:** proposed in [plans/folders.md](plans/folders.md) as three PRs: the archive as its own view (A), chat folders read-only (B), then archiving and folder editing (C).
 - **Stage 4:** images decode through one hardened path: a pure-Rust decoder (not ImageIO), strict size and pixel caps, downscaling and the encrypted cache, optionally in a sandboxed process. See stage-1.md section 0.
 
 ## Task 12: live verification (Stage 1)
@@ -50,7 +51,7 @@ This is blocked on a real `api_id`/`api_hash`. Everything else in Stage 1 has ru
 - [ ] The baseline arrives within 10 s, both on a fresh session and on a stored one.
 - [ ] `quit` stops the runner promptly.
 - [ ] Watch for grammers-internal panics on unusual peers in the update path.
-- [ ] Check what `iter_dialogs` returns for the archive folder (section 14, risk 8).
+- [ ] Check what `iter_dialogs` returns for the archive folder (section 14, risk 8). Part A of [plans/folders.md](plans/folders.md) relies on archived dialogs arriving with `folder_id = 1`. Also check where pinned archived chats appear in that combined traversal. If pins are per folder, `merge_first_page` must become folder-aware.
 
 **Text input** (section 13, task 8):
 - [ ] Pinyin and Japanese IME in the composer:

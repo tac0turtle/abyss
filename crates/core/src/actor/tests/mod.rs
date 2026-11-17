@@ -8,6 +8,7 @@
 )]
 
 mod auth;
+mod folders;
 mod lifecycle;
 mod logout;
 mod onboarding;

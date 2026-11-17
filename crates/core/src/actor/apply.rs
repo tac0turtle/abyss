@@ -3,7 +3,7 @@
 use super::Actor;
 use super::boot::{BootKind, Origin, Snapshot, TailVia};
 use super::jobs::{
-    CallError, CallResult, DialogsStep, Done, Load, Outcome, PAGE, ReqId, StreamEnd,
+    CallError, CallResult, DialogsStep, Done, Job, Load, Outcome, PAGE, ReqId, StreamEnd,
 };
 use super::lifecycle::Reason;
 use super::loads::Owed;
@@ -12,8 +12,10 @@ use crate::backend::{
     Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, StreamError, Update,
 };
 use crate::cache::CacheCmd;
-use crate::model::{ChatSummary, Message, MsgId, ThreadKey};
-use crate::store::{Bump, Change, ContinuityMark, Last, Rest, Route, Unread, ViewGen, Window};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerFolder, ThreadKey};
+use crate::store::{
+    Bump, Change, ContinuityMark, DialogsSeq, Guarded, Last, Rest, Route, Unread, ViewGen, Window,
+};
 
 pub(super) fn user_error(e: CallError) -> UserError {
     match e {
@@ -148,8 +150,8 @@ impl<B: Backend> Actor<B> {
             Outcome::Send { local_id, res } => self.on_send(local_id, res).await,
             Outcome::SendExpired { local_id } => self.send_window_closed(local_id).await,
             _ if !current => {}
-            Outcome::Dialogs { step, res } => {
-                self.on_dialogs(step, res).await;
+            Outcome::Dialogs { step, seq, res } => {
+                self.on_dialogs(step, seq, res).await;
                 if step == DialogsStep::First {
                     self.snapshot_done(Snapshot::Dialogs).await;
                 }
@@ -279,55 +281,79 @@ impl<B: Backend> Actor<B> {
         }
     }
 
-    async fn on_dialogs(&mut self, step: DialogsStep, res: CallResult<DialogsPage>) {
+    async fn on_dialogs(
+        &mut self,
+        step: DialogsStep,
+        seq: DialogsSeq,
+        res: CallResult<DialogsPage>,
+    ) {
         self.dialogs_busy = false;
+        let mut refetch = false;
         match res {
-            Ok(DialogsPage { chats, next }) => {
-                let rest = if next.is_some() {
-                    Rest::More
+            Ok(DialogsPage { mut chats, next }) => {
+                // A folder move made after this request was dispatched is
+                // newer than the page: it is kept, and a first page is
+                // fetched again to settle it. A page that may predate a move
+                // whose record was evicted is dropped instead, and refetched.
+                let guarded = self.dialogs.guard_folders(&mut chats, seq);
+                refetch = guarded != Guarded::Apply;
+                if guarded == Guarded::Discard {
+                    tracing::debug!("a dialogs page older than an evicted folder move dropped");
+                    // Nothing changes; the UI's request is answered, and
+                    // the refetch (below) follows.
+                    let has_more = !self.dialogs_loaded || self.dialogs_next.is_some();
+                    self.emit(Event::DialogsPaging { has_more }).await;
                 } else {
-                    Rest::Last
-                };
-                let event = match step {
-                    DialogsStep::First => {
-                        if let Some(boot) = self.boot.as_mut() {
-                            boot.note_dialogs(&chats);
-                        }
-                        // Chats kept from later pages stay provisionally, but
-                        // pagination restarts from the fresh cursor: a chat
-                        // that appeared below the first page meanwhile is only
-                        // found by walking forward again (later pages confirm
-                        // the kept rows, and admit new ones in server order).
-                        self.dialogs.merge_first_page(chats, rest);
-                        self.dialogs_next = next;
-                        Event::DialogsReset(self.dialogs.as_slice().to_vec())
-                    }
-                    DialogsStep::Next => {
-                        self.dialogs_next = next;
-                        let page = self.dialogs.append(chats, rest);
-                        if page.reordered {
+                    let rest = if next.is_some() {
+                        Rest::More
+                    } else {
+                        Rest::Last
+                    };
+                    let event = match step {
+                        DialogsStep::First => {
+                            if let Some(boot) = self.boot.as_mut() {
+                                boot.note_dialogs(&chats);
+                            }
+                            // Chats kept from later pages stay provisionally, but
+                            // pagination restarts from the fresh cursor: a chat
+                            // that appeared below the first page meanwhile is only
+                            // found by walking forward again (later pages confirm
+                            // the kept rows, and admit new ones in server order).
+                            self.dialogs.merge_first_page(chats, rest);
+                            self.dialogs_next = next;
                             Event::DialogsReset(self.dialogs.as_slice().to_vec())
-                        } else {
-                            Event::DialogsAppended(page.changed)
                         }
+                        DialogsStep::Next => {
+                            self.dialogs_next = next;
+                            let page = self.dialogs.append(chats, rest);
+                            if page.reordered {
+                                Event::DialogsReset(self.dialogs.as_slice().to_vec())
+                            } else {
+                                Event::DialogsAppended(page.changed)
+                            }
+                        }
+                    };
+                    // `PutChats` replaces the cached list, so it always gets the whole list.
+                    if self.cache.is_some() {
+                        let all = self.dialogs.as_slice().to_vec();
+                        self.cache_write(CacheCmd::PutChats(all)).await;
                     }
-                };
-                // `PutChats` replaces the cached list, so it always gets the whole list.
-                if self.cache.is_some() {
-                    let all = self.dialogs.as_slice().to_vec();
-                    self.cache_write(CacheCmd::PutChats(all)).await;
+                    self.dialogs_loaded = true;
+                    self.note_kinds();
+                    self.emit(event).await;
+                    let has_more = self.dialogs_next.is_some();
+                    self.emit(Event::DialogsPaging { has_more }).await;
                 }
-                self.dialogs_loaded = true;
-                self.note_kinds();
-                self.emit(event).await;
-                let has_more = self.dialogs_next.is_some();
-                self.emit(Event::DialogsPaging { has_more }).await;
             }
             Err(e) => {
                 self.error(user_error(e)).await;
                 self.load_ended(LoadTarget::Dialogs, Some(user_error(e)))
                     .await;
             }
+        }
+        let seq = DialogsSeq::default();
+        if refetch && self.enqueue(Job::Dialogs { cursor: None, seq }).await {
+            self.dialogs_busy = true;
         }
         if std::mem::take(&mut self.dialogs_queued) {
             self.load_dialogs().await;
@@ -737,6 +763,29 @@ impl<B: Backend> Actor<B> {
             | Update::TopicEdited { .. }
             | Update::TopicsPinned { .. }
             | Update::ChatChanged { .. } => {}
+            Update::Folders(moves) => self.on_folders(moves).await,
+        }
+    }
+
+    /// Chats moved into or out of the archive: each listed one changes in
+    /// place (`ChatBumped` without a newer message never moves a row), and
+    /// the cached list follows, so a restart shows the same split.
+    async fn on_folders(&mut self, moves: Vec<(ChatId, PeerFolder)>) {
+        let mut changed = Vec::new();
+        for (chat, folder) in moves {
+            if let Some(summary) = self.dialogs.set_folder(chat, folder) {
+                changed.push(summary.clone());
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        for summary in changed {
+            self.emit(Event::ChatBumped(summary)).await;
+        }
+        if self.cache.is_some() {
+            let all = self.dialogs.as_slice().to_vec();
+            self.cache_write(CacheCmd::PutChats(all)).await;
         }
     }
 

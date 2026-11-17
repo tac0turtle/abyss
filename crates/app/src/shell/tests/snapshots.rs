@@ -27,6 +27,7 @@ use gpui::{
 };
 
 use super::{Harness, link};
+use crate::chat::list::Shown;
 use crate::chat::{demo, format};
 use crate::shell::Root;
 use crate::shell::session::Started;
@@ -225,6 +226,18 @@ fn list_deep(dir: &Path) -> Result<()> {
     shot.save(Mode::Night, "list-flip-night.png")
 }
 
+/// The archive opened from the main list's entry.
+fn archive(dir: &Path) -> Result<()> {
+    let mut shot = Shot::open(dir)?;
+    shot.sign_in()?;
+    shot.root.update(&mut shot.cx, |root, window, cx| {
+        root.with_session(|s, cx| s.show_chats(Shown::Archive, window, cx), cx);
+    })?;
+    shot.cx.run_until_parked();
+    shot.save(Mode::Day, "archive-day.png")?;
+    shot.save(Mode::Night, "archive-night.png")
+}
+
 #[test]
 fn snapshots() -> Result<()> {
     let Some(dir) = std::env::var_os(DIR_VAR).map(PathBuf::from) else {
@@ -234,5 +247,6 @@ fn snapshots() -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     signin(&dir)?;
     chat(&dir)?;
+    archive(&dir)?;
     list_deep(&dir)
 }

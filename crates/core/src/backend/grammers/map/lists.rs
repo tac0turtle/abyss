@@ -9,12 +9,29 @@ use super::message::{message, raw_date, raw_key};
 use super::peers::{Directory, MAX_DIRECTORY, channel_chat, chat_id};
 use super::topics::{forum_update, topic_of};
 use crate::backend::{DialogsCursor, HistoryPage, HistoryQuery, Update};
-use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview, ThreadKey};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerFolder, Preview, ThreadKey};
 use crate::store::{ForumStatus, Route, route};
 
 /// Ids accepted from one deletion update. Telegram batches at most 100 per
 /// request; the bound only guards against a malformed update.
 pub(crate) const MAX_DELETED_IDS: usize = 10_000;
+
+/// Telegram's peer folder id of the archive (`dialog.folder_id`,
+/// `folderPeer.folder_id`); `0`, or no id, is the main list.
+pub(crate) const ARCHIVE_FOLDER: i32 = 1;
+/// The peer folder a raw folder id names. Only the archive has an id other
+/// than the main list's; an unknown one is treated as the main list.
+fn peer_folder(id: i32) -> PeerFolder {
+    if id == ARCHIVE_FOLDER {
+        PeerFolder::Archive
+    } else {
+        PeerFolder::Main
+    }
+}
+
+/// Folder moves accepted from one `updateFolderPeers`. The bound only guards
+/// against a malformed update.
+pub(crate) const MAX_FOLDER_MOVES: usize = 1000;
 
 /// Items a response may carry beyond the requested limit (folder entries,
 /// a message sent while the page was being built) before it is rejected.
@@ -206,6 +223,7 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
         // did not map (excluded or invalid).
         last_id: (d.top_message > 0).then_some(MsgId(d.top_message)),
         can_send: entry.can_send,
+        folder: peer_folder(d.folder_id.unwrap_or(0)),
     };
     if summary.is_valid() {
         out.chats.push(summary);
@@ -365,6 +383,19 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
             topic: None,
             still_unread: count(u.still_unread_count),
         }),
+        // Archived or unarchived, here or on another device.
+        U::FolderPeers(u) => {
+            let moves: Vec<(ChatId, PeerFolder)> = u
+                .folder_peers
+                .iter()
+                .take(MAX_FOLDER_MOVES)
+                .filter_map(|tl::enums::FolderPeer::Peer(p)| {
+                    let chat = chat_id(&p.peer)?;
+                    Some((chat, peer_folder(p.folder_id)))
+                })
+                .collect();
+            (!moves.is_empty()).then_some(Update::Folders(moves))
+        }
         // Correlated with the pending-send table by core (plan section 9).
         U::MessageId(u) if u.id > 0 && u.random_id != 0 => Some(Update::MessageId {
             random_id: u.random_id,

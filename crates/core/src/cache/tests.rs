@@ -1,5 +1,7 @@
 use super::*;
-use crate::model::{Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey};
+use crate::model::{
+    Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerFolder, PeerKind, ThreadKey,
+};
 use crate::rich_text::RichText;
 
 const SECRET: &str = "very-secret-plaintext-marker";
@@ -104,6 +106,7 @@ fn summary(c: ChatId, title: &str) -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
+        folder: PeerFolder::Main,
     }
 }
 
@@ -350,11 +353,12 @@ fn version_1_messages_are_dropped_on_upgrade() {
         .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 /// Version 2 → 3 drops the chat list; the upgrade then continues to
-/// version 4, which drops messages (see `version_3_messages_are_dropped_and_chats_kept`).
+/// version 4, which drops messages (see `version_3_messages_and_chats_are_dropped`),
+/// and version 5.
 #[test]
 fn version_2_chat_list_is_dropped_on_upgrade() {
     let (_t, dir, key) = setup();
@@ -369,6 +373,40 @@ fn version_2_chat_list_is_dropped_on_upgrade() {
     let mut db = Cache::open(&dir, &key).unwrap();
     assert!(db.chats().unwrap().is_empty());
     assert!(db.tail(ThreadKey::whole(c), 10).unwrap().is_empty());
+}
+
+#[test]
+fn version_4_chat_list_is_dropped_on_upgrade() {
+    let (_t, dir, key) = setup();
+    let c = user(1);
+    {
+        let mut db = Cache::open(&dir, &key).unwrap();
+        db.put_chats(&[summary(c, "c")]).unwrap();
+        db.put_messages(ThreadKey::whole(c), &[msg(c, 1, "kept")])
+            .unwrap();
+        db.conn().execute_batch("PRAGMA user_version = 4").unwrap();
+    }
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert!(db.chats().unwrap().is_empty());
+    assert_eq!(ids(&db.tail(ThreadKey::whole(c), 10).unwrap()), [1]);
+    let version: i64 = db
+        .conn()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 5);
+}
+
+#[test]
+fn peer_folder_round_trips() {
+    let (_t, dir, key) = setup();
+    let c = user(1);
+    let archived = ChatSummary {
+        folder: PeerFolder::Archive,
+        ..summary(c, "c")
+    };
+    let mut db = Cache::open(&dir, &key).unwrap();
+    db.put_chats(std::slice::from_ref(&archived)).unwrap();
+    assert_eq!(db.chats().unwrap(), [archived]);
 }
 
 #[test]

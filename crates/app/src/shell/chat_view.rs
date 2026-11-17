@@ -17,6 +17,7 @@ use jiff::tz::TimeZone;
 use super::session::Session;
 use super::view::{centered, field, muted};
 use super::{Root, State};
+use crate::chat::list::{ArchiveEntry, Shown, SidebarRow};
 use crate::chat::messages::MessageWindow;
 use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
@@ -71,19 +72,32 @@ pub(super) fn chat_shell(
 }
 
 fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
-    let chats = session.shell.list.as_slice();
-    let body = if chats.is_empty() {
-        centered().child(muted(copy::NO_CHATS)).into_any_element()
+    let list = &session.shell.list;
+    let rows = list.rows();
+    let shown = list.shown();
+    let body = if rows.is_empty() {
+        let empty = match shown {
+            Shown::Main => copy::NO_CHATS,
+            Shown::Archive => copy::NO_ARCHIVED,
+        };
+        centered().child(muted(empty)).into_any_element()
     } else {
-        uniform_list("chats", chats.len(), cx.processor(chat_rows))
+        // Each view keeps its own scroll position.
+        let id = match shown {
+            Shown::Main => "chats-main",
+            Shown::Archive => "chats-archive",
+        };
+        uniform_list(id, rows.len(), cx.processor(chat_rows))
             .flex_1()
             .into_any_element()
     };
     // Below the last chat the column keeps that chat's tone, so the list
     // reads as one descent with no lighter gap under it.
-    let floor = chats.last().map_or(Depth::NOW, |c| {
-        depth_of(c.last_date, format::now(), &format::local_tz())
-    });
+    let floor = match rows.last() {
+        Some(SidebarRow::Chat(c)) => depth_of(c.last_date, format::now(), &format::local_tz()),
+        Some(SidebarRow::Archive(_)) | None => Depth::NOW,
+    };
+    let title = sidebar_title(shown, theme, cx);
     // After a core stop nothing can load: no Retry (round 37).
     let retry = (session.shell.list.gave_up() && !session.shell.is_stopped())
         .then(|| retry_button("retry-chats", copy::RETRY_CHATS, theme, cx).bottom_3());
@@ -104,19 +118,7 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
                 .items_baseline()
                 .bg(theme.surface(Depth::NOW))
                 .text_color(theme.text)
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(mark(theme, 18.))
-                        .child(
-                            div()
-                                .font_family(theme::NAME_FONT)
-                                .text_lg()
-                                .child(copy::WORDMARK),
-                        ),
-                )
+                .child(title)
                 .child(
                     div()
                         .flex()
@@ -129,6 +131,39 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
         .child(body)
         // Last, so it paints over the rows and takes their clicks.
         .children(retry)
+}
+
+/// The sidebar's heading: the wordmark, or the archive's title, which also
+/// leads back.
+fn sidebar_title(shown: Shown, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
+    match shown {
+        Shown::Main => div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(mark(theme, 18.))
+            .child(
+                div()
+                    .font_family(theme::NAME_FONT)
+                    .text_lg()
+                    .child(copy::WORDMARK),
+            )
+            .into_any_element(),
+        Shown::Archive => back_button(cx).into_any_element(),
+    }
+}
+
+/// Leaves the archive for the main list.
+fn back_button(cx: &mut Context<'_, Root>) -> Stateful<Div> {
+    div()
+        .id("archive-back")
+        .font_family(theme::NAME_FONT)
+        .text_lg()
+        .cursor_pointer()
+        .child(copy::ARCHIVE_BACK)
+        .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
+            root.with_session(|s, cx| s.show_chats(Shown::Main, window, cx), cx);
+        }))
 }
 
 /// Opens the appearance panel; also in the app menu and on Cmd+comma.
@@ -156,22 +191,71 @@ fn chat_rows(
     let theme = &Themes::of(window, cx);
     let (tz, now) = (format::local_tz(), format::now());
     let selected = session.shell.selected();
-    let chats = session.shell.list.as_slice();
-    chats
-        .get(range.clone())
+    let rows = session.shell.list.rows();
+    rows.get(range.clone())
         .unwrap_or_default()
         .iter()
         .zip(range)
-        .map(|(chat, ix)| {
-            let row = ChatRow {
-                chat,
-                selected: selected.is_some_and(|t| t.chat == chat.id),
-                time: format::list_time(chat.last_date, now, &tz),
-                depth: depth_of(chat.last_date, now, &tz),
-            };
-            row.render(ix, theme, cx)
+        .map(|(row, ix)| match *row {
+            SidebarRow::Archive(entry) => archive_row(entry, ix, theme, cx),
+            SidebarRow::Chat(chat) => {
+                let row = ChatRow {
+                    chat,
+                    selected: selected.is_some_and(|t| t.chat == chat.id),
+                    time: format::list_time(chat.last_date, now, &tz),
+                    depth: depth_of(chat.last_date, now, &tz),
+                };
+                row.render(ix, theme, cx)
+            }
         })
         .collect()
+}
+
+/// The main list's entry for the archive: opens it in the sidebar.
+fn archive_row(
+    entry: ArchiveEntry,
+    ix: usize,
+    theme: &Theme,
+    cx: &mut Context<'_, Root>,
+) -> Stateful<Div> {
+    let (surface, ink) = (theme.surface(Depth::NOW), theme.text_on(Depth::NOW));
+    div()
+        .id(ix)
+        .w_full()
+        .h(px(CHAT_ROW_HEIGHT))
+        .px_3()
+        .flex()
+        .items_center()
+        .gap_3()
+        .border_l_2()
+        .border_color(transparent_black())
+        .bg(surface)
+        .text_color(ink)
+        .cursor_pointer()
+        .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
+            root.with_session(|s, cx| s.show_chats(Shown::Archive, window, cx), cx);
+        }))
+        .child(
+            div()
+                .size(px(36.))
+                .flex_none()
+                .rounded_full()
+                .border_1()
+                .border_color(theme::faded(ink, 0.4)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(div().font_family(theme::NAME_FONT).child(copy::ARCHIVE))
+                .child(
+                    muted(copy::archive_summary(entry.chats, entry.unread))
+                        .text_xs()
+                        .truncate(),
+                ),
+        )
 }
 
 struct ChatRow<'a> {

@@ -16,7 +16,9 @@ use crate::backend::{
 };
 use crate::cache::CacheHandle;
 use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId, ThreadKey, TopicId};
-use crate::store::{ContinuityMark, FetchSeq, PageKind, TOPICS_PAGE, TopicsGen, ViewGen};
+use crate::store::{
+    ContinuityMark, DialogsSeq, FetchSeq, PageKind, TOPICS_PAGE, TopicsGen, ViewGen,
+};
 
 /// Messages per history page (server and cache).
 pub(super) const PAGE: u32 = 50;
@@ -60,6 +62,8 @@ pub(super) struct TopicsCall {
 pub(super) enum Job {
     Dialogs {
         cursor: Option<DialogsCursor>,
+        /// Taken at dispatch (`Dialogs::dispatch`); the default until then.
+        seq: DialogsSeq,
     },
     History {
         load: Load,
@@ -138,6 +142,7 @@ pub(super) enum StreamEnd {
 pub(super) enum Outcome {
     Dialogs {
         step: DialogsStep,
+        seq: DialogsSeq,
         res: CallResult<DialogsPage>,
     },
     History {
@@ -278,14 +283,14 @@ pub(super) fn job_future<C: Client>(
         cancel,
     };
     match job {
-        Job::Dialogs { cursor } => {
+        Job::Dialogs { cursor, seq } => {
             let step = if cursor.is_none() {
                 DialogsStep::First
             } else {
                 DialogsStep::Next
             };
             let call = async move { client.dialogs(cursor, DIALOGS_PAGE).await };
-            let fut = admitted.run(call, move |res| Outcome::Dialogs { step, res });
+            let fut = admitted.run(call, move |res| Outcome::Dialogs { step, seq, res });
             (TaskKind::Dialogs, Box::pin(fut))
         }
         Job::History {

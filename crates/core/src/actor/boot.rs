@@ -23,7 +23,7 @@ use super::lifecycle::{Phase, Reason};
 use crate::api::{Event, HistoryDir, WindowState};
 use crate::backend::{Backend, HistoryQuery, StreamItem, Update};
 use crate::model::{ChatId, ChatSummary, MsgId, ThreadKey};
-use crate::store::MAX_WINDOWS;
+use crate::store::{DialogsSeq, MAX_WINDOWS};
 
 /// How long a new instance may take to establish its update baseline.
 pub(super) const BASELINE_WAIT: Duration = Duration::from_secs(10);
@@ -234,7 +234,10 @@ impl<B: Backend> Actor<B> {
         let dialogs = !self.dialogs_busy;
         if dialogs {
             self.dialogs_busy = true;
-            self.priority.push_back(Job::Dialogs { cursor: None });
+            self.priority.push_back(Job::Dialogs {
+                cursor: None,
+                seq: DialogsSeq::default(),
+            });
         }
         if let Some(boot) = self.boot.as_mut() {
             boot.dialogs_pending = dialogs;

@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use abyss_core::api::UserError;
-use abyss_core::model::{ChatId, ChatSummary, Preview};
+use abyss_core::model::{ChatId, ChatSummary, PeerFolder, Preview};
 use abyss_core::store::{MAX_DIALOGS, bump_moves};
 use gpui::SharedString;
 
@@ -39,10 +39,37 @@ struct Paging {
     retry: Backoff,
 }
 
+/// Which of Telegram's two peer folders the sidebar shows. Core keeps one
+/// list holding both, in server order; each is a view of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Shown {
+    /// The main list, led by an entry that opens the archive.
+    #[default]
+    Main,
+    Archive,
+}
+
+/// The main list's entry for the archive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ArchiveEntry {
+    /// Archived chats loaded so far.
+    pub(crate) chats: usize,
+    /// How many of them have unread messages.
+    pub(crate) unread: usize,
+}
+
+/// One row of the sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidebarRow<'a> {
+    Archive(ArchiveEntry),
+    Chat(&'a ChatSummary),
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ChatList {
     chats: Vec<ChatSummary>,
     paging: Paging,
+    shown: Shown,
 }
 
 /// Whether a `ChatBumped` summary `new` moved its chat in core: core's own
@@ -53,6 +80,7 @@ fn is_newer(new: &ChatSummary, old: &ChatSummary) -> bool {
 }
 
 impl ChatList {
+    #[cfg(test)]
     pub(crate) fn as_slice(&self) -> &[ChatSummary] {
         &self.chats
     }
@@ -63,6 +91,54 @@ impl ChatList {
 
     pub(crate) fn get(&self, id: ChatId) -> Option<&ChatSummary> {
         self.chats.iter().find(|c| c.id == id)
+    }
+
+    pub(crate) fn shown(&self) -> Shown {
+        self.shown
+    }
+
+    /// Switches the sidebar between the main list and the archive. A view
+    /// with no row renders nothing that could ask for more, so it wants
+    /// the next page right away (the archive may lie further down).
+    pub(crate) fn show(&mut self, shown: Shown) {
+        self.shown = shown;
+        self.paging.wanted |= self.row_count() == 0;
+    }
+
+    /// The archive's entry in the main list, once an archived chat is loaded.
+    fn archive_entry(&self) -> Option<ArchiveEntry> {
+        let (chats, unread) = self
+            .chats
+            .iter()
+            .filter(|c| c.folder == PeerFolder::Archive)
+            .fold((0, 0), |(n, u), c| (n + 1, u + usize::from(c.unread > 0)));
+        (chats > 0).then_some(ArchiveEntry { chats, unread })
+    }
+
+    /// The chats of the shown view, in core's order.
+    fn shown_chats(&self) -> impl Iterator<Item = &ChatSummary> {
+        let folder = match self.shown {
+            Shown::Main => PeerFolder::Main,
+            Shown::Archive => PeerFolder::Archive,
+        };
+        self.chats.iter().filter(move |c| c.folder == folder)
+    }
+
+    /// The sidebar's rows: the main list starts with the archive's entry.
+    pub(crate) fn rows(&self) -> Vec<SidebarRow<'_>> {
+        let entry = match self.shown {
+            Shown::Main => self.archive_entry().map(SidebarRow::Archive),
+            Shown::Archive => None,
+        };
+        entry
+            .into_iter()
+            .chain(self.shown_chats().map(SidebarRow::Chat))
+            .collect()
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        let entry = self.shown == Shown::Main && self.archive_entry().is_some();
+        usize::from(entry) + self.shown_chats().count()
     }
 
     /// Core's whole list (it merges a reloaded first page into later pages).
@@ -115,10 +191,11 @@ impl ChatList {
         }
     }
 
-    /// Row `last_visible` is on screen: near the end, the sidebar wants the
-    /// next page.
+    /// Row `last_visible` of the shown view is on screen: near the view's
+    /// end, the sidebar wants the next page (which may hold more of either
+    /// view: the server lists both folders in one traversal).
     pub(crate) fn seen(&mut self, last_visible: usize) {
-        let len = self.chats.len();
+        let len = self.row_count();
         if len == 0 || last_visible.saturating_add(LOAD_MARGIN) >= len {
             self.paging.wanted = true;
         }
@@ -172,10 +249,11 @@ impl ChatList {
     /// Core applied a dialogs page (`DialogsPaging`). An empty list shows no
     /// row to ask for more, so it wants the next page right away.
     pub(crate) fn paged(&mut self, pages: Pages) {
+        let empty = self.row_count() == 0;
         let p = &mut self.paging;
         p.has_more = pages == Pages::More;
         p.in_flight = false;
-        p.wanted |= self.chats.is_empty();
+        p.wanted |= empty;
         p.retry.reset();
     }
 
@@ -253,6 +331,7 @@ mod tests {
             last_date: 0,
             last_id: None,
             can_send: true,
+            folder: PeerFolder::Main,
         }
     }
 
@@ -401,6 +480,85 @@ mod tests {
         assert_eq!(list.len(), MAX_DIALOGS);
         list.seen(MAX_DIALOGS - 1);
         assert!(!list.wants_more(Instant::now()), "never past the cap");
+    }
+
+    fn archived(n: i64) -> ChatSummary {
+        ChatSummary {
+            folder: PeerFolder::Archive,
+            ..chat(n)
+        }
+    }
+
+    fn row_ids(list: &ChatList) -> Vec<i64> {
+        assert_eq!(list.row_count(), list.rows().len());
+        list.rows()
+            .iter()
+            .map(|r| match r {
+                SidebarRow::Archive(_) => 0,
+                SidebarRow::Chat(c) => c.id.id,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_archive_is_a_view_of_the_one_list() {
+        let mut list = ChatList::default();
+        list.reset(vec![pinned(1), chat(2), chat(4)]);
+        assert_eq!(row_ids(&list), [1, 2, 4], "no archive loaded, no entry");
+        list.reset(vec![pinned(1), chat(2), archived(3), chat(4), archived(5)]);
+        assert_eq!(
+            row_ids(&list),
+            [0, 1, 2, 4],
+            "the entry leads the main list"
+        );
+        assert_eq!(
+            list.rows()[0],
+            SidebarRow::Archive(ArchiveEntry {
+                chats: 2,
+                unread: 0
+            })
+        );
+        list.show(Shown::Archive);
+        assert_eq!(row_ids(&list), [3, 5], "server order, no entry");
+        // Unarchived elsewhere: the chat changes view in place.
+        list.bump(chat(3));
+        assert_eq!(row_ids(&list), [5]);
+        list.show(Shown::Main);
+        assert_eq!(row_ids(&list), [0, 1, 2, 3, 4]);
+        let mut unread = archived(5);
+        unread.unread = 2;
+        list.bump(unread);
+        assert!(matches!(
+            list.rows()[0],
+            SidebarRow::Archive(ArchiveEntry {
+                chats: 1,
+                unread: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn paging_follows_the_shown_view() {
+        let now = Instant::now();
+        let mut list = ChatList::default();
+        // 100 chats, 90 of them archived: the main view ends early.
+        list.reset(
+            (0..100)
+                .map(|n| if n < 10 { chat(n) } else { archived(n) })
+                .collect(),
+        );
+        list.paged(Pages::More);
+        list.seen(5);
+        assert!(list.wants_more(now), "the main view's end is on screen");
+        list.requested();
+        list.paged(Pages::More);
+        list.show(Shown::Archive);
+        list.seen(10);
+        assert!(!list.wants_more(now), "the archive's end is not");
+        // An archive view with no row asks for the next page by itself.
+        list.reset((0..10).map(chat).collect());
+        list.show(Shown::Archive);
+        assert!(list.wants_more(now));
     }
 
     #[test]

@@ -131,6 +131,18 @@ pub enum ChatKind {
     Supergroup { forum: bool, gigagroup: bool },
 }
 
+/// Telegram's peer folders (not chat folders): every chat is in exactly one.
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash,
+)]
+pub enum PeerFolder {
+    /// Folder 0, the main chat list.
+    #[default]
+    Main,
+    /// Folder 1, the archive.
+    Archive,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Preview {
     Text(String),
@@ -155,6 +167,9 @@ pub struct ChatSummary {
     /// without relying on timestamps, which collide within a second.
     pub last_id: Option<MsgId>,
     pub can_send: bool,
+    /// The main list or the archive. The list holds both; the UI shows one
+    /// at a time.
+    pub folder: PeerFolder,
 }
 
 /// How the server ordered a forum's topic list

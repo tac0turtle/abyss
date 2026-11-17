@@ -14,7 +14,8 @@ use crate::backend::grammers::map::peers::{
 };
 use crate::backend::{HistoryQuery, Update};
 use crate::model::{
-    Body, ChatId, ChatKind, InvalidTopicId, MediaKind, MsgId, PeerKind, Preview, ThreadKey, TopicId,
+    Body, ChatId, ChatKind, InvalidTopicId, MediaKind, MsgId, PeerFolder, PeerKind, Preview,
+    ThreadKey, TopicId,
 };
 use crate::rich_text::{LinkTarget, MAX_ENTITIES, MAX_TEXT_BYTES, MAX_URL_BYTES, Style};
 use crate::sanitize::MAX_SERVICE_BYTES;
@@ -705,6 +706,61 @@ fn folders_communities_and_unknown_peers_are_skipped() {
     let ids: Vec<i64> = out.chats.iter().map(|c| c.id.id).collect();
     assert_eq!(ids, vec![7], "the folder's peer is not listed as a chat");
     assert_eq!(out.chats[0].last, None);
+}
+
+#[test]
+fn archived_dialogs_are_in_the_archive_and_keep_their_place() {
+    let users = users(vec![
+        user(7, "Ann", ""),
+        user(8, "Bob", ""),
+        user(9, "Cy", ""),
+    ]);
+    let mut archived = dialog(peer_user(8), 2);
+    archived.folder_id = Some(1);
+    let mut main = dialog(peer_user(9), 3);
+    main.folder_id = Some(0);
+    let dialogs: Vec<tl::enums::Dialog> = [dialog(peer_user(7), 1), archived, main]
+        .into_iter()
+        .map(tl::enums::Dialog::Dialog)
+        .collect();
+    let dir = Directory::from_lists(&users, &[]);
+    let out = lists::dialogs(&parts(&dialogs, &[], &users, &[]), &dir, 100);
+    let folders: Vec<(i64, PeerFolder)> = out.chats.iter().map(|c| (c.id.id, c.folder)).collect();
+    assert_eq!(
+        folders,
+        vec![
+            (7, PeerFolder::Main),
+            (8, PeerFolder::Archive),
+            (9, PeerFolder::Main)
+        ]
+    );
+}
+
+#[test]
+fn folder_moves_map_to_archive_flags() {
+    use tl::enums::Update as U;
+    let moved =
+        |peer, folder_id| tl::enums::FolderPeer::Peer(tl::types::FolderPeer { peer, folder_id });
+    let update = U::FolderPeers(tl::types::UpdateFolderPeers {
+        folder_peers: vec![
+            moved(peer_user(7), 1),
+            moved(peer_chat(3), 0),
+            moved(peer_user(-1), 1),
+        ],
+        pts: 1,
+        pts_count: 1,
+    });
+    assert!(matches!(
+        lists::update(&update, &Directory::default()),
+        Some(Update::Folders(m))
+            if m == vec![(uid(7), PeerFolder::Archive), (gid(3), PeerFolder::Main)]
+    ));
+    let empty = U::FolderPeers(tl::types::UpdateFolderPeers {
+        folder_peers: vec![moved(peer_user(-1), 1)],
+        pts: 1,
+        pts_count: 1,
+    });
+    assert!(lists::update(&empty, &Directory::default()).is_none());
 }
 
 fn slice<'a>(

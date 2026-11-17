@@ -18,7 +18,7 @@ use crate::model::{
 };
 use crate::store::MAX_DIALOGS;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 /// Version 2 replaced `Message::edited` with `edit_date`; version 1 message rows
 /// cannot be decoded, so they are dropped (the cache is disposable).
 const MIGRATE_1_TO_2: &str =
@@ -36,6 +36,9 @@ fn migrate_3_to_4() -> String {
          PRAGMA user_version = 4; COMMIT;"
     )
 }
+/// Version 5 added `ChatSummary::folder`; version 4 chat rows cannot be
+/// decoded, so the cached chat list is dropped (messages are unchanged).
+const MIGRATE_4_TO_5: &str = "BEGIN; DELETE FROM chats; PRAGMA user_version = 5; COMMIT;";
 /// Messages deleted per eviction step.
 const EVICT_BATCH: i64 = 1000;
 /// Upper bound on eviction steps per call; exceeding it is reported, not hidden.
@@ -349,15 +352,22 @@ impl Cache {
                 conn.execute_batch(MIGRATE_1_TO_2)?;
                 conn.execute_batch(MIGRATE_2_TO_3)?;
                 conn.execute_batch(&migrate_3_to_4())?;
+                conn.execute_batch(MIGRATE_4_TO_5)?;
                 Ok(())
             }
             2 => {
                 conn.execute_batch(MIGRATE_2_TO_3)?;
                 conn.execute_batch(&migrate_3_to_4())?;
+                conn.execute_batch(MIGRATE_4_TO_5)?;
                 Ok(())
             }
             3 => {
                 conn.execute_batch(&migrate_3_to_4())?;
+                conn.execute_batch(MIGRATE_4_TO_5)?;
+                Ok(())
+            }
+            4 => {
+                conn.execute_batch(MIGRATE_4_TO_5)?;
                 Ok(())
             }
             SCHEMA_VERSION => Ok(()),

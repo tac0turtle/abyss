@@ -1,11 +1,45 @@
 //! Bounded, ordered chat list.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerFolder, Preview};
 
 /// Maximum number of dialogs held.
 pub const MAX_DIALOGS: usize = 1000;
+
+/// Live folder moves remembered for crossing dialogs responses. Beyond it
+/// the oldest move is forgotten, and every response that could still need
+/// it is discarded ([`Guarded::Discard`]).
+const MAX_FOLDER_MOVES: usize = MAX_DIALOGS;
+
+/// What [`Dialogs::guard_folders`] made of a dialogs response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Guarded {
+    /// Apply the page: no move it could predate disagrees with it.
+    Apply,
+    /// Apply the page (live moves kept over it), then fetch the first page
+    /// again: the page predates a move it disagreed with.
+    ApplyAndRefetch,
+    /// Drop the page and fetch the first page again: it was dispatched
+    /// before a move whose record was evicted, so it can't be guarded.
+    Discard,
+}
+
+/// One remembered live folder move.
+#[derive(Clone, Copy, Debug)]
+struct Move {
+    folder: PeerFolder,
+    /// The dispatch seq current when the move was made.
+    at: DialogsSeq,
+    /// Move order (monotonic), for eviction oldest first.
+    order: u64,
+}
+
+/// The dialogs requests' logical clock. Every dialogs request takes the next
+/// value when it is *dispatched*, so a response knows which live folder
+/// moves it cannot have seen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DialogsSeq(u64);
 
 /// Ordered chat list: pinned chats first in server order, then unpinned chats by
 /// recency. Bounded by [`MAX_DIALOGS`].
@@ -24,6 +58,17 @@ pub struct Dialogs {
     /// Bumped by every call that can change which chats are listed, or
     /// their order.
     rev: u64,
+    /// The seq of the last dispatched dialogs request.
+    dispatched: DialogsSeq,
+    /// Live folder moves (`set_folder`) with the seq current when each was
+    /// made. A response dispatched at or before that seq may predate the
+    /// move, so the move wins over it ([`Dialogs::guard_folders`]).
+    moves: HashMap<ChatId, Move>,
+    /// Source of [`Move::order`].
+    move_order: u64,
+    /// Responses dispatched at or before this seq may predate an evicted
+    /// move: they are discarded.
+    evicted_through: DialogsSeq,
 }
 
 /// What a later page did to the list.
@@ -118,8 +163,8 @@ impl Dialogs {
     /// dropping the pages loaded after it. The page becomes the head of the list
     /// in server order. Previously loaded chats it does not contain are kept
     /// after it (unpinned, newest first) when they are not newer than the page's
-    /// oldest unpinned chat; a chat that is newer but missing was left, deleted
-    /// or archived, so it goes. A page that ends the list replaces it entirely.
+    /// oldest unpinned chat; a chat that is newer but missing was left or
+    /// deleted, so it goes (an archived chat stays listed, in the archive). A page that ends the list replaces it entirely.
     /// Returns how many previously loaded chats were kept.
     pub fn merge_first_page(&mut self, page: Vec<ChatSummary>, rest: Rest) -> usize {
         let old = std::mem::take(&mut self.list);
@@ -259,6 +304,73 @@ impl Dialogs {
         Bump::Updated(summary)
     }
 
+    /// Takes the seq of a dialogs request being dispatched.
+    pub fn dispatch(&mut self) -> DialogsSeq {
+        self.dispatched = DialogsSeq(self.dispatched.0.saturating_add(1));
+        self.dispatched
+    }
+
+    /// Keeps live folder moves over a dialogs response dispatched at `seq`,
+    /// before the page is applied: a chat moved at or after that dispatch
+    /// takes its live folder. A move older than the dispatch is settled by
+    /// the response, which is authoritative for it. A response dispatched
+    /// before an evicted move is discarded whole, untouched.
+    ///
+    /// Every refetch this asks for is dispatched after every move recorded
+    /// so far, so it is authoritative for all of them: only a new move
+    /// crossing it can ask for another.
+    pub fn guard_folders(&mut self, page: &mut [ChatSummary], seq: DialogsSeq) -> Guarded {
+        if seq <= self.evicted_through {
+            return Guarded::Discard;
+        }
+        let mut conflict = false;
+        for chat in page {
+            let Some(&Move { folder, at, .. }) = self.moves.get(&chat.id) else {
+                continue;
+            };
+            if seq <= at {
+                conflict |= chat.folder != folder;
+                chat.folder = folder;
+            } else {
+                self.moves.remove(&chat.id);
+            }
+        }
+        if conflict {
+            Guarded::ApplyAndRefetch
+        } else {
+            Guarded::Apply
+        }
+    }
+
+    /// Moves a chat into or out of the archive. `None` when the chat is not
+    /// listed or already there. The order is unchanged: the archive and the
+    /// main list are views of one server-ordered list. The move is
+    /// remembered, listed or not, for responses already in flight.
+    pub fn set_folder(&mut self, chat: ChatId, folder: PeerFolder) -> Option<&ChatSummary> {
+        if self.moves.len() >= MAX_FOLDER_MOVES
+            && !self.moves.contains_key(&chat)
+            && let Some((&oldest, _)) = self.moves.iter().min_by_key(|(_, m)| m.order)
+            && let Some(evicted) = self.moves.remove(&oldest)
+        {
+            // A response dispatched at or before the evicted move could
+            // need it; none dispatched later can.
+            self.evicted_through = self.evicted_through.max(evicted.at);
+        }
+        self.move_order = self.move_order.wrapping_add(1);
+        let record = Move {
+            folder,
+            at: self.dispatched,
+            order: self.move_order,
+        };
+        self.moves.insert(chat, record);
+        let summary = self
+            .list
+            .iter_mut()
+            .find(|c| c.id == chat && c.folder != folder)?;
+        summary.folder = folder;
+        Some(summary)
+    }
+
     /// Sets the unread count (local read or read on another device).
     pub fn set_unread(&mut self, chat: ChatId, unread: u32) -> Option<&ChatSummary> {
         let summary = self.list.iter_mut().find(|c| c.id == chat)?;
@@ -291,6 +403,7 @@ mod tests {
             last_date: 0,
             last_id: None,
             can_send: true,
+            folder: PeerFolder::Main,
         }
     }
 
@@ -441,5 +554,83 @@ mod tests {
         let out = d.append(vec![chat(3)], Rest::Last);
         assert!(out.reordered);
         assert_eq!(ids(&d), vec![1, 3]);
+    }
+
+    #[test]
+    fn archiving_flags_the_chat_in_place() {
+        let mut d = Dialogs::default();
+        d.reset(vec![chat(1), chat(2)]);
+        let rev = d.rev();
+        let archive = PeerFolder::Archive;
+        assert!(
+            d.set_folder(id(2), archive)
+                .is_some_and(|c| c.folder == archive)
+        );
+        assert!(d.set_folder(id(2), archive).is_none(), "already archived");
+        assert!(d.set_folder(id(9), archive).is_none(), "not listed");
+        assert_eq!(ids(&d), vec![1, 2], "order unchanged");
+        assert_eq!(d.rev(), rev);
+        let main = PeerFolder::Main;
+        assert!(d.set_folder(id(2), main).is_some_and(|c| c.folder == main));
+    }
+
+    /// A response dispatched before a live move keeps the move (and asks for
+    /// a refetch); one dispatched after it is authoritative and settles it.
+    #[test]
+    fn folder_moves_win_over_older_responses_only() {
+        let archive = PeerFolder::Archive;
+        let mut d = Dialogs::default();
+        d.reset(vec![chat(1), chat(2)]);
+        let older = d.dispatch();
+        d.set_folder(id(2), archive);
+        // Not listed: remembered too, for the page that brings it.
+        assert!(d.set_folder(id(3), archive).is_none());
+        let mut page = vec![chat(1), chat(2), chat(3)];
+        assert_eq!(d.guard_folders(&mut page, older), Guarded::ApplyAndRefetch);
+        assert_eq!(
+            page.iter().map(|c| c.folder).collect::<Vec<_>>(),
+            [PeerFolder::Main, archive, archive]
+        );
+        let newer = d.dispatch();
+        let mut page = vec![chat(2)];
+        assert_eq!(
+            d.guard_folders(&mut page, newer),
+            Guarded::Apply,
+            "authoritative"
+        );
+        assert_eq!(page[0].folder, PeerFolder::Main);
+        let mut page = vec![chat(2)];
+        assert_eq!(
+            d.guard_folders(&mut page, older),
+            Guarded::Apply,
+            "settled: forgotten"
+        );
+    }
+
+    /// Past the cap the oldest move goes first, in move order (not by
+    /// seq: these share one), and a response dispatched before it is
+    /// discarded; a response dispatched after it is applied.
+    #[test]
+    fn evicting_a_move_discards_the_responses_that_could_need_it() {
+        let archive = PeerFolder::Archive;
+        let mut d = Dialogs::default();
+        d.reset(vec![chat(1), chat(2)]);
+        let older = d.dispatch();
+        d.set_folder(id(1), archive);
+        let others = i64::try_from(MAX_FOLDER_MOVES).unwrap();
+        for n in 0..others - 1 {
+            d.set_folder(id(1000 + n), archive);
+        }
+        let mut page = vec![chat(1), chat(2)];
+        assert_eq!(d.guard_folders(&mut page, older), Guarded::ApplyAndRefetch);
+        // One more: chat 1's move is the oldest, so it goes.
+        d.set_folder(id(5000), archive);
+        assert!(!d.moves.contains_key(&id(1)));
+        assert!(d.moves.contains_key(&id(1000)));
+        let mut page = vec![chat(1), chat(2)];
+        assert_eq!(d.guard_folders(&mut page, older), Guarded::Discard);
+        assert_eq!(page[0].folder, PeerFolder::Main, "untouched");
+        let newer = d.dispatch();
+        assert_eq!(d.guard_folders(&mut page, newer), Guarded::Apply);
     }
 }

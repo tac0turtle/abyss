@@ -11,7 +11,7 @@ use super::{Harness, add_big_forum, forum, forum_summary, online, reconciled, ru
 use crate::api::{Command, Event, HistoryDir, UserError, WindowState};
 use crate::backend::Update;
 use crate::backend::fake::{FakeScript, text_message};
-use crate::model::{ChatId, ChatKind, ThreadKey};
+use crate::model::{ChatId, ChatKind, PeerFolder, ThreadKey};
 
 const PLAIN_GROUP: ChatKind = ChatKind::Supergroup {
     forum: false,
@@ -129,5 +129,32 @@ async fn the_kind_is_forgotten_with_the_last_view() {
         opened(&mut h, ThreadKey::whole(chat(n))).await;
     }
     opened(&mut h, ThreadKey::whole(f)).await;
+    h.stop().await;
+}
+
+/// Folders plan part A: the peer folder and the kind are independent. A
+/// forum moved into the archive is still a forum: its summary keeps the
+/// kind, the whole-chat key stays refused, and its topics still open.
+#[tokio::test(start_paused = true)]
+async fn an_archived_forum_is_still_a_forum() {
+    let f = forum(100);
+    let mut script = FakeScript::demo(1, 1);
+    add_big_forum(&mut script, f, 2);
+    let mut h = online(script).await;
+    h.until(|e| matches!(e, Event::DialogsReset(c) if c.iter().any(|c| c.id == f)))
+        .await;
+    h.fake
+        .push_update(Update::Folders(vec![(f, PeerFolder::Archive)]))
+        .await;
+    let (ev, _) = h
+        .until(|e| matches!(e, Event::ChatBumped(s) if s.id == f))
+        .await;
+    let Event::ChatBumped(summary) = ev else {
+        unreachable!()
+    };
+    assert_eq!(summary.folder, PeerFolder::Archive);
+    assert_eq!(summary.kind, forum_summary(f).kind);
+    refused(&mut h, ThreadKey::whole(f)).await;
+    opened(&mut h, topic_key(f, 2)).await;
     h.stop().await;
 }

@@ -11,7 +11,9 @@ pub use badge::{
     BadgeSeq, BadgeSource, Badges, CURSOR_SLOTS, KIND_SLOTS, MAX_PEER_DIALOGS, Offer,
     PEER_CALL_INTERVAL, PEER_REFRESH_INTERVAL, PeerBatch, PeerScheduler, SHOWN_SLOTS,
 };
-pub use dialogs::{Appended, Bump, Dialogs, Last, MAX_DIALOGS, Rest, Unread, bump_moves};
+pub use dialogs::{
+    Appended, Bump, Dialogs, DialogsSeq, Guarded, Last, MAX_DIALOGS, Rest, Unread, bump_moves,
+};
 pub use limits::{AUTO_REFRESH_COOLDOWN, AutoRefresh, NotBefore, Refresh};
 pub use route::{ForumStatus, Route, normalize, route};
 pub use topics::{

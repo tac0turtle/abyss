@@ -217,15 +217,16 @@ async fn reconcile_tail_gap_replaces_only_its_thread() {
     assert_eq!(ids(&handle.tail(b, 10).await.unwrap()), [90, 120, 160, 300]);
 }
 
-/// Section 11: migration 3 → 4 drops messages and their LRU rows, keeps the
-/// chat list, and adds the topic column.
+/// Section 11: migration 3 → 4 drops messages and their LRU rows and adds
+/// the topic column. It keeps the chat list, but the upgrade continues to
+/// version 5, which drops it (`ChatSummary::folder`, folders plan part A).
 #[test]
-fn version_3_messages_are_dropped_and_chats_kept() {
+fn version_3_messages_and_chats_are_dropped() {
     let (_t, dir, key_) = setup();
     let c = user(1);
     {
         let mut db = Cache::open(&dir, &key_).unwrap();
-        db.put_chats(&[summary(c, "kept")]).unwrap();
+        db.put_chats(&[summary(c, "dropped by 4 to 5")]).unwrap();
         db.touch(c).unwrap();
         let body = postcard::to_allocvec(&msg(c, 1, "v3")).unwrap();
         // The version 3 layout: no topic column, no thread index.
@@ -248,7 +249,7 @@ fn version_3_messages_are_dropped_and_chats_kept() {
             .unwrap();
     }
     let mut db = Cache::open(&dir, &key_).unwrap();
-    assert_eq!(db.chats().unwrap(), [summary(c, "kept")]);
+    assert!(db.chats().unwrap().is_empty());
     assert_eq!(row_count(&db), 0);
     assert_eq!(db.total_bytes(), 0);
     let lru: i64 = db
@@ -260,7 +261,7 @@ fn version_3_messages_are_dropped_and_chats_kept() {
         .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     db.put_messages(key(forum(), 2), &posts(2, [1])).unwrap();
     assert_eq!(ids(&db.tail(key(forum(), 2), 10).unwrap()), [1]);
 }

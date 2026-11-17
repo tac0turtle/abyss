@@ -13,6 +13,10 @@ use super::sends::{Echo, Phase};
 pub(crate) const WORDMARK: &str = "abyss";
 pub(crate) const SELECT_CHAT: &str = "Select a chat";
 pub(crate) const NO_CHATS: &str = "No chats yet";
+pub(crate) const NO_ARCHIVED: &str = "No archived chats";
+pub(crate) const ARCHIVE: &str = "Archive";
+/// The archive view's title, which leads back to the main list.
+pub(crate) const ARCHIVE_BACK: &str = "‹ Archive";
 pub(crate) const LOADING_HISTORY: &str = "Loading…";
 pub(crate) const START_OF_HISTORY: &str = "Start of the conversation";
 pub(crate) const EMPTY_CHAT: &str = "No messages yet";
@@ -193,6 +197,16 @@ mod send_label_tests {
     }
 }
 
+/// The archive entry's second line: how many archived chats are loaded (the
+/// list may hold only some of them), how many of those are unread.
+pub(crate) fn archive_summary(chats: usize, unread: usize) -> SharedString {
+    let noun = if chats == 1 { "chat" } else { "chats" };
+    match unread {
+        0 => format!("{chats} {noun} loaded").into(),
+        n => format!("{chats} {noun} loaded · {n} unread").into(),
+    }
+}
+
 pub(crate) fn unread_badge(unread: u32) -> SharedString {
     if unread > 999 {
         "999+".into()
@@ -215,5 +229,11 @@ mod tests {
             byte_size(u64::MAX).ends_with(" GB"),
             "saturates, no overflow"
         );
+    }
+
+    #[test]
+    fn archive_counts_say_loaded() {
+        assert_eq!(archive_summary(1, 0), "1 chat loaded");
+        assert_eq!(archive_summary(12, 3), "12 chats loaded · 3 unread");
     }
 }

@@ -54,7 +54,7 @@ use crate::core::ShutdownReport;
 use crate::events::EventSender;
 use crate::model::{MsgId, ThreadKey};
 use crate::session::{PersistHandle, SessionSnapshot};
-use crate::store::{Dialogs, MAX_DIALOGS, ViewGen, Window, Windows};
+use crate::store::{Dialogs, DialogsSeq, MAX_DIALOGS, ViewGen, Window, Windows};
 
 /// Shutdown's deadline for retirement and the persistence seal, counted from
 /// its start (plan section 5).
@@ -449,9 +449,12 @@ impl<B: Backend> Actor<B> {
             let Some(permit) = self.admission.try_acquire() else {
                 return;
             };
-            let Some(job) = queue.remove(at) else {
+            let Some(mut job) = queue.remove(at) else {
                 return;
             };
+            if let Job::Dialogs { seq, .. } = &mut job {
+                *seq = self.dialogs.dispatch();
+            }
             let ctx = CallCtx {
                 client: Arc::clone(&live.client),
                 cgen: self.cgen,
@@ -656,7 +659,8 @@ impl<B: Backend> Actor<B> {
         } else {
             None
         };
-        if self.enqueue(Job::Dialogs { cursor }).await {
+        let seq = DialogsSeq::default();
+        if self.enqueue(Job::Dialogs { cursor, seq }).await {
             self.dialogs_busy = true;
         } else {
             self.load_ended(LoadTarget::Dialogs, Some(UserError::Busy))

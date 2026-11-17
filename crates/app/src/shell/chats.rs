@@ -440,6 +440,22 @@ impl Session {
         cx.notify();
     }
 
+    /// Switches the sidebar between the main list and the archive. A view
+    /// with no row may want the next page at once.
+    pub(super) fn show_chats(
+        &mut self,
+        shown: crate::chat::list::Shown,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        self.shell.list.show(shown);
+        let now = cx.background_executor().now();
+        self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
+            s.request_dialogs(now, admit)
+        });
+        cx.notify();
+    }
+
     /// Chat list row `last_visible` was rendered: maybe load the next page.
     /// Called during render, so the request goes out after it.
     pub(super) fn dialogs_seen(
