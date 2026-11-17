@@ -1,6 +1,6 @@
 # abyss Stage 2 plan: forum topics
 
-Status: **v5.3** (2026-11-17). Nothing in it is implemented yet. v2 applied review round 1 and recorded the owner's decisions (section 14). v3 applied round 2. v4 applied round 3: every count (the forum badge and each topic's unread) is a server value only, refreshed on triggers, and snapshots are authoritative in dispatch order. v5 applied round 4, v5.1 applied round 5's fixes, v5.2 applied round 6's, and v5.3 applies rounds 7 and 8 (section 16). It builds on [stage-1.md](stage-1.md) and keeps every Stage 1 invariant (section 1). Sections of the Stage 1 plan are cited as "S1 §N".
+Status: **v6.3** (2026-11-17). Tasks 1–11 are implemented and on main; section 17 (tasks 13–18) is reviewed and not yet implemented. v2 applied review round 1 and recorded the owner's decisions (section 14). v3 applied round 2. v4 applied round 3: every count (the forum badge and each topic's unread) is a server value only, refreshed on triggers, and snapshots are authoritative in dispatch order. v5 applied round 4, v5.1 applied round 5's fixes, v5.2 applied round 6's, and v5.3 applies rounds 7 and 8 (section 16). Section 17 (draft v6.2, review rounds 1–2 applied) adds chat-list tabs, inline topics and unread views as tasks 13–18, which run before task 12. It builds on [stage-1.md](stage-1.md) and keeps every Stage 1 invariant (section 1). Sections of the Stage 1 plan are cited as "S1 §N".
 
 Pinned upstreams (unchanged from Stage 1):
 - **grammers** `e61cf858` (codeberg.org/Lonami/grammers, v0.12.0, TL `LAYER 233`). `G/` = `~/.cargo/git/checkouts/grammers-8937e3b5288aa015/e61cf85/`. The references below were checked against a clone of that exact revision.
@@ -923,7 +923,7 @@ Each task is one implementation and review cycle on `agent/stage-2`, recorded in
     - a closed demo topic blocks the composer;
     - a new message into a read topic shows the dot, then the server count;
     - reading the last unread topic of a forum lowers the forum's badge within one `peer_dialogs` round trip.
-12. **Live verification** (blocked on credentials, like Stage 1 task 12). The checklist in section 13. *Done when:* every item is checked off in the roadmap, with U1–U5 resolved, and any resulting code change has landed as its own reviewed task.
+12. **Live verification** (blocked on credentials, like Stage 1 task 12). It runs last, after tasks 13–18 (section 17.9). The checklist in section 13, plus section 17.11. *Done when:* every item is checked off in the roadmap, with U1–U5 resolved, and any resulting code change has landed as its own reviewed task.
 
 ## 13. Unknowns needing live verification
 
@@ -1149,3 +1149,627 @@ Follow-ups (not Stage 2 tasks):
 |---|---|---|
 | 1 | P2: a send between `KindChanged` and its summary created an unmarked echo in an obsolete key. P3: obsolete-send cleanup waited for a painted pane | The latest kind core stated governs the pane and send admission; cleanup runs on events with its own backoff; discarded sends of unknown outcome say they may have been sent |
 | 2 | Pass. P3 applied by the lead: a reset cleanup backoff now wakes at once (not while core is stopped) | — |
+
+## 17. Chat-list tabs, inline topics and unread views
+
+Status: **v6.3, reviewed** (2026-11-17). v6.1 applied review round 1 and recorded the lead's decisions D7–D9. v6.2 applied round 2 and decision D10; v6.3 applied round 3; round 4 passed with no P0–P2 (sections 17.12, 17.13). The owner added this work to Stage 2 on 2026-11-17 (section 17.1). It runs as tasks 13–18, after task 11 and before task 12 (live verification), whose checklist grows by section 17.11.
+
+It builds on the folders plan ([folders.md](folders.md), parts A–C, on main) and does not rebuild it. Kept as built:
+- the archive view (`Shown::Archive`, the archive entry, "‹ Archive");
+- the folder tabs strip (`folder_tabs` in `shell/chat_view.rs`) and `ChatFolder::contains`;
+- the folder menu and folder editing (part C).
+
+### 17.1 Goals and non-goals
+
+**Owner decisions (2026-11-17, fixed):**
+- **Tabs:** fixed built-in tabs alongside the account's chat folders. The folder tabs stay read-only views, with editing from the right-click menu as built.
+- **Grouping:** a forum's row in the chat list expands to show its topics under it.
+- **Unread view:** an unread-only filter covering chats and topics, and first-unread positioning with a divider when a chat or topic opens (its placement and label: decision D10).
+- **Scope:** broadcast channels stay excluded, even when a folder names them. No new account writes.
+
+**In scope:**
+- the built-in tabs All, Private, Groups and Forums, in one strip with the folder tabs, with the selected tab and the unread filter kept in a small local file;
+- inline topics under the forum the pane shows;
+- the unread filter, over any tab and over the archive;
+- opening a chat or topic at its first unread message, the divider, and partial read marks;
+- core: a read pointer per chat (topics already have one), and history anchored at a message id.
+
+**Out of scope:**
+- any account write: marking chats read or unread from the list, `messages.markDialogUnread` (`api.tl:2711`), "mark all as read";
+- `dialog.unread_mark` (decision D8), and the reaction and poll-vote unread counts (`unread_reactions_count`, `unread_poll_votes_count`, `api.tl:225`);
+- unread counts on tabs (section 17.7 says why);
+- creating, renaming, reordering or hiding built-in tabs;
+- expanding several forums at once, and topic previews of forums the pane doesn't show (D7);
+- "next unread chat" navigation; mention navigation stays out (section 0);
+- caching anchored history on disk (section 17.5, "Cache");
+- accessibility roles for VoiceOver, which are Stage 3. v1 keeps every state readable without colour.
+
+### 17.2 Tabs
+
+**Model** (`chat/list.rs`). `Shown` becomes:
+
+```rust
+pub(crate) enum Tab { All, Private, Groups, Forums, Folder(i32) }
+pub(crate) enum Shown { Tab(Tab), Archive }        // today's Shown::Main is Shown::Tab(Tab::All)
+pub(crate) struct View { shown: Shown, unread_only: bool }   // the filter: section 17.4
+```
+
+**The strip.**
+- **Order:** All, Private, Groups, Forums, then the folder tabs in server order.
+- **"All" exists once.** The strip's current "All" (`Shown::Main`, `copy::ALL_CHATS`) is the built-in All. `dialogFilterDefault` is still skipped (part B), so no folder can duplicate it.
+- **When it shows:** always, not only when the account has folders as today. In the archive, the tabs are hidden and only the unread toggle (section 17.4) shows.
+- **Layout:** it scrolls horizontally as today. The unread toggle sits at its right end and doesn't scroll.
+- **Menus:** right-clicking a folder tab is unchanged; built-in tabs have no menu.
+- A folder that is removed while shown falls back to All, as today.
+
+**Matching** is a pure function of `ChatSummary` over the loaded list, like `ChatFolder::contains`:
+
+| Tab | Peer folder | Rule |
+|---|---|---|
+| All | Main | every chat; today's main view, led by the archive entry |
+| Private | Main | `ChatKind::Private { .. }` or `Bot`: every one-to-one chat (D9) |
+| Groups | Main | `Group`, or `Supergroup { forum: false, .. }` |
+| Forums | Main | `Supergroup { forum: true, .. }` |
+| Folder(id) | both | `ChatFolder::contains` as built (part B), the folder's pinned chats first |
+
+- Private, Groups and Forums **partition** All's chats (a property, section 17.8). Groups leaves forums out. A folder's `groups` flag still takes them in (Telegram's rule, part B).
+- Broadcasts never reach the list, so no tab can show one, whatever a folder names.
+- **Order:** built-in tabs keep core's order (pinned chats first, then server and bump order), as All does today.
+- **Forum status** is the summary's `kind`, which the rest of the app reads too (`chat::is_forum`).
+  - A chat whose forum flag changes moves between Groups and Forums when its summary arrives.
+  - While core fences a chat, it keeps the old kind (section 6.6), so the row stays where it was.
+  - The pane's own reconciliation (`shown_kind`, task 11) is unchanged.
+- **Unread state** comes from the summary fields that core keeps under per-field stamps (`unread`, `unread_mentions`; `Dialogs::guard`, task 8 round 3). The app never computes it. Section 17.4 defines it.
+
+**The archive** stays its own view, as built.
+- Built-in tabs cover the main peer folder only, as All does. An archived chat shows in a tab only through a folder that includes it.
+- The archive entry leads All only, and "‹ Archive" leads back to All.
+
+**Scroll positions.** Each `(shown, unread_only)` pair has its own `uniform_list` id (`chats-all`, `chats-private`, …, `chats-folder-<id>`, each with an `-unread` variant, and `chats-archive`). So each view keeps its own scroll position, as today.
+
+**Persistence.** The view is kept in a small file next to the theme file, following its rules (`ui/theme/settings.rs`).
+- **Location:** `~/Library/Application Support/dev.abyss/sidebar`, mode 0600 in the 0700 directory.
+- **Content:** the header `abyss-sidebar 1`, then `tab=all|private|groups|forums|folder:<id>` and `unread=0|1`.
+- **Limits:** at most 128 bytes are read. Anything unexpected means the defaults: All, with the filter off.
+- **No secrets:** no title and nothing secret is stored. The archive is never stored.
+- **Writing:** the file is written when the user changes the tab or the filter, never during render.
+- **Restoring a folder tab:**
+  - A stored folder tab is a pending choice until the session's first `ChatFolders` event.
+  - The folder is shown if it exists; otherwise All is.
+  - Either way the pending choice is then dropped.
+- **Logout** deletes the file, best effort, so the next account starts on All. Like the theme file, it isn't precious.
+
+**Keyboard.** The bindings live on the shell. The composer's text input binds none of these chords, and none of them affects IME composition:
+- **Ctrl+Tab / Ctrl+Shift+Tab:** next or previous tab, wrapping. They do nothing in the archive.
+- **Cmd+Shift+U:** turns the unread filter on or off.
+- **Option+Cmd+Down / Up:** selects the next or previous sidebar row.
+  - Chat rows and inline topic rows count; the archive entry, More and placeholder rows are skipped.
+  - They go through `select_chat` and `select_topic`, so admission and draft rules are unchanged.
+- **Option+Cmd+Right / Left:** expands or collapses the pane's forum row (section 17.3).
+- **Cmd+[:** unchanged (section 8).
+
+Task 12 checks the chords against macOS system shortcuts and input methods (section 17.11).
+
+**Accessibility in v1.** No state depends on hue (brand rule 2):
+- The selected tab and the toggle when it is on carry the ink rule and full ink; the others are in quiet ink.
+- An expanded forum shows "▾", a collapsed one "▸".
+- Inline topic rows are indented and carry the topic glyph.
+- The divider is a text label.
+
+Element ids are stable, so Stage 3 can attach accessibility roles to them.
+
+### 17.3 Inline forum topics
+
+**Which forum expands.** Only the forum the pane shows (`Pane::Forum { chat, .. }`), and selecting a forum row expands it (decision D7). This is the forum whose topic list the app already holds: `ChatShell.topics`, the replayed copy of core's shown list. So inline topics need no new data source, command or request:
+- core still retains at most 6 topic lists (LRU, section 6.1);
+- the shown forum stays the only one that is drained by id (section 6.4);
+- the by-id rate, discovery, the automatic-refresh limiter and the flood-wait deadlines are untouched.
+
+A lightweight preview per forum was considered and rejected:
+- It would need its own merge rule against live triggers and crossing snapshots. Sections 6.4 and 16 settled those only for the retained lists.
+- It would add `getForumTopics` calls for forums nobody opened.
+
+**Rows.** The sidebar's rows are cached (section 17.7), so they are owned descriptors that hold ids, not borrows. They are resolved against the chat list and the topic copy when a row renders:
+
+```rust
+pub(crate) enum SidebarRow {
+    Archive(ArchiveEntry),
+    Chat(ChatId),
+    Topic { forum: ChatId, topic: TopicId },
+    MoreTopics { forum: ChatId },
+    TopicsPending { forum: ChatId },
+}
+```
+
+- **Resolution:** a descriptor whose chat or topic no longer resolves renders as an empty row for that one frame. Every change that could cause this also recomputes the rows (section 17.7), so it never persists.
+- **Placement:** the three new variants come right after the forum's row.
+- **Which topics:** the topic copy's topics in its display order, as the pane shows them (pinned first, then the list's order mode; `ListChange::apply`).
+  - At most the first `INLINE_TOPICS = 8` are shown.
+  - The open topic is always shown, in its list position, also beyond the first 8, as long as the copy holds it.
+  - Under the unread filter, the 8 slots go to the topics section 17.4 lets through, in list order.
+- **More topics.** A "More topics" row follows when:
+  - the copy holds more topics than are shown;
+  - `has_more` is set;
+  - or, under the filter, the forum's badge exceeds the number of unread topics shown.
+
+  Selecting it shows the full list in the pane: Back to `Forum { open: None }` if a topic is open, otherwise nothing. The pane's list keeps paging, the countdown and Retry (section 8). Inline rows never ask for pages, so nothing in the sidebar drives topic requests.
+- **Before a copy exists** (opening, after `ForumInvalidated`, during a flood wait on a cold open): one `TopicsPending` row. It shows the pane's placeholder text: loading, the flood-wait countdown, or "unavailable" after a core stop.
+- **Look.**
+  - Rows are as tall as chat rows (`CHAT_ROW_HEIGHT`), so the sidebar stays a `uniform_list`, which needs uniform heights.
+  - They are indented by the avatar's width.
+  - Each shows the "#" glyph (D3), the title, the preview, the time, the closed and pinned marks, and `UnreadMark::of(topic)`, so freshness reads the same as in the pane.
+  - Tone follows the topic's own age (brand rule 1).
+- **Selection mark:** on the forum row while the pane shows the forum's list, and on the open topic's row while a topic is open.
+- **Expansion.** `ChatShell.inline: Inline { Expanded, Collapsed }`.
+  - It is reset to `Expanded` whenever a forum is selected.
+  - The disclosure glyph on the forum row toggles it without changing the pane: the glyph's click stops propagation, and the rest of the row selects as today.
+  - It goes with the list when the pane leaves the forum (another chat, Back to no chat, a `KindChanged` to not-a-forum).
+- **Navigation stays as in section 8.**
+  - A topic row calls `select_topic`. Topic rows exist only for the pane's forum, so its `Pane::Forum` check holds.
+  - The forum row calls `select_chat`: the same forum while a topic is open goes back to the list, as today.
+  - Drafts and admission rules are unchanged.
+  - `TopicRemoved`, `TopicBumped` and `ForumInvalidated` reach the inline rows through the same `TopicList::apply`.
+- **Which tab:** inline rows follow the forum's row into whatever tab or folder shows it. If the current view doesn't show the forum's row, there are no inline rows; expansion never adds a chat to a view.
+
+### 17.4 Unread filter
+
+**What counts as unread.** There is one pure function per kind of row, in `chat/list.rs`. The filter and the archive entry both use them:
+- **A chat that is not a forum:** its displayed count or its mentions are above 0. The displayed count is the confirmed count, except that Stage 1's overlay shows 0 while a read covering every known message is outstanding (section 17.6.1).
+  - Muted chats count.
+  - `dialog.unread_mark` isn't modelled (decision D8).
+- **A forum:** its badge, `unread > 0 || unread_mentions > 0`. That is the server's unread-topic count (D1), set only from authoritative sources (section 7).
+  - While the pane shows the forum, it also counts as unread when its copy shows an unread topic.
+  - So a topic marked with a dot isn't hidden behind a badge whose refresh is still pending.
+- **A topic:** `UnreadMark::of(topic) != UnreadMark::None`.
+  - The server's count when it is above 0.
+  - A dot for `NewSince` with a count of 0.
+  - Nothing for `ReadSince`, because it was just read here.
+  - The count itself is never adjusted (section 6.4); freshness only decides what shows.
+
+**Membership.** Each view has a base predicate:
+- a tab's rule (section 17.2);
+- a folder's `ChatFolder::contains`;
+- or the archive's peer folder.
+
+`ChatFolder::contains` keeps its precedence:
+1. An explicit exclusion removes the chat.
+2. Otherwise, an explicit inclusion (pinned or included) admits it.
+3. Otherwise, the kind flags decide, followed by the "exclude muted", "exclude read" and "exclude archived" flags.
+
+`contains` gains a `read_waived: bool` argument. It waives only `EXCLUDE_READ`; every other step runs as before. The menu of part C computes its ✓ marks with `read_waived = false`, so folder editing is unchanged.
+
+- **With the filter off,** a chat is shown iff its base predicate holds, with nothing waived.
+- **With the filter on,** a chat is shown iff:
+  - its base predicate holds, with `read_waived = true` for a kept chat and `false` otherwise; and
+  - it is unread or kept.
+
+So a kept chat outlives only its own reading:
+- It stays when it becomes read, under the filter's unread test and under a folder's "exclude read".
+- Any other change removes its row only when the resulting base predicate fails:
+  - a new explicit exclusion;
+  - a removed inclusion, if the kind flags don't then admit the chat;
+  - a kind change;
+  - a mute or an archive move that a folder flag excludes;
+  - a move between peer folders for a built-in tab or the archive;
+  - leaving the loaded list.
+
+In All, the archive entry shows under the filter only while an archived chat is unread.
+
+**Kept chats and topics.** Kept rows let a list stay still while it is read through.
+- **What is kept:** a chat the user opens from the view while the filter is on, and a topic opened from inline rows while the filter is on.
+- **The open item.** The pane's chat and its open topic count as kept while they are open, whether or not they were opened under the filter. They are not stored for this; they follow the pane.
+  - An open chat that isn't listed (it has a window but is not among the loaded dialogs) has no row in any view, so the exception doesn't apply to it.
+  - An open topic that the copy doesn't hold has no inline row.
+- **Stored sets:**
+  - `kept: HashSet<ChatId>` holds only listed chats, so at most `MAX_DIALOGS`.
+  - `kept_topics: HashSet<TopicId>` belongs to the pane's forum and holds only ids in its copy, so at most `MAX_TOPICS_PER_FORUM + 1`.
+- **Maintenance.** After every list event that can drop chats (`DialogsReset`, and a `ChatFolders` that removes the shown folder), `kept` is intersected with the listed ids. After every topic event that can drop topics (`TopicsReset`, `TopicRemoved`; `ForumInvalidated` clears it), `kept_topics` is intersected with the copy's ids. Both maintenance passes are linear in the list.
+- **Clearing.** Both sets are cleared when the filter is turned on or off, when the tab changes, or when the archive is entered or left. `kept_topics` is also cleared when the pane leaves the forum.
+- A chat read on another device that isn't kept leaves the filtered view at once.
+
+**Paging.** Only loaded chats are known: at most 1,000, as for folders and the archive.
+- The filter doesn't change dialogs paging. The view's own row count drives `seen`, so a sparse view asks for further pages, as folder views do today, up to `MAX_DIALOGS`.
+- **Empty view, more pages exist:** "No unread chats among those loaded".
+- **Empty view, every page loaded:** "No unread chats".
+- **Topics:** only the copy's loaded topics are known. The More row (section 17.3) shows when the badge says there are more.
+
+### 17.5 First-unread positioning and the divider
+
+**The read pointer** is the confirmed one (section 17.6.1). It moves only on server evidence: snapshots, server read updates, and the `max_id` of a read the server accepted.
+- **Chat:** `ChatSummary.read.read_inbox_max`. Forums don't use it: their reads are per topic.
+- **Topic:** `Topic.read_inbox_max`.
+
+An admitted read that hasn't succeeded never moves it.
+
+**What the app captures at open.** When a thread opens (`select_chat` for a chat that isn't a forum, or `select_topic`), the app takes `Unread { after: MsgId }` from its copy:
+- **Chat:** the confirmed pointer, when the displayed count is above 0.
+- **Topic:** its pointer, when its mark isn't `None`.
+- **Nothing** when nothing is unread.
+
+The capture stays fixed while the pane shows the thread.
+
+**How the thread opens.**
+- **Nothing captured:** `OpenThread`, as today.
+- **Captured:** `OpenThreadAt { thread, after }`.
+  - Only a **server page fetched for this open** can prove where the first unread message is:
+    - a server tail whose oldest message is at or below `after`, or that holds the whole history;
+    - or an `Around(after)` page.
+  - No retained window and no cached history seeds or shortcuts an anchored open (section 17.6.5).
+  - The count never decides it, because outgoing messages can sit between unread ones.
+- **Around page:** core answers with `History { dir: Around, .. }`.
+  - It is a detached window with up to `AROUND_CONTEXT` messages at or below `after` and the rest of a page above it.
+  - It behaves like a Stage 1 window scrolled away from the tail: "Jump to latest" is offered, `LoadNewer` pages towards the tail, and `LoadOlder` works as usual.
+  - Reaching the tail restores cache continuity (section 17.6.6).
+- **Failure (best effort):** `LoadEnded { History { thread, dir: Tail | Around }, error }` for the anchored open (offline, a flood wait, any error).
+  - The app falls back to `OpenThread`, so the cached tail shows if there is one, with the divider only if its position is in it.
+  - Offline, the read position may not be reachable.
+
+**The read gate.** Each view of the open thread (`ViewGen`) has one state:
+
+```rust
+enum ReadGate {
+    AwaitingHistory,                     // no History of this view yet
+    AwaitingPaint { view: ViewGen },     // positioned; waiting for the first paint
+    Ready,                               // MarkRead allowed (Stage 1's rule)
+}
+```
+
+- **Opening** a thread (any path, including the fallback) starts at `AwaitingHistory`. So does a new view of it (`ThreadInvalidated`, a `Tail` with a new view).
+- **The view's first `History` moves it to `AwaitingPaint { view }`**, whatever the path:
+  - with the divider's message in the window, the list is first scrolled so the divider row is at the top of the viewport (`ListState::scroll_to`, follow mode off);
+  - otherwise, including the tail fallback, the list keeps its tail position, and no scroll is needed.
+- **The after-paint callback** moves it to `Ready` only if the gate is still `AwaitingPaint` for the same `view` and the window's view is still that view. Any other callback does nothing.
+- **Closing** the thread, switching panes or replacing the view before the paint discards the state, and no read is sent for it.
+- **Only in `Ready`** does `frame_commands` send `MarkRead`: the highest displayed message while the window is active. `read_sent` starts at `after`, so frames showing only the read context send nothing.
+- In an anchored window that is a partial read, and the chat's count then comes from the server (section 17.6.2).
+- `ViewingTail(Some)` is still sent only when the window is attached and its end is on screen, so incoming messages keep counting as unread until the user reaches the tail.
+
+**Positioning without the divider in view.** If the window holds no message above `after` (the best-effort fallback, or an `Around` page with nothing above the anchor, which core answers with the tail), the thread sits at the tail. The divider appears if the user scrolls up to it, and nothing loads by itself.
+
+**The divider** marks the **read position** (decision D10). It is a full-width band like the day separator: the label "New since you last read" in quiet ink with a hairline rule, and no colour (brand rule 2).
+- **Where:** immediately after the anchor, before the first message whose id is above `after`, incoming or outgoing. Every window that holds a message above `after` therefore has a divider.
+- **Fixed:** it doesn't move while the pane shows the thread. New messages arrive below it, and reads, here or elsewhere, don't move it.
+- **Removed** when the pane leaves the thread, or when the user sends into the thread.
+- **Late divider:** if nothing was captured at open, it appears once, when an incoming message arrives while the tail isn't being viewed (the window is inactive or scrolled up). `after` is then the newest message before it. There is at most one divider per open.
+- **Rebuild or invalidation:** the window is replaced by the tail, and core drops the anchor as it does for detached windows. The divider stays if the new window holds a message above `after`.
+
+### 17.6 Core and backend changes
+
+**17.6.1 Read state: server evidence only.** A chat's unread count and read pointer are one confirmed value under the unread stamp of `Dialogs::guard` (`store/dialogs/fields.rs`):
+
+```rust
+pub struct ReadState { pub unread: u32, pub read_inbox_max: MsgId }
+```
+
+- `ChatSummary` carries it in place of the bare `unread` (`summary.read`).
+- The guard's `Current` and `Unlisted` carry the pair, never one half (task 8 round 4).
+
+**What changes it.** Only server evidence, and core never computes a count from a read:
+- **Snapshots** (dialogs pages, `peer_dialogs`):
+  - when the unread group applies, in dispatch order as today, they set `unread`;
+  - they raise the pointer to `max(current, snapshot)`. The server's pointer never moves back, and a successful read below proves it is at least that high.
+- **Server read updates:** a chat-level `ReadInbox` sets `unread = still_unread` at the clock's value and raises the pointer to its `max_id`. `Update::ReadInbox` gains `max_id: MsgId`, mapped from both read updates; pointers are mapped with `max(0)`.
+- **A successful read** of `max_id = N` (task 9's completion, under the current `ClientGen`):
+  - It proves only that the server's pointer is at least N. Core raises the pointer to `max(pointer, N)` and stamps nothing.
+  - It proves no count. The chat or forum is marked badge-dirty, and section 7's `peer_dialogs` refresh, dispatched after the read, brings the server's pair (17.6.2).
+- **Counted live messages** increment `unread`, as Stage 1 does. That is unchanged and is the only local change to the count.
+
+**Pending reads have one source:** `ReadMark` in `actor/reads.rs`, which holds the intent (`max_id`) apart from the attempt in flight (`flight`).
+- No second record exists in the dialogs.
+- **A completion settles only its own `max_id`.** If the intent has grown since (read 100 in flight, 150 admitted), success for 100 raises the pointer to 100. The intent for 150 stays and goes at the next flush (`read_settled`, as today).
+- **A terminal rejection** settles that attempt's intent as today and changes no `ReadState`.
+
+**The display overlay.** Stage 1 drops a chat's badge to 0 as soon as the read is admitted. That stays, but only as a display overlay; it is never written into `ReadState`.
+- `ChatSummary` gains `reading: Option<MsgId>`: the `max_id` of the thread's outstanding `ReadMark`, or `None`.
+- Core sets it from `reads` whenever a mark is admitted, grows or settles, and emits `ChatBumped`. It is unguarded, not cached, and not part of any snapshot.
+- **It is a projection, re-derived on every install.** Whenever a summary is installed, replaced or emitted (first-page merge, page append, `peer_dialogs` refresh, cached chats at bootstrap, re-admission of an unlisted chat), core sets `summary.reading = outstanding_read(summary.id)` from `reads`. An incoming snapshot never supplies or clears it, so a page arriving during a retry delay can't expose the old count while a covering intent exists.
+- **Implementation:** `#[serde(skip)]` on the field (default `None`), so it can't be persisted; reducers and snapshot guards use `ReadState` only.
+- **The displayed count** is 0 while `reading ≥ last_id` (the read covers every known message), and `read.unread` otherwise.
+- So a newer message, a partial read, a rejection or a completion each show the confirmed count again, until the refresh brings the server's.
+- `mark_read` no longer calls `set_unread(.., 0)` at admission.
+
+**Cache schema 7:** postcard rows are positional, so 6→7 drops the cached chat list, as 4→5 and 5→6 did. Messages are kept. Cached rows carry `ReadState`; `reading` starts as `None`.
+
+**Fake:**
+- Each scripted chat keeps a read pointer, moved by `read_history` and by a pushed `ReadInbox`.
+- Its `unread` is the number of incoming messages above the pointer, so a refresh after any read returns a consistent pair.
+- It can refuse a read terminally, so the rejection path is testable.
+
+**17.6.2 Refresh after reads.**
+- Every successful read of a chat that isn't a forum, covering or partial, marks it badge-dirty (section 7), as topic reads already mark their forum.
+- `SHOWN_SLOTS` now serves the chat the pane shows, forum or not. Today it serves the shown forum, which is the same chat whenever the pane shows a forum. The open chat's count therefore trails by about one `PEER_CALL_INTERVAL`.
+- There is no new scheduler and no new rate.
+
+**17.6.3 Topics.** Topic counts stay server values only. A successful topic read of `max_id = N` does two things:
+- it raises the retained topic's `read_inbox_max` to `max(pointer, N)` and emits `TopicBumped`;
+- it keeps task 9's `ReadSince` trigger, so the existing by-id refetch brings the server's count.
+
+A rejected topic read changes nothing. A snapshot also raises the pointer by the max, under the unread group's stamp (section 6.4).
+
+**17.6.4 History anchored at an id:** `HistoryQuery::Around(MsgId)`.
+- **Bounds:**
+  - `0 < limit ≤ 100` (Telegram's history maximum) and `0 ≤ AROUND_CONTEXT < limit`. Core uses `limit = PAGE = 50` and `AROUND_CONTEXT = 10`, checked by a `const` assertion.
+  - The backend refuses other values with `Rejected`, without calling.
+  - The anchor must be `≥ 0`. A negative `after` in `OpenThreadAt` is answered `Rejected` at admission.
+- **No successor.** The successor is `anchor.0.checked_add(1)`. `None` (the anchor is `i32::MAX`) means no message can be newer, so core opens the tail instead (17.6.5) and never calls `Around`.
+- **Grammers:** one call, through `history_request` (`calls.rs`), for both `getHistory` and `getReplies`.
+  - The offsets are `offset_id = successor`, `add_offset = -(limit - AROUND_CONTEXT)`, `min_id = max_id = 0`.
+  - That returns up to `limit - AROUND_CONTEXT` messages above the anchor and up to `AROUND_CONTEXT` at or below it (live check L1).
+  - An anchor of 0 (nothing read) gives the thread's oldest messages.
+  - The response gets the same size checks as other history pages.
+- **Never the tail.** The page's `has_more` isn't trusted to say the tail was reached. Core opens the window detached (`has_newer = true`), and `LoadNewer` (`After`, Stage 1's rule) finds the tail. `has_older` starts true, as for every window.
+- **Fake:** the same bounds, the same successor rule and the same slice over its normalized history. Messages above the anchor are taken oldest first, up to `limit - AROUND_CONTEXT`; messages at or below it are taken newest first, up to `AROUND_CONTEXT`. Invalid bounds are refused the same way.
+
+**17.6.5 `Command::OpenThreadAt { thread, after: MsgId }`.** It is account-scoped; `Debug` shows the key and the id.
+- **Refusals and close:** the same refusals as `OpenThread` (a whole-chat key of a known forum, task 7), plus a negative `after`, and the same close of the previous thread.
+- **No shortcut.** No retained window and no cached history is used. Applying an ordinary tail to a retained window (`on_tail`, `apply.rs`) could drop the boundary, so only a page fetched for this open proves it.
+- **Proof by the server tail:**
+  - The window is invalidated and reopened under a new `ViewGen`. No seed is shown.
+  - The view's single-flight load is a server `Tail` (`TailVia::Server`, with the usual `ContinuityMark`).
+  - **It proves coverage** if its covered range reaches `after` (`covered.oldest ≤ after`), or if it is the whole history (`!has_more`). It is then applied exactly as `on_tail` applies an open's tail: `ReconcileTail`, continuity and `Reconciled`.
+  - **It doesn't prove coverage** otherwise. It is then dropped unapplied: no window change and no cache write. The same view's load continues as `Around(after)`.
+  - **No successor** (17.6.4): the server tail is applied as an ordinary open's tail, whatever it covers.
+- **The Around page:**
+  - It fills the empty window through a new `Windows::anchor(thread, view, page)`, which sets `has_newer`.
+  - It is emitted as `History { dir: HistoryDir::Around, has_more: true }`.
+  - A page with no message above `after` (the unread messages were deleted, or the pointer was stale) is dropped, and the view's tail is applied instead: a second `Tail` load, applied whatever it covers.
+- **The cache, until the tail is reached:**
+  - Nothing is read, and nothing is written.
+  - The window isn't `cache_contiguous`, so the existing gates (`reconcile`, live write-through, pages served from the cache) keep it out. No new cache path exists.
+  - This restriction ends explicitly at 17.6.6.
+- **Refresh, reconcile, rebuild, fence:**
+  - A light refresh skips detached windows (`merge_tail`).
+  - Reconcile and rebuild invalidate the window and reload the tail, dropping the anchor.
+  - A fence defers the command like `OpenThread`, and its lift loads the tail.
+- **Failure:** the anchored open's load (`Tail` or `Around`) ends with `LoadEnded { History { thread, dir }, error }`. The app's fallback is in section 17.5.
+
+**17.6.6 Returning to the live tail restores continuity.** Today a detached window that pages back down attaches without regaining `cache_contiguous`:
+- `LoadNewer` only appends;
+- a light refresh's merge returns early for a detached window, and an attached but non-contiguous one only merges (`merge.rs:96-99`);
+- so nothing restores continuity. This is task 7's progress gap (section 16).
+
+The rule:
+- **Trigger.** When a `Newer` page attaches the open thread's window (`has_more = false`) while the window isn't `cache_contiguous`, core requests a server tail of that thread. It is single-flight with the thread's history loads, and its `ContinuityMark` is taken at dispatch.
+- **Restoring merge.** The reply is applied by a new `TailMode::Restore`, which keeps the view and its viewport:
+  - **Diff:** the same diff as `merge_tail` (deletions, edits, appended messages).
+  - **Cache:** a `CacheCmd::ReconcileTail { thread, messages, from }` from the page's authoritative range, exactly as `on_tail` builds it.
+  - **Continuity:** `set_cache_contiguous(thread)`, **only if** `may_restore(thread, since)` holds and the `ReconcileTail` was issued.
+  - **A gap** (`tail_diff` reports one) falls back to `on_tail`. That replaces the view, so the viewport is lost; the read gate restarts for the new view.
+- **Scheduling and safety** (review round 2 guidance):
+  - **Start:** the restoring tail starts only after the attaching `Newer` load has released the thread's single-flight slot (`history_busy`).
+  - **Checks:** its reply passes the same stale-view check as every history reply (`view_gen`). If the window is detached again by then, the restore is dropped: the next attaching page asks again.
+  - **User loads** that arrive while it runs are deferred through the existing mechanism (`loads::MAX_DEFERRED`), as for any history load.
+  - **Live messages** that cross it are handled as `on_tail` handles them: messages above the page's authoritative top are kept on top, and they are not written as contiguous unless `may_restore` holds.
+- **Never otherwise.** `cache_contiguous` is never set directly by attaching, by `Around`, or by a `Newer` page.
+- This applies to every window that pages back to the tail, Stage 1's scrolled-back windows included. Each return then costs one extra tail call.
+- This is where the anchored window's cache restriction (17.6.5) ends.
+
+**17.6.7 Unchanged:** topic lists and their caps, drains and rates; the backend calls (no new one); `ChatFolder` apart from the `read_waived` argument (section 17.4); the folder writes; `HistoryDir` gains `Around`, and nothing else in `Event` changes.
+
+### 17.7 Budgets and bounds
+
+| What | Bound | Notes |
+|---|---|---|
+| Sidebar rows (cached descriptors) | `MAX_DIALOGS` + archive entry + `INLINE_TOPICS` + open topic + one More or pending row | ids only, resolved at render |
+| Inline topic rows | `INLINE_TOPICS = 8`, plus the open topic | only for the pane's forum |
+| Kept chats (filter) | ≤ `MAX_DIALOGS`: only listed ids, intersected after every reset | cleared on filter, tab and archive changes |
+| Kept topics (filter) | ≤ `MAX_TOPICS_PER_FORUM + 1`: only ids in the copy, intersected after resets and removals | cleared on filter and tab changes, and when the pane leaves the forum |
+| Read gate | one state per open view | discarded with the view |
+| Divider | one `after` per open pane | dropped with the pane |
+| Read overlay | `reading: Option<MsgId>` per listed row, mirrored from `ReadMark` (≤ `MAX_READS`) | no second record; not persisted |
+| Sidebar file | ≤ 128 bytes read, two lines | defaults on anything unexpected |
+| Around page | `limit = PAGE = 50`, `AROUND_CONTEXT = 10`; valid `0 < limit ≤ 100`, `0 ≤ context < limit` | same response checks as history pages |
+| Anchored windows | ordinary windows: `MAX_WINDOWS = 8`, `MAX_STORE_BYTES` | Stage 1 LRU |
+| Coverage tail and restoring tail | one tail per anchored open (plus `Around` when it doesn't prove coverage), and one per return to the tail | single-flight per thread |
+| Read state | `ReadState` replaces `unread`: +4 bytes per dialog row and per unlisted record | ≤ `MAX_DIALOGS` each |
+| Refreshes after reads | section 7's dirty bits (≤ `MAX_DIALOGS`) and `peer_dialogs` rate; topics through the existing by-id drain | no new queue or call |
+| Topic requests | none new | inline rows read the shown list |
+
+**Per-render cost.**
+- The sidebar's rows are computed today on every call of `rows()` and `row_count()`, several times a frame. With tabs, the filter and inline rows, they are cached as owned descriptors.
+- The cache is recomputed when the list, the folders, the view, the pane, the topic copy or the kept sets change. Expired mutes are rechecked at most once a minute.
+- **Unread counts per tab are out of scope** for this reason: `ChatFolder::contains` is linear in a folder's peers (≤ 512). Counting every tab on each change is up to 64 folders × 1,000 chats × 512 peers.
+
+### 17.8 Tests
+
+The owner's test policy holds here: a small set of behavioural tests per task, a property where one fits, no test per review finding, and no test that repeats what a property already checks.
+
+- **Task 13, tabs:**
+  - a property over random lists: Private, Groups and Forums partition All's chats and keep core's order;
+  - the strip's order;
+  - a removed folder falls back to All;
+  - the sidebar file: round trip, garbage gives the defaults, and a stored folder is restored at the first `ChatFolders` or dropped;
+  - Ctrl+Tab cycles the tabs (app test).
+
+  The existing folder tests stay as they are, apart from the `Shown` rename.
+- **Task 14, inline topics** (app tests):
+  - selecting a forum shows at most 8 topics, then More;
+  - an open topic beyond the first 8 is shown;
+  - collapsing and expanding leave the pane alone;
+  - a topic row opens its topic;
+  - `ForumInvalidated` leaves the pending row;
+  - `TopicRemoved` removes the row;
+  - rendering inline rows sends no command (the admitted commands are recorded).
+- **Task 15, unread filter:**
+  - a property over random lists, folders, kept sets and events (resets, kind changes, archive moves, folder edits):
+    - every shown chat satisfies its base rule with only read-based exclusions waived, and is unread or kept;
+    - every unread chat whose base rule holds is shown;
+    - a chat that an explicit exclusion names, or whose kind or peer folder fails the base rule, is never shown;
+    - the kept sets hold only listed ids (or ids in the copy) after every event;
+  - a chat read inside the filter stays until the filter is turned off, including in a folder that excludes read chats;
+  - a remote read of a chat that isn't kept removes it;
+  - the pane's forum with a dot topic stays.
+- **Task 16, core read state:**
+  - a property over random interleavings of admissions (growing intents), flushes, completions (success, retry, rejection) in any order, snapshots, server read updates and counted messages, checked against a reference model:
+    - `ReadState`'s pointer always equals the max of the server evidence applied and the `max_id`s of successful reads;
+    - its count always equals the last server value accepted under the stamp rule, plus Stage 1's counted increments since; no read ever writes a count;
+    - a completion settles only its own `max_id`, and an intent that grew while it flew stays outstanding;
+    - when the whole intent has settled (the `ReadMark` is gone), `reading` is `None` and the displayed count is `read.unread`;
+    - while an intent covers `last_id`, the displayed count is 0, including after the row is replaced by a page or refresh, or re-admitted from unlisted (row replacement and re-admission are transitions of the same property);
+  - mapping: `read_inbox_max_id` and both read updates' `max_id`;
+  - actor:
+    - every successful read schedules one `peer_dialogs` refresh, and its result sets the server's pair;
+    - a covering read that completes after newer server evidence leaves that evidence in place;
+    - a terminally rejected read shows the confirmed count again;
+    - a successful topic read raises the topic's pointer and is refetched by id;
+  - cache 6→7.
+- **Task 17, anchored history:**
+  - the grammers request fields for `Around`, for both calls, at anchors 0, a middle id and `i32::MAX` (no call);
+  - a fake contract case with the same bounds;
+  - actor:
+    - a retained attached window is ignored, and the open is proven by a server page;
+    - a server tail that proves coverage is applied with continuity;
+    - one that doesn't is dropped unapplied, and `Around` follows;
+    - an anchored window's pages leave the disk cache unchanged until it reaches the tail (its contents are compared before and after);
+    - reaching the tail issues one restoring tail, restores continuity, and keeps the view; then a live message is written through;
+    - a restoring tail dispatched before a loss of continuity doesn't restore it;
+    - a light refresh leaves a detached window alone;
+    - a failure ends with `LoadEnded`;
+    - an `Around` page with nothing above the anchor falls back to the tail.
+- **Task 18, divider and read gate** (app tests):
+  - the divider sits right after the anchor, before the first message above `after`, outgoing ones included;
+  - a property over random event sequences (`History` of current and stale views, after-paint callbacks of either view, closes, pane switches, invalidations): `MarkRead` is admitted only in `Ready` for the current view, and never after a close or switch before the paint;
+  - the anchored and the tail-fallback paths both reach `Ready`;
+  - `read_sent` starts at `after`;
+  - the fallback to `OpenThread` on `LoadEnded`;
+  - the divider goes on a send and on a pane change;
+  - a late divider appears for a message that arrives while the window is inactive.
+- **Snapshots** (`--features snapshots`): `tabs-day/night.png`, `inline-topics-day/night.png` and `unread-divider-day/night.png`. The demo data gains chats and a topic with more than 50 unread messages, some with outgoing messages between them and one with only outgoing messages above the pointer, so `cargo dev` exercises the anchored path.
+
+### 17.9 Ordered tasks and acceptance criteria
+
+These continue section 12 and run in this order, after task 11 and before task 12. Each is one implementation and review cycle on `agent/stage-2`, recorded in section 17.13, and ends with section 12's checks.
+
+13. **App: built-in tabs.** `Tab` and `View`, the matching rules, the strip with "All" once, the sidebar file, the keyboard chords for tabs and the toggle (the toggle is wired in task 15), and the scroll ids.
+    *Done when:*
+    - the task 13 tests pass, and the existing folder and archive tests pass apart from the rename;
+    - in `cargo dev`, the strip shows All, Private, Groups and Forums before the demo folders;
+    - a restart restores the tab.
+14. **App: inline forum topics.** The owned row descriptors and the row cache, the new `SidebarRow` variants, the expansion state and glyph, the selection marks, the More and pending rows, and the Option+Cmd+arrow chords.
+    *Done when:*
+    - the task 14 tests pass;
+    - in `cargo dev`, selecting a demo forum shows its pinned topics first under its row;
+    - switching topics from the sidebar is instant;
+    - no topic request is sent that the pane wouldn't send without inline rows.
+15. **App: the unread filter.** The unread functions, membership with the read-only waiver, `ChatFolder::contains`'s `read_waived` argument, kept chats and topics with their maintenance, the copy, and the archive entry under the filter.
+    *Done when:*
+    - the task 15 tests pass;
+    - in `cargo dev`, reading through the filter keeps the list still until the filter is turned off.
+16. **Core: read state from server evidence.**
+    - `ReadState` under the unread stamp, with the pointer raised by the max, and `ReadInbox.max_id`.
+    - The `reading` overlay from `ReadMark`, with no zeroing at admission.
+    - A refresh after every successful read, the shown slot for the pane's chat, and the topic pointer on successful reads.
+    - The fake pointer and rejection, and cache schema 7.
+
+    *Done when:*
+    - the task 16 tests pass;
+    - the existing badge, guard and read tests pass. Tests that read `unread == 0` after admission read the displayed count instead.
+17. **Core and backend: anchored history and tail restoration.** `HistoryQuery::Around` with its bounds in grammers and the fake, `OpenThreadAt` proven only by a server page, `Windows::anchor`, `HistoryDir::Around`, the fallbacks, `TailMode::Restore` with the scheduling rules of section 17.6.6, and a contract case.
+    *Done when:*
+    - the task 17 tests pass;
+    - the existing history, cache-continuity and refresh tests pass unchanged, apart from the extra restoring tail where a window pages back to the tail.
+18. **App: first-unread positioning, the read gate and the divider.** The capture, `OpenThreadAt`, `ReadGate`, positioning, the divider and its rules, and the fallback.
+    *Done when:*
+    - the task 18 tests pass;
+    - in `cargo dev`, a chat with 120 unread messages and interleaved outgoing ones opens at the divider;
+    - reading half of them lowers the chat's badge to the fake's remaining count within one `peer_dialogs` round trip;
+    - "Jump to latest" reaches the tail;
+    - a topic with many unread messages opens the same way.
+
+**Task 12 grows** by the checks of section 17.11 and runs last, after task 18. Its "done when" is unchanged: every item checked off in the roadmap, and any resulting code change landed as its own reviewed task.
+
+### 17.10 Risks
+
+1. **Count latency after reads.** After any read, the badge shows the confirmed count until the `peer_dialogs` refresh lands: about one `PEER_CALL_INTERVAL` for the pane's chat, and longer under load or flood waits (risk 4).
+   - The one exception is Stage 1's overlay, which shows 0 while a covering read is outstanding.
+   - A partial read keeps the old count until the refresh.
+   - The badge never shows a count the server didn't send or Stage 1 didn't count.
+2. **Opening an unread chat costs one or two calls before anything shows.** No retained window or cached history seeds an anchored open, so a thread with unread messages shows "Loading" for one round trip, and for two when the tail doesn't prove coverage. The owner accepted this for v1 (review round 2).
+3. **Offline is best effort.** Without a connection, an unread chat falls back to its cached tail, and the first unread message may not be reachable.
+4. **The confirmed pointer lags admitted reads.** A thread reopened before its read succeeds captures the older pointer, so the divider sits higher. A rejected read never moves the pointer.
+5. **Returning to the tail costs a call.** Every window that pages back to the live tail now costs one restoring tail (section 17.6.6). If that tail finds a gap, the view is replaced and the scroll position is lost.
+6. **One expanded forum** (D7). In the unread filter, other forums show their badges, not their unread topics.
+7. **Sparse views page eagerly.** A sparse filtered or folder view loads further dialogs pages up to `MAX_DIALOGS`, as folders already do.
+8. **Keyboard chords** may collide with system shortcuts or input methods on some setups (checked in task 12).
+9. **Row height.** Inline topic rows take a chat row's full height, so an expanded forum takes up to 10 rows of the sidebar.
+
+### 17.11 Live unknowns (added to task 12)
+
+- **L1: `Around` semantics** for `getHistory` and `getReplies` (`offset_id = anchor + 1` with a negative `add_offset`), including General under U1:
+  - an anchor of 0;
+  - an anchor whose message was deleted;
+  - sparse ids in a topic (other topics' messages between them);
+  - the beginning of history (fewer than `AROUND_CONTEXT` messages below);
+  - the end of history (fewer than `limit - AROUND_CONTEXT` above);
+  - histories where most messages are outgoing.
+
+  Confirm the split around the anchor in each case.
+- **L2:** what `dialog.read_inbox_max_id` holds for a forum, and whether `updateReadChannelInbox.max_id` arrives for forums. Both are unused for forums, but must not confuse the guard.
+- **L3: partial reads in chats.** After a partial `messages.readHistory` or `channels.readHistory`:
+  - `getPeerDialogs` reports `unread_count` as the incoming messages above the new pointer, and `read_inbox_max_id` as that pointer;
+  - another device sees the same.
+- **L4: partial reads in topics.** After a partial `messages.readDiscussion`:
+  - `getForumTopicsByID` reports the raised `read_inbox_max_id` and the remaining count;
+  - the forum's badge still counts the topic as unread.
+- **L5:** whether reading a chat clears `dialog.unread_mark` on the server (informs D8 later).
+- **L6:** `peer_dialogs` at its interval stays clear of flood waits with partial-read refreshes added during heavy reading (risk 4).
+- **L7:** the chords of section 17.2 under macOS system shortcuts and with Pinyin and Japanese IME active in the composer.
+- **L8: first-paint positioning on real data.**
+  - An anchored open shows the divider, right after the read position, at the top of the viewport before any `MarkRead` is sent.
+  - This holds with variable-height messages (long text, media chips), in both an active and an inactive window.
+  - It holds with only outgoing messages above the pointer.
+  - The tail fallback reaches `Ready` too.
+
+### 17.12 Decisions (2026-11-17)
+
+The lead accepted the proposed defaults (formerly open questions Q1–Q3):
+
+- **D7. One expanded forum:** only the forum the pane shows expands inline, reusing core's shown list with no new requests. Expanding several forums at once is a follow-up. It would need a second live forum in core, with more by-id drain traffic and a rule for which lists refresh.
+- **D8. Marked-unread chats** (`dialog.unread_mark`) are not modelled in v1. Clearing the mark is an account write (`messages.markDialogUnread`), so a marked chat would otherwise stay in the filter for good. Revisit with L5.
+- **D9. Built-in tabs:**
+  - Private holds people and bots (one-to-one chats).
+  - Groups holds basic groups and supergroups that aren't forums.
+  - Forums holds forums only.
+  - The three partition All.
+- **D10. The divider marks the read position** (lead, review round 2): it sits right after the pointer, before the first newer message, incoming or outgoing, labelled "New since you last read". Every window holding a message above the pointer has one.
+
+### 17.13 Review log
+
+#### Round 1 (verdict: needs rework; no P0/P1)
+
+| # | Finding | Resolution (v6.1) |
+|---|---|---|
+| 1 | P2: a local read raised the pointer at admission, snapshots took the max, and a terminally rejected read (`reads.rs`, which discards the intent) left the pointer advanced for good | Confirmed `ReadState { unread, read_inbox_max }` under one unread stamp, also in `Current` and `Unlisted`, set only by snapshots (dispatch order), server read updates and successful completions. Admitted reads are a separate `PendingRead { through, covers, counted_since }`, cleared on completion or rejection; a rejection restores the confirmed state (17.6.1, 17.6.3) |
+| 2 | P2: the read gate had no completion path when no scroll was needed | `ReadGate { AwaitingHistory, AwaitingPaint { view }, Ready }` per view. Every path (divider, tail, fallback) enters `AwaitingPaint` on the view's first `History`; the after-paint callback checks the gate's and the window's `ViewGen`; a close, switch or new view before the paint discards it with no read (17.5) |
+| 3 | P2: the unread count didn't prove the tail held the first unread message (outgoing messages interleave) | The count threshold is gone. `OpenThreadAt` uses the tail only when it proves coverage: the retained attached window, or a server tail whose covered oldest id is at or below the pointer (or the whole history). Otherwise `Around`. Cached history never seeds an anchored open; the offline fallback is best effort (17.5, 17.6.5) |
+| 4 | P2: returning to the live tail had no trigger to restore cache continuity, repeating task 7's progress gap | A `Newer` page that attaches a non-contiguous window requests a server tail with a fresh `ContinuityMark`, applied by `TailMode::Restore`: a merge that keeps the view, issues `ReconcileTail`, and sets continuity only under `may_restore`; a gap falls back to `on_tail`. The anchored window's cache restriction ends there; nothing sets `cache_contiguous` directly (17.6.6) |
+| 5 | P2: folder membership and kept rows contradicted each other, and a blind union could bring back excluded chats | Membership is the base rule with only read-based exclusions (the filter's test, a folder's "exclude read") waived for kept chats; explicit exclusions, kind changes, mute and archive rules and peer-folder moves always apply. The "identical with the toggle" claim is gone (17.4) |
+| 6 | P2: the kept sets had no maintenance rule | Kept ids are intersected with the listed ids (or the copy's ids) after every reset or removal; the open chat and topic are kept implicitly and need a row to show; both sets are cleared on filter, tab and archive changes, and topics also when the pane leaves the forum (17.4, 17.7) |
+| 7 | P2: `anchor + 1` was unchecked | `checked_add(1)`, with no successor meaning a tail open; `0 < limit ≤ 100`, `0 ≤ AROUND_CONTEXT < limit` with a `const` assertion; negative anchors refused; the fake follows the same rules (17.6.4) |
+| 8 | P3: cached sidebar rows borrowed `Topic` | Rows are owned descriptors (`Chat(ChatId)`, `Topic { forum, topic: TopicId }`, …) resolved at render (17.3) |
+| — | Also | L1 widened (zero and deleted anchors, sparse topic ids, both ends of history, mostly outgoing histories); L3/L4 now check partial reads in chats and topics; L8 checks first-paint positioning; trailing whitespace fixed |
+
+#### Round 2 (verdict: needs rework; no P0/P1)
+
+The read gate, `TailMode::Restore`, the kept sets, checked arithmetic and owned rows were closed. The first-paint delay is accepted as a v1 trade-off. The lead chose to simplify the read state instead of patching it.
+
+| # | Finding | Resolution (v6.2) |
+|---|---|---|
+| 1 | P2: overlapping attempts: read 100 in flight, 150 admitted, success for 100 confirmed too much | `PendingRead` is removed. `ReadMark` (`reads.rs`) is the only pending record, and a completion settles only its own `max_id` (17.6.1) |
+| 2 | P2: a covering read completing after newer server evidence installed a stale computed count | No read writes a count. Success raises the pointer by `max(pointer, N)`, stamps nothing, and marks the chat dirty for `peer_dialogs`; topics use the existing by-id refetch. Stage 1's 0 is a display overlay (`reading`, from `ReadMark`), never stored in `ReadState` (17.6.1–17.6.3) |
+| 3 | P2: the retained-window shortcut lost the boundary once `on_tail` replaced the window | The shortcut is removed. Only a server tail whose oldest message is at or below the pointer, or an `Around` page, proves an anchored open (17.5, 17.6.5) |
+| 4 | P2: an `Around` page could hold no incoming message above the anchor, so it had no divider | Decision D10: the divider marks the read position, before the first message above the pointer, incoming or outgoing ("New since you last read"); only a page with nothing above falls back to the tail (17.5, 17.12) |
+| 5 | P3: the membership wording overstated which changes remove a kept row | A change removes a row only when the resulting base predicate fails. `contains` keeps its precedence (exclusion, then inclusion, then flags), and `read_waived` waives only `EXCLUDE_READ`; part C's ✓ menu passes `false` (17.4) |
+| — | Also | `TailMode::Restore` scheduling: it starts after the attaching load releases its slot, keeps the stale-view and detached checks, defers user loads, and keeps `on_tail`'s handling of crossing live messages (17.6.6). Budgets, tests (a `ReadMark` settlement property), tasks, risks and L8 updated |
+
+#### Round 3 (verdict: one P2; no P0/P1)
+
+| # | Finding | Resolution (v6.3) |
+|---|---|---|
+| 1 | P2: summary replacement (first-page merge, append, refresh, bootstrap, re-admission) could clear the `reading` overlay while a covering intent was still outstanding | `reading` is a projection re-derived from `reads` on every install/replace/emit; snapshots never carry it; `#[serde(skip)]`; the task 16 property gains replacement and re-admission transitions (17.6.1, 17.10) |
+
+Notes accepted from the review: the overlay can make a count jump (0, then the confirmed value) by design (risk 1); `peer_dialogs` refresh after reads is coalesced and bounded by the scheduler, so task 16's "one refresh" means scheduling dirty work, not one request; the D10 divider can outlive a zero count and doesn't affect filter membership.
+
+#### Round 4 (verdict: pass; no P0–P2)
+
+The round 3 overlay fix is closed; the install-site list was checked against main 86d5e06 (first-page merge, append, `peer_dialogs` refresh, cache reset, other emissions).
