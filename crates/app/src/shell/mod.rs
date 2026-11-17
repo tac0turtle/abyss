@@ -43,7 +43,15 @@ actions!(
         /// Turns the sidebar's unread filter on or off (Cmd+Shift+U). Bound
         /// now so the chord is reserved; the filter handles it (plan
         /// section 17.4, task 15).
-        ToggleUnread
+        ToggleUnread,
+        /// Selects the sidebar's next chat or topic row (Option+Cmd+Down).
+        NextRow,
+        /// Selects the sidebar's previous chat or topic row (Option+Cmd+Up).
+        PreviousRow,
+        /// Shows the pane's forum's topics under its row (Option+Cmd+Right).
+        ExpandForum,
+        /// Hides them (Option+Cmd+Left).
+        CollapseForum
     ]
 );
 
@@ -59,6 +67,10 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
         KeyBinding::new("cmd-shift-u", ToggleUnread, None),
+        KeyBinding::new("alt-cmd-down", NextRow, None),
+        KeyBinding::new("alt-cmd-up", PreviousRow, None),
+        KeyBinding::new("alt-cmd-right", ExpandForum, None),
+        KeyBinding::new("alt-cmd-left", CollapseForum, None),
     ]
 }
 

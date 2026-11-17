@@ -1780,3 +1780,9 @@ The round 3 overlay fix is closed; the install-site list was checked against mai
 |---|---|---|
 | 1 | P2: tab actions ran while signed out and could rewrite the deleted sidebar file. P3: `StartupBlocked` deleted the preference; the tabs snapshot was missing | Both tab entry points require `SignedIn`; only `LoggingOut`/`LogoutIncomplete` delete the file, and a startup block keeps the in-memory choice; `tabs()` snapshot added (macOS-only, unverified here) |
 | 2 | Pass | — |
+
+#### Task 14: inline forum topics (1 round; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 | Pass. P3 follow-up: Option+Cmd+Up/Down selection doesn't scroll the marked sidebar row into view | Open follow-up (needs a per-view scroll handle). Also fixed in this task: a stale `Event::History { chat }` in the macOS-only snapshots.rs from task 1 |

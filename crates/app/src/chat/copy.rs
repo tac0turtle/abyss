@@ -108,6 +108,12 @@ pub(crate) const PINNED_TOPIC: &str = "pinned";
 pub(crate) const CLOSED_TOPIC: &str = "closed";
 /// In place of the composer in a closed topic the user may not post in.
 pub(crate) const TOPIC_CLOSED: &str = "This topic is closed.";
+/// The disclosure glyph of the pane's forum's sidebar row (plan section
+/// 17.2): its topics show under it, or are collapsed.
+pub(crate) const EXPANDED: &str = "▾";
+pub(crate) const COLLAPSED: &str = "▸";
+/// The sidebar row after a forum's inline topics when it has more.
+pub(crate) const MORE_TOPICS: &str = "More topics";
 
 /// Where a discarded draft of `thread` was written: a topic of the chat
 /// (titled `chat`), or the chat.

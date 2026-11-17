@@ -10,6 +10,7 @@ use abyss_core::api::{Command, HistoryDir, UserError, WindowState};
 use abyss_core::model::{ChatId, LocalId, ThreadKey, TopicId};
 use gpui::FollowMode;
 
+use super::inline::Inline;
 use super::messages::MessageWindow;
 use super::retry::AUTO_RESTART_GAP;
 use super::sends::Echo;
@@ -33,7 +34,8 @@ impl ChatShell {
     /// (`OpenForum`), any other chat its messages (`OpenThread`, which
     /// closes the previous thread and any forum view in core). Refused,
     /// the pane stays as it was. Selecting a forum whose topic is open
-    /// goes back to its list.
+    /// goes back to its list. Selecting a forum expands its sidebar row
+    /// (plan section 17.3, decision D7).
     pub(crate) fn select(&mut self, chat: ChatId, admit: Admit<'_>) -> Result<(), Refused> {
         if !self.list.get(chat).is_some_and(super::is_forum) {
             return self.show_thread(ThreadKey::whole(chat), admit);
@@ -42,10 +44,12 @@ impl ChatShell {
             Pane::Forum {
                 chat: c,
                 open: None,
-            } if c == chat => Ok(()),
-            Pane::Forum { chat: c, .. } if c == chat => self.back_to_topics(admit),
-            _ => self.show_forum(chat, admit),
+            } if c == chat => {}
+            Pane::Forum { chat: c, .. } if c == chat => self.back_to_topics(admit)?,
+            _ => self.show_forum(chat, admit)?,
         }
+        self.set_inline(Inline::Expanded);
+        Ok(())
     }
 
     fn show_thread(&mut self, thread: ThreadKey, admit: Admit<'_>) -> Result<(), Refused> {
@@ -57,8 +61,8 @@ impl ChatShell {
         if self.core == CoreState::Running {
             admit(Command::OpenThread(thread))?;
         }
-        self.set_pane(Pane::Thread(thread));
         self.topics = None;
+        self.set_pane(Pane::Thread(thread));
         self.show_window(Some(thread));
         Ok(())
     }
@@ -78,8 +82,8 @@ impl ChatShell {
         } else {
             None
         };
-        self.set_pane(Pane::Forum { chat, open: None });
         self.topics = Some(TopicList::new(chat, opening));
+        self.set_pane(Pane::Forum { chat, open: None });
         self.show_window(None);
         Ok(())
     }
@@ -117,8 +121,8 @@ impl ChatShell {
                 if self.core == CoreState::Running {
                     admit(Command::CloseForum(chat))?;
                 }
-                self.set_pane(Pane::Empty);
                 self.topics = None;
+                self.set_pane(Pane::Empty);
                 Ok(())
             }
             Pane::Empty | Pane::Thread(_) => Ok(()),
@@ -153,13 +157,16 @@ impl ChatShell {
         self.stale_pane().filter(|_| self.fix_retry.ready(now))
     }
 
-    /// The pane becomes `pane`. The kind core announced for the previous
-    /// chat (`KindChanged`) is forgotten with it.
+    /// The pane becomes `pane` (its topic list already set). The kind core
+    /// announced for the previous chat (`KindChanged`) and the expansion of
+    /// its sidebar row are forgotten with it.
     fn set_pane(&mut self, pane: Pane) {
         if pane.chat() != self.pane.chat() {
             self.shown_kind = None;
+            self.inline = Inline::Expanded;
         }
         self.pane = pane;
+        self.sync_inline();
     }
 
     fn back_to_topics(&mut self, admit: Admit<'_>) -> Result<(), Refused> {

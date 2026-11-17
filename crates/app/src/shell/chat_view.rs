@@ -5,7 +5,7 @@
 use std::ops::Range;
 use std::time::Instant;
 
-use abyss_core::model::{Body, ChatKind, ChatSummary, Message, MsgId};
+use abyss_core::model::{Body, ChatId, ChatKind, ChatSummary, Message, MsgId};
 use abyss_core::rich_text::RichText;
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, FontWeight, Hsla,
@@ -15,17 +15,23 @@ use gpui::{
 use jiff::tz::TimeZone;
 
 use super::session::Session;
+use super::topic_view::topic_row;
 use super::view::{centered, field, muted};
 use super::{Root, State};
+use crate::chat::inline::Inline;
 use crate::chat::list::{ArchiveEntry, ChatList, Shown, SidebarRow, Tab, View};
 use crate::chat::messages::MessageWindow;
 use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
-use crate::chat::{ChatShell, Composer, Pane, Row, copy, format, list as chat_list};
+use crate::chat::{ChatShell, Composer, Pane, Row, copy, format, list as chat_list, topics};
 use crate::ui::mark::mark;
 use crate::ui::theme::{self, Depth, Theme, Themes};
 
 const CHAT_ROW_HEIGHT: f32 = 56.;
+/// A chat row's avatar disc.
+const AVATAR_SIZE: f32 = 36.;
+/// A chat row's side padding (`px_3`).
+const ROW_PADDING: f32 = 12.;
 const SIDEBAR_WIDTH: f32 = 300.;
 const BUBBLE_MAX_WIDTH: f32 = 560.;
 /// Strength of the ink wash behind a bubble's sender band.
@@ -93,10 +99,12 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
     };
     // Below the last chat the column keeps that chat's tone, so the list
     // reads as one descent with no lighter gap under it.
-    let floor = match rows.last() {
-        Some(SidebarRow::Chat(c)) => depth_of(c.last_date, format::now(), &format::local_tz()),
-        Some(SidebarRow::Archive(_)) | None => Depth::NOW,
-    };
+    let floor = rows
+        .last()
+        .and_then(|&row| row_date(&session.shell, row))
+        .map_or(Depth::NOW, |date| {
+            depth_of(date, format::now(), &format::local_tz())
+        });
     let title = sidebar_title(shown, theme, cx);
     // After a core stop nothing can load: no Retry (round 37).
     let retry = (session.shell.list.gave_up() && !session.shell.is_stopped())
@@ -310,25 +318,118 @@ fn chat_rows(
     session.dialogs_seen(range.end.saturating_sub(1), window, cx);
     let theme = &Themes::of(window, cx);
     let (tz, now) = (format::local_tz(), format::now());
-    let selected = session.shell.pane().chat();
-    let rows = session.shell.list.rows();
+    let shell = &session.shell;
+    let marked = shell.marked();
+    let rows = shell.list.rows();
     rows.get(range.clone())
         .unwrap_or_default()
         .iter()
         .zip(range)
-        .map(|(row, ix)| match *row {
-            SidebarRow::Archive(entry) => archive_row(entry, ix, theme, cx),
-            SidebarRow::Chat(chat) => {
-                let row = ChatRow {
-                    chat,
-                    selected: selected == Some(chat.id),
-                    time: format::list_time(chat.last_date, now, &tz),
-                    depth: depth_of(chat.last_date, now, &tz),
-                };
-                row.render(ix, theme, cx)
+        .map(|(&row, ix)| {
+            let selected = marked == Some(row);
+            match row {
+                SidebarRow::Archive(entry) => archive_row(entry, ix, theme, cx),
+                SidebarRow::Chat(id) => {
+                    let Some(chat) = shell.list.get(id) else {
+                        return empty_row(ix);
+                    };
+                    let row = ChatRow {
+                        chat,
+                        selected,
+                        inline: shell.inline_of(id),
+                        time: format::list_time(chat.last_date, now, &tz),
+                        depth: depth_of(chat.last_date, now, &tz),
+                    };
+                    row.render(ix, theme, cx)
+                }
+                SidebarRow::Topic { topic, .. } => {
+                    let Some(topic) = shell.topics().and_then(|l| l.get(topic)) else {
+                        return empty_row(ix);
+                    };
+                    let id = ("inline-topic", u64::from(topic.id.get().cast_unsigned()));
+                    let ink = theme.text_on(depth_of(topics::activity(topic), now, &tz));
+                    let mark = if selected {
+                        ink.into()
+                    } else {
+                        transparent_black()
+                    };
+                    let row = topic_row(topic, id.into(), (&tz, now), theme, cx);
+                    inline_band(row, ink, mark)
+                }
+                SidebarRow::MoreTopics { forum } => {
+                    let depth = forum_depth(shell, forum, now, &tz);
+                    more_row(depth, theme, cx)
+                }
+                SidebarRow::TopicsPending { forum } => {
+                    let depth = forum_depth(shell, forum, now, &tz);
+                    let countdown = shell
+                        .topics()
+                        .and_then(|l| l.countdown(cx.background_executor().now()));
+                    let text = super::topic_view::placeholder(shell, countdown);
+                    let band = div().id("topics-pending").child(muted(text).text_xs());
+                    inline_band(band, theme.text_on(depth), transparent_black())
+                        .bg(theme.surface(depth))
+                }
             }
         })
         .collect()
+}
+
+/// When a sidebar row's thing last changed, for its tone: a chat's last
+/// message, a topic's activity. Rows without one sit at the surface.
+fn row_date(shell: &ChatShell, row: SidebarRow) -> Option<i64> {
+    match row {
+        SidebarRow::Chat(id)
+        | SidebarRow::MoreTopics { forum: id }
+        | SidebarRow::TopicsPending { forum: id } => shell.list.get(id).map(|c| c.last_date),
+        SidebarRow::Topic { topic, .. } => shell
+            .topics()
+            .and_then(|l| l.get(topic))
+            .map(topics::activity),
+        SidebarRow::Archive(_) => None,
+    }
+}
+
+/// The tone of a forum's More and pending rows: the forum row's own.
+fn forum_depth(shell: &ChatShell, forum: ChatId, now: i64, tz: &TimeZone) -> Depth {
+    shell
+        .list
+        .get(forum)
+        .map_or(Depth::NOW, |c| depth_of(c.last_date, now, tz))
+}
+
+/// A row whose chat or topic no longer resolves: blank for the one frame
+/// until the rows are recomputed (plan section 17.3).
+fn empty_row(ix: usize) -> Stateful<Div> {
+    div().id(ix).w_full().h(px(CHAT_ROW_HEIGHT))
+}
+
+/// An inline row under the pane's forum (plan section 17.3): as tall as a
+/// chat row, so the sidebar stays a uniform list, indented by the avatar's
+/// width, with a chat row's selection rule (`mark`: the ink or nothing).
+fn inline_band(row: Stateful<Div>, ink: Rgba, mark: Hsla) -> Stateful<Div> {
+    row.w_full()
+        .h(px(CHAT_ROW_HEIGHT))
+        .pl(px(ROW_PADDING + AVATAR_SIZE))
+        .pr(px(ROW_PADDING))
+        .flex()
+        .items_center()
+        .border_l_2()
+        .border_color(mark)
+        .text_color(ink)
+}
+
+/// "More topics": the full list shows in the pane. From a topic, it goes
+/// back to the list; on the list itself, it does nothing more.
+fn more_row(depth: Depth, theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
+    let band = div()
+        .id("more-topics")
+        .cursor_pointer()
+        .child(muted(copy::MORE_TOPICS).text_xs())
+        .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
+            root.with_session(|s, cx| s.more_topics(window, cx), cx);
+        }));
+    inline_band(band, theme.text_on(depth), transparent_black()).bg(theme.surface(depth))
 }
 
 /// The main list's entry for the archive: opens it in the sidebar.
@@ -381,6 +482,8 @@ fn archive_row(
 struct ChatRow<'a> {
     chat: &'a ChatSummary,
     selected: bool,
+    /// The pane's forum's expansion, shown by its disclosure glyph.
+    inline: Option<Inline>,
     time: SharedString,
     /// How far the chat has sunk: its surface darkens with its age.
     depth: Depth,
@@ -401,6 +504,7 @@ impl ChatRow<'_> {
         let title = div()
             .flex()
             .gap_2()
+            .children(self.inline.map(|inline| disclosure(inline, cx)))
             .child(
                 div()
                     .flex_1()
@@ -457,6 +561,26 @@ impl ChatRow<'_> {
     }
 }
 
+/// The pane's forum's disclosure glyph: "▾" while its topics show under
+/// it, "▸" while collapsed (no state by hue alone, brand rule 2). A click
+/// toggles them and stops there, so the row's own click doesn't select.
+fn disclosure(inline: Inline, cx: &mut Context<'_, Root>) -> Stateful<Div> {
+    let glyph = match inline {
+        Inline::Expanded => copy::EXPANDED,
+        Inline::Collapsed => copy::COLLAPSED,
+    };
+    div()
+        .id("forum-disclosure")
+        .flex_none()
+        .cursor_pointer()
+        .child(glyph)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |root, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            root.with_session(|s, cx| s.set_inline(inline.toggled(), cx), cx);
+        }))
+}
+
 /// A chat row's unread count.
 fn unread_badge(chat: &ChatSummary, surface: Rgba, ink: Rgba) -> Option<Div> {
     (chat.unread > 0).then(|| count_badge(chat.unread, chat.unread_mentions, surface, ink))
@@ -479,7 +603,7 @@ pub(super) fn count_badge(unread: u32, mentions: u32, surface: Rgba, ink: Rgba) 
 /// Initials on a faint disc of the row's text color (no images in Stage 1).
 fn avatar(chat: &ChatSummary, ink: Rgba) -> Div {
     div()
-        .size(px(36.))
+        .size(px(AVATAR_SIZE))
         .flex_none()
         .rounded_full()
         .bg(theme::faded(ink, 0.14))

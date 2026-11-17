@@ -160,6 +160,11 @@ impl TopicList {
         topic.closed && !self.can_post_closed
     }
 
+    /// Whether core said the server holds topics past the copy.
+    pub(crate) fn has_more(&self) -> bool {
+        self.has_more
+    }
+
     /// Whether core sent a copy to show (possibly empty).
     pub(crate) fn is_loaded(&self) -> bool {
         self.view.is_some()

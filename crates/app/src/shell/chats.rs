@@ -17,7 +17,8 @@ use super::bridge::SharedCore;
 use super::session::Session;
 use crate::chat::copy as chat_copy;
 use crate::chat::discarded::{Lost, Obsolete};
-use crate::chat::list::{Shown, Step, View};
+use crate::chat::inline::Inline;
+use crate::chat::list::{Shown, SidebarRow, Step, View};
 use crate::chat::sidebar_file::SidebarFile;
 use crate::chat::{Admit, ChatShell, Composer, Pane, Refused, Stale, format};
 use crate::ui::copy;
@@ -320,6 +321,35 @@ impl Session {
             topic: Some(topic),
         });
         self.navigate(to, window, cx, |s, admit| s.open_topic(topic, admit));
+    }
+
+    /// Option+Cmd+Down/Up: the next or previous chat or topic row of the
+    /// sidebar, selected as a click would select it.
+    pub(super) fn step_row(&mut self, step: Step, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if self.auth != AuthView::SignedIn {
+            return;
+        }
+        match self.shell.row_after(step) {
+            Some(SidebarRow::Chat(chat)) => self.select_chat(chat, window, cx),
+            Some(SidebarRow::Topic { topic, .. }) => self.select_topic(topic, window, cx),
+            _ => {}
+        }
+    }
+
+    /// The disclosure glyph and Option+Cmd+Right/Left: expands or
+    /// collapses the pane's forum's row, leaving the pane as it is.
+    pub(super) fn set_inline(&mut self, inline: Inline, cx: &mut Context<'_, Root>) {
+        if self.shell.set_inline(inline) {
+            cx.notify();
+        }
+    }
+
+    /// "More topics": the full list shows in the pane, so from a topic it
+    /// goes back to the list.
+    pub(super) fn more_topics(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if matches!(self.shell.pane(), Pane::Forum { open: Some(_), .. }) {
+            self.back_from_forum(window, cx);
+        }
     }
 
     /// "‹ Topics" and Cmd+[: from a topic to its forum's list, from a

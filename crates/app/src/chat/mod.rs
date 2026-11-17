@@ -11,6 +11,7 @@ pub(crate) mod demo;
 pub(crate) mod discarded;
 pub(crate) mod drafts;
 pub(crate) mod format;
+pub(crate) mod inline;
 pub(crate) mod list;
 pub(crate) mod messages;
 pub(crate) mod retry;
@@ -32,6 +33,7 @@ use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, Task, px};
 
 pub(crate) use self::commands::{Admit, Refused};
 use self::discarded::Obsolete;
+use self::inline::Inline;
 use self::list::ChatList;
 use self::messages::{Applied, Batch, MessageWindow, RowOp};
 use self::retry::{Backoff, earliest};
@@ -126,6 +128,9 @@ pub(crate) struct ChatShell {
     pane: Pane,
     /// The forum's topic list while the pane shows a forum (`Pane::Forum`).
     topics: Option<TopicList>,
+    /// Whether the pane's forum shows its topics under its sidebar row
+    /// (plan section 17.3); it goes with the list when the pane leaves it.
+    inline: Inline,
     /// Core removed the open topic (`TopicRemoved`): the pane goes back to
     /// the list ([`Self::stale_pane`]).
     open_removed: Option<(TopicId, TopicGone)>,
@@ -213,6 +218,7 @@ impl Default for ChatShell {
             list: ChatList::default(),
             pane: Pane::Empty,
             topics: None,
+            inline: Inline::Expanded,
             open_removed: None,
             shown_kind: None,
             fix_retry: Backoff::default(),
@@ -581,6 +587,7 @@ impl ChatShell {
                 }
                 if let Some(list) = self.topics.as_mut() {
                     list.apply(topics);
+                    self.sync_inline();
                 }
             }
             Event::KindChanged { chat, forum } => {

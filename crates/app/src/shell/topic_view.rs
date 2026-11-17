@@ -26,7 +26,7 @@ const DOT_SIZE: f32 = 8.;
 
 /// What the topic list shows instead of rows: a flood wait's countdown
 /// replaces "Loading topics…" while there is no copy.
-fn placeholder(shell: &ChatShell, countdown: Option<u64>) -> SharedString {
+pub(super) fn placeholder(shell: &ChatShell, countdown: Option<u64>) -> SharedString {
     match (shell.topics().filter(|l| l.is_loaded()), countdown) {
         (Some(_), _) => copy::NO_TOPICS.into(),
         (None, Some(left)) => copy::topics_flood(left),
@@ -162,21 +162,22 @@ fn topic_rows(
         .unwrap_or_default()
         .iter()
         .zip(range)
-        .map(|(topic, ix)| topic_row(topic, ix, (&tz, now), theme, cx))
+        .map(|(topic, ix)| topic_row(topic, ix.into(), (&tz, now), theme, cx))
         .collect()
 }
 
 /// A topic: the neutral glyph (owner decision D3), its title with closed
 /// and pinned marks and its time, then its last message and unread mark.
-/// Its tone sinks with its age, like a chat row.
-fn topic_row(
+/// Its tone sinks with its age, like a chat row. The sidebar's inline rows
+/// are these too.
+pub(super) fn topic_row(
     topic: &Topic,
-    ix: usize,
+    id: ElementId,
     (tz, now): (&TimeZone, i64),
     theme: &Theme,
     cx: &mut Context<'_, Root>,
 ) -> Stateful<Div> {
-    let id = topic.id;
+    let topic_id = topic.id;
     let depth = depth_of(topics::activity(topic), now, tz);
     let (surface, ink) = (theme.surface(depth), theme.text_on(depth));
     let tag = |text: &'static str| muted(text).text_xs().flex_none();
@@ -211,7 +212,7 @@ fn topic_row(
         )
         .children(unread_mark(UnreadMark::of(topic), surface, ink));
     div()
-        .id(ix)
+        .id(id)
         .w_full()
         .h(px(TOPIC_ROW_HEIGHT))
         .px_3()
@@ -222,7 +223,7 @@ fn topic_row(
         .text_color(ink)
         .cursor_pointer()
         .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
-            root.with_session(|s, cx| s.select_topic(id, window, cx), cx);
+            root.with_session(|s, cx| s.select_topic(topic_id, window, cx), cx);
         }))
         .child(glyph(ink))
         .child(

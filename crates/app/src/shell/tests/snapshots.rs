@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use abyss_core::api::{AuthState, Event, HistoryDir};
-use abyss_core::model::ChatId;
+use abyss_core::model::{ChatId, ThreadKey};
 use abyss_core::store::ViewGen;
 use gpui::{
     AnyWindowHandle, AppContext, HeadlessAppContext, Modifiers, MouseMoveEvent, PlatformInput,
@@ -151,7 +151,7 @@ impl Shot {
         let messages = history.remove(&SHOWCASE).unwrap_or_default();
         let start = messages.len().saturating_sub(TAIL);
         self.core_says(Event::History {
-            chat: SHOWCASE,
+            thread: ThreadKey::whole(SHOWCASE),
             view: ViewGen(1),
             dir: HistoryDir::Tail,
             messages: messages.into_iter().skip(start).collect(),
@@ -254,6 +254,62 @@ fn tabs(dir: &Path) -> Result<()> {
     shot.save(Mode::Night, "tabs-night.png")
 }
 
+/// The demo forum shown in the pane, its topics under its sidebar row
+/// (plan section 17.3), pinned first, with one of them open.
+fn inline_topics(dir: &Path) -> Result<()> {
+    use abyss_core::model::TopicOrder;
+    use abyss_core::store::TopicsGen;
+
+    let forum = ChatId {
+        kind: abyss_core::model::PeerKind::Channel,
+        id: 2,
+    };
+    let mut shot = Shot::open(dir)?;
+    shot.sign_in()?;
+    shot.root.update(&mut shot.cx, |root, window, cx| {
+        root.with_session(|s, cx| s.select_chat(forum, window, cx), cx);
+    })?;
+    shot.cx.run_until_parked();
+    // Core's first page, in its display order: pinned first, then by
+    // activity.
+    let mut topics: Vec<_> = demo::script(format::now())
+        .topics
+        .remove(&forum)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t.visibility == abyss_core::model::Visibility::Shown)
+        .map(|t| t.topic)
+        .collect();
+    topics.sort_by_key(|t| {
+        (
+            !t.pinned,
+            std::cmp::Reverse(crate::chat::topics::activity(t)),
+        )
+    });
+    topics.truncate(50);
+    let open = topics.get(2).map(|t| t.id);
+    shot.core_says(Event::TopicsReset {
+        chat: forum,
+        view: TopicsGen(1),
+        order: TopicOrder::LastActivity,
+        topics,
+        can_post_closed: false,
+    })?;
+    shot.core_says(Event::TopicsPaging {
+        chat: forum,
+        view: TopicsGen(1),
+        has_more: true,
+    })?;
+    if let Some(topic) = open {
+        shot.root.update(&mut shot.cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_topic(topic, window, cx), cx);
+        })?;
+        shot.cx.run_until_parked();
+    }
+    shot.save(Mode::Day, "inline-topics-day.png")?;
+    shot.save(Mode::Night, "inline-topics-night.png")
+}
+
 /// A chat folder's tab selected: its pinned chat first, then its own.
 fn folder(dir: &Path) -> Result<()> {
     let mut shot = Shot::open(dir)?;
@@ -293,6 +349,7 @@ fn snapshots() -> Result<()> {
     chat(&dir)?;
     archive(&dir)?;
     tabs(&dir)?;
+    inline_topics(&dir)?;
     folder(&dir)?;
     list_deep(&dir)
 }

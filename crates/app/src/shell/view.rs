@@ -16,6 +16,7 @@ use super::session::Session;
 use super::shutdown::Closing;
 use super::{Failure, Root, State};
 use crate::chat::copy as chat_copy;
+use crate::chat::inline::Inline;
 use crate::chat::list::Step;
 use crate::ui::copy;
 use crate::ui::mark::mark;
@@ -27,6 +28,11 @@ type SubmitFn = fn(&mut Session, &mut Window, &mut Context<'_, Root>);
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        if let State::Running(session) = &mut self.state {
+            // The sidebar's rows are cached: a folder's expired mutes are
+            // rechecked here, at most once a minute (plan section 17.7).
+            session.shell.list.recheck(crate::chat::format::now());
+        }
         let theme = &Themes::of(window, cx);
         let (body, overlay) = match &self.state {
             State::Failed(failure) => (failure_screen(failure).into_any_element(), None),
@@ -55,6 +61,18 @@ impl Render for Root {
             }))
             .on_action(cx.listener(|root, _: &super::PreviousTab, window, cx| {
                 root.with_session(|s, cx| s.step_tab(Step::Previous, window, cx), cx);
+            }))
+            .on_action(cx.listener(|root, _: &super::NextRow, window, cx| {
+                root.with_session(|s, cx| s.step_row(Step::Next, window, cx), cx);
+            }))
+            .on_action(cx.listener(|root, _: &super::PreviousRow, window, cx| {
+                root.with_session(|s, cx| s.step_row(Step::Previous, window, cx), cx);
+            }))
+            .on_action(cx.listener(|root, _: &super::ExpandForum, _, cx| {
+                root.with_session(|s, cx| s.set_inline(Inline::Expanded, cx), cx);
+            }))
+            .on_action(cx.listener(|root, _: &super::CollapseForum, _, cx| {
+                root.with_session(|s, cx| s.set_inline(Inline::Collapsed, cx), cx);
             }))
             .child(body)
             .children(panel)

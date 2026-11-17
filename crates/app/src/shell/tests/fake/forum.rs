@@ -16,7 +16,7 @@ use abyss_core::store::TopicsGen;
 
 use super::*;
 use crate::chat::Pane;
-use crate::chat::list::Pages;
+use crate::chat::list::{Pages, SidebarRow};
 
 const FORUM: ChatId = ChatId {
     kind: PeerKind::Channel,
@@ -597,6 +597,175 @@ fn a_topics_flood_wait_counts_down_and_then_loads_once(cx: &mut TestAppContext) 
     assert_eq!(countdown(&root, cx), Some(4));
 }
 
+/// The rows right under `forum`'s sidebar row: its inline topics and their
+/// More or pending row.
+fn beneath(shell: &crate::chat::ChatShell, forum: ChatId) -> Vec<SidebarRow> {
+    let rows = shell.list.rows();
+    let Some(at) = rows.iter().position(|r| *r == SidebarRow::Chat(forum)) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .skip(at + 1)
+        .take_while(|r| !matches!(r, SidebarRow::Chat(_) | SidebarRow::Archive(_)))
+        .copied()
+        .collect()
+}
+
+fn inline(root: &Entity<Root>, cx: &mut VisualTestContext) -> Vec<SidebarRow> {
+    read(root, cx, |s| beneath(&s.shell, FORUM))
+}
+
+fn topic_rows(ids: impl IntoIterator<Item = i32>) -> Vec<SidebarRow> {
+    ids.into_iter()
+        .map(|n| SidebarRow::Topic {
+            forum: FORUM,
+            topic: tid(n),
+        })
+        .collect()
+}
+
+const MORE: SidebarRow = SidebarRow::MoreTopics { forum: FORUM };
+const PENDING: SidebarRow = SidebarRow::TopicsPending { forum: FORUM };
+
+/// Plan section 17.3: the shown forum lists its first 8 topics under its
+/// row, plus the open topic wherever it stands, then More; a topic row and
+/// Option+Cmd+Down/Up open topics as the topic list does, and the inline
+/// rows follow the list's events without asking core for anything.
+#[gpui::test]
+fn the_shown_forum_lists_its_topics_under_its_row(cx: &mut TestAppContext) {
+    let (root, cx, harness) = forum_listed(cx);
+    assert!(inline(&root, cx).is_empty(), "no forum shown");
+    select_forum(&root, cx);
+    assert_eq!(inline(&root, cx), [PENDING], "loading");
+
+    let topics = [pinned(30), pinned(31)]
+        .into_iter()
+        .chain((1..=18).map(topic))
+        .collect();
+    topics_listed(&harness, cx, topics, Pages::More);
+    let first = [30, 31, 1, 2, 3, 4, 5, 6];
+    assert_eq!(inline(&root, cx), [topic_rows(first), vec![MORE]].concat());
+
+    // Down from the forum's row opens its first topic, which takes the
+    // selection mark.
+    assert_eq!(
+        sent_by(&harness, || cx.simulate_keystrokes("alt-cmd-down")),
+        [debug(&Command::OpenThread(topic_key(30)))]
+    );
+    let marked = read(&root, cx, |s| s.shell.marked());
+    assert_eq!(marked, topic_rows([30]).pop());
+
+    // An open topic beyond the first 8 shows in its place: at most 8, the
+    // open one and More.
+    select_topic(&root, cx, 15);
+    let shown = [30, 31, 1, 2, 3, 4, 5, 6, 15];
+    assert_eq!(inline(&root, cx), [topic_rows(shown), vec![MORE]].concat());
+    assert_eq!(
+        sent_by(&harness, || cx.simulate_keystrokes("alt-cmd-up")),
+        [debug(&Command::OpenThread(topic_key(6)))],
+        "the previous row: the 8th topic"
+    );
+    select_topic(&root, cx, 15);
+
+    // Core's events reach the inline rows through the same list, and
+    // drawing them asks core for nothing, though more pages exist.
+    let removed = Event::TopicRemoved {
+        chat: FORUM,
+        topic: tid(30),
+        reason: TopicGone::Deleted,
+    };
+    let sent = sent_by(&harness, || {
+        core_sends(&harness, cx, removed);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    });
+    assert!(sent.is_empty(), "{sent:?}");
+    let shown = [31, 1, 2, 3, 4, 5, 6, 7, 15];
+    assert_eq!(inline(&root, cx), [topic_rows(shown), vec![MORE]].concat());
+
+    // More goes back to the full list in the pane.
+    assert_eq!(
+        sent_by(&harness, || act(
+            &root,
+            cx,
+            crate::shell::session::Session::more_topics
+        )),
+        [debug(&Command::CloseThread(topic_key(15)))]
+    );
+    assert_eq!(pane(&root, cx), LIST);
+
+    core_sends(&harness, cx, Event::ForumInvalidated(FORUM));
+    assert_eq!(inline(&root, cx), [PENDING], "until core's new copy");
+}
+
+/// Collapsing and expanding the shown forum's row leave the pane alone;
+/// selecting the forum expands it again. The inline rows follow the forum's
+/// row into every view that shows it (a built-in tab, a folder, the
+/// archive), and never add it to one that doesn't.
+#[gpui::test]
+fn inline_topics_collapse_and_follow_the_forum_into_every_view(cx: &mut TestAppContext) {
+    use crate::chat::inline::Inline;
+    use crate::chat::list::{Shown, Tab};
+
+    let (root, cx, harness) = forum_listed(cx);
+    let groups = abyss_core::model::ChatFolder {
+        id: 2,
+        title: "Groups".into(),
+        rules: abyss_core::model::FolderRules::GROUPS,
+        pinned: Vec::new(),
+        include: Vec::new(),
+        exclude: Vec::new(),
+        shared: false,
+    };
+    core_sends(&harness, cx, Event::ChatFolders(vec![groups]));
+    select_forum(&root, cx);
+    topics_listed(&harness, cx, vec![topic(5), topic(6)], Pages::Done);
+    let both = topic_rows([5, 6]);
+    let expansion = |root: &Entity<Root>, cx: &mut VisualTestContext| {
+        read(root, cx, |s| s.shell.inline_of(FORUM))
+    };
+
+    let sent = sent_by(&harness, || cx.simulate_keystrokes("alt-cmd-left"));
+    assert!(sent.is_empty(), "{sent:?}");
+    assert_eq!(pane(&root, cx), LIST);
+    assert_eq!(expansion(&root, cx), Some(Inline::Collapsed));
+    assert!(inline(&root, cx).is_empty());
+    let sent = sent_by(&harness, || cx.simulate_keystrokes("alt-cmd-right"));
+    assert!(sent.is_empty(), "{sent:?}");
+    assert_eq!(inline(&root, cx), both);
+
+    // Collapsed, then selected again from its row: expanded.
+    act(&root, cx, |s, _, cx| s.set_inline(Inline::Collapsed, cx));
+    select_forum(&root, cx);
+    assert_eq!(inline(&root, cx), both);
+
+    let show = |root: &Entity<Root>, cx: &mut VisualTestContext, shown: Shown| {
+        act(root, cx, |s, w, cx| s.show_chats(shown, w, cx));
+        read(root, cx, |s| s.shell.list.rows().to_vec())
+    };
+    for shown in [Shown::Tab(Tab::Forums), Shown::Tab(Tab::Folder(2))] {
+        show(&root, cx, shown);
+        assert_eq!(inline(&root, cx), both, "{shown:?}");
+    }
+    let private = show(&root, cx, Shown::Tab(Tab::Private));
+    assert!(private.iter().all(|r| matches!(r, SidebarRow::Chat(_))));
+
+    // Archived elsewhere: the archive shows it with its topics.
+    let archived = ChatSummary {
+        folder: abyss_core::model::PeerFolder::Archive,
+        ..forum_chat(IS_FORUM)
+    };
+    core_sends(&harness, cx, Event::ChatBumped(archived));
+    let rows = show(&root, cx, Shown::Archive);
+    assert_eq!(rows, [vec![SidebarRow::Chat(FORUM)], both].concat());
+
+    // Leaving the forum takes its rows along.
+    select(&root, cx, 1);
+    let rows = read(&root, cx, |s| s.shell.list.rows().to_vec());
+    assert_eq!(rows, [SidebarRow::Chat(FORUM)]);
+    assert_eq!(expansion(&root, cx), None);
+}
+
 /// The real core over the `cargo dev` demo account: a forum lists General
 /// and 60 topics with the pinned ones first, over two pages; the
 /// creation-ordered forum (chat 12) keeps its order while messages arrive,
@@ -808,6 +977,20 @@ impl Live {
         };
         assert_eq!(pinned(&self.shell)[..2], [true, true]);
         assert!(pinned(&self.shell)[2..].iter().all(|p| !p), "pinned first");
+        // Under the forum's sidebar row: its first topics, the pinned ones
+        // leading, then More.
+        let shown = ids(&self.shell);
+        let rows = beneath(&self.shell, chat);
+        let first = crate::chat::inline::INLINE_TOPICS;
+        let topics = rows.iter().take(first).map(|r| match r {
+            SidebarRow::Topic { topic, .. } => topic.get(),
+            other => panic!("{other:?}"),
+        });
+        assert!(topics.eq(shown.iter().take(first).copied()));
+        assert_eq!(
+            rows.get(first),
+            Some(&SidebarRow::MoreTopics { forum: chat })
+        );
 
         // A message into the last topic.
         let before = ids(&self.shell);

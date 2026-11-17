@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use abyss_core::api::{Event, UserError};
-use abyss_core::model::{ChatFolder, ChatId, ChatKind, ChatSummary, PeerFolder, Preview};
+use abyss_core::model::{ChatFolder, ChatId, ChatKind, ChatSummary, PeerFolder, Preview, TopicId};
 use abyss_core::store::{MAX_DIALOGS, bump_moves};
 use gpui::SharedString;
 
@@ -15,6 +15,10 @@ use super::retry::Backoff;
 const LOAD_MARGIN: usize = 20;
 /// Characters of the last message shown in a row.
 const PREVIEW_CHARS: usize = 100;
+/// Seconds after which a folder view rechecks its chats' mutes against the
+/// clock (plan section 17.7): an expired mute stops counting within a
+/// minute of the next redraw.
+const MUTE_RECHECK: i64 = 60;
 
 /// What core's `DialogsPaging` said about further pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,11 +115,42 @@ pub(crate) struct ArchiveEntry {
     pub(crate) unread: usize,
 }
 
-/// One row of the sidebar.
+/// One row of the sidebar (plan section 17.3): an owned descriptor, kept
+/// in the row cache and resolved against the chat list and the shown
+/// forum's topics when it renders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SidebarRow<'a> {
+pub(crate) enum SidebarRow {
     Archive(ArchiveEntry),
-    Chat(&'a ChatSummary),
+    Chat(ChatId),
+    /// A topic of the pane's forum, under the forum's row.
+    Topic {
+        forum: ChatId,
+        topic: TopicId,
+    },
+    /// The pane's forum holds more topics than its rows show.
+    MoreTopics {
+        forum: ChatId,
+    },
+    /// The pane's forum has no topic copy yet.
+    TopicsPending {
+        forum: ChatId,
+    },
+}
+
+impl SidebarRow {
+    /// Whether the user selects something with it: a chat or a topic, not
+    /// the archive's entry, More or a placeholder.
+    pub(crate) fn selectable(self) -> bool {
+        matches!(self, Self::Chat(_) | Self::Topic { .. })
+    }
+}
+
+/// Rows the chat shell places right after a forum's row: its inline topics
+/// (plan section 17.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Beneath {
+    pub(crate) forum: ChatId,
+    pub(crate) rows: Vec<SidebarRow>,
 }
 
 #[derive(Debug, Default)]
@@ -128,6 +163,17 @@ pub(crate) struct ChatList {
     restoring: Option<i32>,
     /// The account's chat folders, in server order.
     folders: Vec<ChatFolder>,
+    /// The shown view's rows without inline topics, recomputed when the
+    /// list, the folders or the view change.
+    base: Vec<SidebarRow>,
+    /// When `base` was computed (unix seconds): folder mutes are checked
+    /// against it.
+    computed: i64,
+    /// The rows under the pane's forum, from the chat shell.
+    beneath: Option<Beneath>,
+    /// The sidebar's rows: `base` with `beneath` after its forum's row, if
+    /// the view shows that row.
+    rows: Vec<SidebarRow>,
 }
 
 /// Whether a `ChatBumped` summary `new` moved its chat in core: core's own
@@ -180,6 +226,7 @@ impl ChatList {
             Shown::Tab(Tab::Folder(folder)) => self.restoring = Some(folder),
             shown => self.view.shown = shown,
         }
+        self.recompute();
     }
 
     /// Switches the sidebar to another view. The user's choice replaces a
@@ -189,6 +236,7 @@ impl ChatList {
     pub(crate) fn show(&mut self, shown: Shown) {
         self.restoring = None;
         self.view.shown = shown;
+        self.recompute();
         self.paging.wanted |= self.row_count() == 0;
     }
 
@@ -228,15 +276,23 @@ impl ChatList {
     /// falls back to All.
     pub(crate) fn set_folders(&mut self, folders: Vec<ChatFolder>) {
         self.folders = folders;
+        let exists = |id| self.folders.iter().any(|f| f.id == id);
+        let mut shown = self.view.shown;
         if let Some(folder) = self.restoring.take()
-            && self.folders.iter().any(|f| f.id == folder)
+            && exists(folder)
         {
-            self.show(Shown::Tab(Tab::Folder(folder)));
+            shown = Shown::Tab(Tab::Folder(folder));
         }
-        if let Shown::Tab(Tab::Folder(id)) = self.view.shown
-            && !self.folders.iter().any(|f| f.id == id)
+        if let Shown::Tab(Tab::Folder(id)) = shown
+            && !exists(id)
         {
-            self.show(Shown::default());
+            shown = Shown::default();
+        }
+        if shown == self.view.shown {
+            // The shown folder's rules may have changed.
+            self.recompute();
+        } else {
+            self.show(shown);
         }
     }
 
@@ -252,8 +308,8 @@ impl ChatList {
 
     /// The chats of the shown view: a built-in tab's or the archive's in
     /// core's order, or a chat folder's matching chats with its pinned ones
-    /// first, in its order.
-    fn shown_chats(&self) -> Vec<&ChatSummary> {
+    /// first, in its order. Mutes are checked against `now`.
+    fn shown_chats(&self, now: i64) -> Vec<&ChatSummary> {
         let main = |c: &&ChatSummary| c.folder == PeerFolder::Main;
         match self.view.shown {
             Shown::Archive => self
@@ -266,9 +322,6 @@ impl ChatList {
                 let Some(folder) = self.folders.iter().find(|f| f.id == id) else {
                     return Vec::new();
                 };
-                // Mutes are checked against the clock, so one that expired
-                // stops counting at the next render.
-                let now = super::format::now();
                 let pinned = folder.pinned.iter().filter_map(|&p| self.get(p));
                 let rest = self
                     .chats
@@ -290,22 +343,63 @@ impl ChatList {
         self.view.shown == Shown::Tab(Tab::All)
     }
 
-    /// The sidebar's rows: All starts with the archive's entry.
-    pub(crate) fn rows(&self) -> Vec<SidebarRow<'_>> {
+    /// The sidebar's rows: All starts with the archive's entry, and the
+    /// pane's forum is followed by its inline topics.
+    pub(crate) fn rows(&self) -> &[SidebarRow] {
+        &self.rows
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Recomputes the shown view's rows (plan section 17.7): called by
+    /// every change of the list, the folders or the view.
+    fn recompute(&mut self) {
+        let now = super::format::now();
         let entry = self
             .leads_with_archive()
             .then(|| self.archive_entry())
             .flatten();
-        entry
+        let chats = self.shown_chats(now).into_iter().map(|c| c.id);
+        self.base = entry
             .map(SidebarRow::Archive)
             .into_iter()
-            .chain(self.shown_chats().into_iter().map(SidebarRow::Chat))
-            .collect()
+            .chain(chats.map(SidebarRow::Chat))
+            .collect();
+        self.computed = now;
+        self.place_beneath();
     }
 
-    pub(crate) fn row_count(&self) -> usize {
-        let entry = self.leads_with_archive() && self.archive_entry().is_some();
-        usize::from(entry) + self.shown_chats().len()
+    /// Places the rows beneath their forum's row, if the view shows it:
+    /// they never add a chat to a view.
+    fn place_beneath(&mut self) {
+        let placed = self.beneath.as_ref().and_then(|beneath| {
+            let at = self
+                .base
+                .iter()
+                .position(|r| *r == SidebarRow::Chat(beneath.forum))?;
+            let (head, tail) = self.base.split_at(at + 1);
+            Some([head, &beneath.rows, tail].concat())
+        });
+        self.rows = placed.unwrap_or_else(|| self.base.clone());
+    }
+
+    /// The rows to show under a forum's row (none: no forum is expanded).
+    pub(crate) fn set_beneath(&mut self, beneath: Option<Beneath>) {
+        if self.beneath != beneath {
+            self.beneath = beneath;
+            self.place_beneath();
+        }
+    }
+
+    /// A redraw at `now`: a folder view rechecks its chats' mutes, at most
+    /// once every [`MUTE_RECHECK`] seconds.
+    pub(crate) fn recheck(&mut self, now: i64) {
+        let folder = matches!(self.view.shown, Shown::Tab(Tab::Folder(_)));
+        if folder && now.saturating_sub(self.computed) >= MUTE_RECHECK {
+            self.recompute();
+        }
     }
 
     /// Applies a chat-list event from core; other events are not its own.
@@ -326,6 +420,7 @@ impl ChatList {
     pub(crate) fn reset(&mut self, mut chats: Vec<ChatSummary>) {
         chats.truncate(MAX_DIALOGS);
         self.chats = chats;
+        self.recompute();
     }
 
     /// A later page: listed chats update in place, new ones are appended.
@@ -337,6 +432,7 @@ impl ChatList {
                 self.chats.push(chat);
             }
         }
+        self.recompute();
     }
 
     /// A chat's summary changed. A newer last message (by `last_id`) moves
@@ -344,6 +440,11 @@ impl ChatList {
     /// does; anything else (an unread count, a read elsewhere, a repeated
     /// bump) updates it in place.
     pub(crate) fn bump(&mut self, chat: ChatSummary) {
+        self.place(chat);
+        self.recompute();
+    }
+
+    fn place(&mut self, chat: ChatSummary) {
         let Some(pos) = self.chats.iter().position(|c| c.id == chat.id) else {
             if self.chats.len() < MAX_DIALOGS {
                 let at = self.section_start(&chat);
@@ -672,12 +773,11 @@ mod tests {
     }
 
     fn row_ids(list: &ChatList) -> Vec<i64> {
-        assert_eq!(list.row_count(), list.rows().len());
         list.rows()
             .iter()
             .map(|r| match r {
-                SidebarRow::Archive(_) => 0,
-                SidebarRow::Chat(c) => c.id.id,
+                SidebarRow::Chat(c) => c.id,
+                _ => 0,
             })
             .collect()
     }
@@ -893,8 +993,8 @@ mod tests {
                 list.rows()
                     .iter()
                     .filter_map(|r| match r {
-                        SidebarRow::Chat(c) => Some(c.id.id),
-                        SidebarRow::Archive(_) => None,
+                        SidebarRow::Chat(c) => Some(c.id),
+                        _ => None,
                     })
                     .collect()
             };
