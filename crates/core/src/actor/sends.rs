@@ -353,6 +353,8 @@ impl<B: Backend> Actor<B> {
 
     /// Validates a new send and enters it in the (bounded) table,
     /// undispatched and `Failed`, in the first slot of `order` with room.
+    /// A send into a topic core knows is closed to the user is refused
+    /// (`TopicClosed`; plan section 6.7).
     /// Answered `SendAdmitted`; `None`: refused, and answered `SendRefused`
     /// (task 6j). A `local_id` core already holds gets only `Error(Busy)`:
     /// the UI never reuses one, and the answer must not touch that send.
@@ -372,6 +374,8 @@ impl<B: Backend> Actor<B> {
             Some(UserError::Busy)
         } else if !sendable(&text) {
             Some(UserError::Rejected)
+        } else if self.topic_closed(thread) {
+            Some(UserError::TopicClosed)
         } else {
             None
         };
@@ -590,6 +594,7 @@ impl<B: Backend> Actor<B> {
         };
         p.in_flight = false;
         let attempts = p.attempts;
+        let thread = p.thread;
         match res {
             Ok(id) => {
                 self.sends.remove(local_id);
@@ -628,6 +633,9 @@ impl<B: Backend> Actor<B> {
                 }
             }
             Err(CallError::Backend(e)) => {
+                if let BackendError::Rejected(reason) = e {
+                    self.topic_send_refused(thread, reason);
+                }
                 self.error(super::apply::user_error(CallError::Backend(e)))
                     .await;
                 self.finish_send(local_id, SendState::Failed).await;

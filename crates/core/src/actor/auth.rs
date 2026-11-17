@@ -450,9 +450,7 @@ impl<C> Ctx<C> {
         Done {
             cgen,
             parked: err.map(|_| permit),
-            // A login call reports like a read mark: no store change, only
-            // the error for stall detection.
-            outcome: Outcome::Read(err.map_or(Ok(()), Err)),
+            outcome: Outcome::Login(err.map_or(Ok(()), Err)),
         }
     }
 }

@@ -34,7 +34,9 @@ use super::boot::BootKind;
 use super::jobs::{CallError, CallResult, Job, TopicsCall};
 use super::lifecycle::Phase;
 use crate::api::{ClientGen, Event, LoadTarget, UserError};
-use crate::backend::{Backend, BackendError, TopicsById, TopicsCursor, TopicsPage, Update};
+use crate::backend::{
+    Backend, BackendError, RejectReason, TopicsById, TopicsCursor, TopicsPage, Update,
+};
 use crate::cache::CacheCmd;
 use crate::model::{ChatId, Message, MsgId, ThreadKey, TopicId};
 use crate::store::{
@@ -607,6 +609,48 @@ impl<B: Backend> Actor<B> {
             _ => return,
         };
         self.emit_list_changes(chat, changes).await;
+    }
+
+    /// Whether core knows a send into `thread` would be refused because its
+    /// topic is closed: a retained list holds the topic closed, and the user
+    /// may not post in closed topics (plan section 6.7).
+    pub(super) fn topic_closed(&self, thread: ThreadKey) -> bool {
+        let Some(topic) = thread.topic else {
+            return false;
+        };
+        self.topics.lists.get(thread.chat).is_some_and(|list| {
+            list.post_closed() == PostClosed::Refused && list.get(topic).is_some_and(|t| t.closed)
+        })
+    }
+
+    /// A local read of `thread`'s topic completed: the topic's count may
+    /// have changed, so it is due (`ReadSince`).
+    pub(super) async fn topic_read(&mut self, thread: ThreadKey) {
+        let Some(topic) = thread.topic else {
+            return;
+        };
+        let Some(list) = self.topics.lists.get_mut(thread.chat) else {
+            return;
+        };
+        let changes = list.trigger_unread(topic, UnreadTrigger::ReadLocally, now());
+        self.emit_list_changes(thread.chat, changes).await;
+    }
+
+    /// The server refused a send into `thread` for its topic: closed (the
+    /// list was stale: its meta is refetched) or deleted (a suspicion, which
+    /// a fresh by-id result settles).
+    pub(super) fn topic_send_refused(&mut self, thread: ThreadKey, reason: RejectReason) {
+        let Some(topic) = thread.topic else {
+            return;
+        };
+        let Some(list) = self.topics.lists.get_mut(thread.chat) else {
+            return;
+        };
+        match reason {
+            RejectReason::TopicClosed => list.mark_due(topic, now()),
+            RejectReason::TopicDeleted => list.suspect_deleted(topic, now()),
+            _ => {}
+        }
     }
 
     /// `chat`'s forum flag changed (plan section 6.6): its list goes. A

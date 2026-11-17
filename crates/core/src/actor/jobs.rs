@@ -106,6 +106,8 @@ pub(super) enum Job {
     Read {
         thread: ThreadKey,
         max_id: MsgId,
+        /// Earlier failed attempts of this read intent.
+        retry: u8,
     },
     TopicsPage {
         call: TopicsCall,
@@ -220,7 +222,16 @@ pub(super) enum Outcome {
     SendExpired {
         local_id: LocalId,
     },
-    Read(CallResult<()>),
+    /// A read mark of `thread` up to `max_id` ended.
+    Read {
+        thread: ThreadKey,
+        max_id: MsgId,
+        retry: u8,
+        res: CallResult<()>,
+    },
+    /// A login call ended: no store change, only the error for stall
+    /// detection.
+    Login(CallResult<()>),
     TopicsPage {
         call: TopicsCall,
         kind: PageKind,
@@ -393,12 +404,11 @@ pub(super) fn job_future<C: Client>(
             };
             (TaskKind::Send(local_id), Box::pin(fut))
         }
-        Job::Read { thread, max_id } => {
-            let call = async move { client.read_history(thread, max_id).await };
-            // Read marks are best effort; the next read covers a lost one.
-            let fut = admitted.run(call, Outcome::Read);
-            (TaskKind::Read, Box::pin(fut))
-        }
+        Job::Read {
+            thread,
+            max_id,
+            retry,
+        } => read(client, admitted, thread, max_id, retry),
         Job::TopicsPage { call, kind, cursor } => {
             let topics = async move { client.topics(call.chat, cursor, TOPICS_PAGE).await };
             let fut = admitted.run(topics, move |res| Outcome::TopicsPage { call, kind, res });
@@ -461,6 +471,24 @@ fn history<C: Client>(
         TaskKind::History(load, dir),
         Box::pin(admitted.run(call, outcome)),
     )
+}
+
+/// The future for an admitted read mark, plus its kind.
+fn read<C: Client>(
+    client: Arc<C>,
+    admitted: Admitted,
+    thread: ThreadKey,
+    max_id: MsgId,
+    retry: u8,
+) -> (TaskKind, DoneFuture) {
+    let call = async move { client.read_history(thread, max_id).await };
+    let fut = admitted.run(call, move |res| Outcome::Read {
+        thread,
+        max_id,
+        retry,
+        res,
+    });
+    (TaskKind::Read, Box::pin(fut))
 }
 
 fn topics_by_id<C: Client>(

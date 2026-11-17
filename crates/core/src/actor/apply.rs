@@ -28,6 +28,12 @@ pub(super) fn user_error(e: CallError) -> UserError {
         CallError::Backend(BackendError::Rejected(RejectReason::FolderLimit)) => {
             UserError::FolderLimit
         }
+        CallError::Backend(BackendError::Rejected(RejectReason::TopicClosed)) => {
+            UserError::TopicClosed
+        }
+        CallError::Backend(BackendError::Rejected(RejectReason::TopicDeleted)) => {
+            UserError::TopicDeleted
+        }
         CallError::Backend(BackendError::Rejected(_) | BackendError::Unauthorized) => {
             UserError::Rejected
         }
@@ -49,9 +55,14 @@ fn call_error(outcome: &Outcome) -> Option<CallError> {
         | Outcome::Send { res: Err(e), .. }
         | Outcome::TopicsPage { res: Err(e), .. }
         | Outcome::TopicsById { res: Err(e), .. }
-        | Outcome::Read(Err(e))
+        | Outcome::Login(Err(e))
         | Outcome::ChatFolders(Err(e))
         | Outcome::FolderWrite { res: Err(e), .. } => Some(*e),
+        // A retried read's time-out is not counted again: one read intent
+        // can't keep stall detection rebuilding (`reads`).
+        Outcome::Read {
+            res: Err(e), retry, ..
+        } => (*retry == 0 || *e != CallError::Timeout).then_some(*e),
         _ => None,
     }
 }
@@ -161,6 +172,13 @@ impl<B: Backend> Actor<B> {
         match done.outcome {
             Outcome::Send { local_id, res } => self.on_send(local_id, res).await,
             Outcome::SendExpired { local_id } => self.send_window_closed(local_id).await,
+            // Before the generation check: the intent outlives the instance.
+            Outcome::Read {
+                thread,
+                max_id,
+                res,
+                ..
+            } => self.on_read(done.cgen, thread, max_id, res).await,
             // Before the generation check: a write from a retired instance
             // still frees the account's one write slot (`folder_writes`).
             Outcome::FolderWrite { write, moved, res } => {
@@ -194,8 +212,7 @@ impl<B: Backend> Actor<B> {
             Outcome::PeerDialogs { chats, stamps, res } => {
                 self.on_peer_dialogs(chats, stamps, res).await;
             }
-            // Read marks are best effort; the next read covers a lost one.
-            Outcome::Read(_) | Outcome::UpdatesEnded(StreamEnd::Cancelled) => {}
+            Outcome::Login(_) | Outcome::UpdatesEnded(StreamEnd::Cancelled) => {}
             Outcome::ChatFolders(res) => self.on_chat_folders(res).await,
             Outcome::CacheChats(chats) => self.on_cache_chats(chats).await,
             Outcome::CacheHistory {
@@ -208,6 +225,13 @@ impl<B: Backend> Actor<B> {
         }
         if let Some(e) = err {
             self.inspect_call(e).await;
+        }
+        // Independent of which time-outs count toward the stall window: once
+        // every permit is parked, nothing else can time out to trigger
+        // recovery (a retried read's time-outs are not counted, but still
+        // park their permits). `rebuild` is a no-op once retiring.
+        if current && self.admission.parked() >= super::admission::MAX_CONCURRENT {
+            self.rebuild(Reason::Stall).await;
         }
     }
 

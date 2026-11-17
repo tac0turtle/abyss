@@ -1,5 +1,5 @@
-//! Stage 2 tasks 6 to 8: forum topic lists, topic threads, live routing,
-//! the forum badge and the forum flag in the actor, against the fake's
+//! Stage 2 tasks 6 to 9: forum topic lists, topic threads, live routing,
+//! the forum badge, the forum flag, and sends and reads in the actor, against the fake's
 //! forums (plan section 11, "Actor against the fake").
 
 mod admission;
@@ -18,7 +18,9 @@ mod kinds;
 mod open_topic;
 mod opening;
 mod overflow;
+mod reads;
 mod routing;
+mod sending;
 mod threads;
 
 use std::time::Duration;

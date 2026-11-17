@@ -264,6 +264,10 @@ pub enum UserError {
     /// to be sent: they were cancelled, and nothing of them reached the
     /// server.
     FolderWritesCancelled,
+    /// The forum topic is closed, and only its admins may post in it.
+    TopicClosed,
+    /// The forum topic was deleted.
+    TopicDeleted,
     /// A bug: a contained panic or broken invariant.
     Internal,
 }

@@ -192,7 +192,9 @@ async fn second_migration_halts_offline() {
 
 /// Sixteen calls time out, so the permits are parked; the third time-out is a
 /// stall and rebuilds. The runner takes 4 s to quit, and no permit may return
-/// before it has.
+/// before it has. The timed-out reads are sent again on the new instance.
+/// Then retried reads, whose time-outs the stall window doesn't count, park
+/// every permit: that rebuilds too, once, and their reads land after it.
 #[tokio::test(start_paused = true)]
 async fn parked_permits_recycle_only_after_the_runner_completes() {
     let mut h = harness(FakeScript::default(), None).await;
@@ -227,12 +229,39 @@ async fn parked_permits_recycle_only_after_the_runner_completes() {
     assert!(triggered.elapsed() >= Duration::from_secs(4));
     assert_eq!(h.fake.runners_finished(), 1);
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        h.fake.calls(Op::Read),
-        total,
-        "recycled permits admit the rest"
-    );
+    // The rest, and the timed-out reads again: every read lands.
+    let landed: std::collections::HashSet<ThreadKey> =
+        h.fake.read_calls().into_iter().map(|(t, _)| t).collect();
+    assert_eq!(landed.len(), total, "recycled permits admit the rest");
     assert_eq!(h.permits.available_permits(), MAX_CONCURRENT);
+
+    // Retried reads (their time-outs don't count for the stall window)
+    // time out until every permit is parked: that alone rebuilds, once.
+    for fault in [Fault::Error(BackendError::Transient), Fault::Hang] {
+        for _ in 0..MAX_CONCURRENT {
+            h.fake.inject(Op::Read, fault);
+        }
+    }
+    let retried: Vec<ThreadKey> = (0..MAX_CONCURRENT)
+        .map(|i| ThreadKey::whole(chat(i64::try_from(i).unwrap() + 100)))
+        .collect();
+    for thread in &retried {
+        h.send(Command::MarkRead {
+            thread: *thread,
+            max_id: MsgId(1),
+        })
+        .await;
+    }
+    h.until(rebuilding).await;
+    assert_eq!(h.permits.available_permits(), 0, "every permit parked");
+    h.online().await;
+    assert_eq!(h.fake.runners_finished(), 2);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(h.permits.available_permits(), MAX_CONCURRENT);
+    assert_eq!(h.fake.builds(), 3, "no further rebuild");
+    let landed: std::collections::HashSet<ThreadKey> =
+        h.fake.read_calls().into_iter().map(|(t, _)| t).collect();
+    assert!(retried.iter().all(|t| landed.contains(t)), "{landed:?}");
     h.stop().await;
 }
 

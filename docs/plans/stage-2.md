@@ -1120,3 +1120,11 @@ Follow-ups (not Stage 2 tasks):
 | 4 | P2: unlisted chats kept a stamp without its value | Unlisted records keep (value, stamp) pairs until admission; independent source-log reference model with membership transitions |
 | 5 | P2: eviction during `guard()` bypassed the cutoff; `commit_kind` stamped only listed chats | Room made before checking, never evicting chats the response lists; unlisted records carry committed kinds |
 | 6 | Pass | Also fixed: a task 2 store bug found by `merge_policy` (an edit while a topic's activity is unsettled now counts as a live change; §6.3 amended; seed kept in proptest-regressions). Notes: `guard()` relies on callers' input bounds (≤ 1,000); continuous edits can keep a topic due with 30 s backoff |
+
+### Task 9: sending and read marks per topic (3 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 | P2: timeouts and flood waits dropped an accepted read intent, leaving the thread unread while the UI suppresses a repeat `MarkRead` | Read intents kept per thread until a covering read lands, one flight per thread, backoff 1→30 s, flood waits after their deadline, rejections terminal; only a read's first timeout counts toward stall detection |
+| 2 | P2: excluding retried timeouts also bypassed the exhausted-permit recovery, so retried reads could park every permit | Independent check at the end of `on_done`: all permits parked on the current client triggers a stall rebuild (no-op once retiring); the existing lifecycle test extends to cover it |
+| 3 | Pass | Accepted: closed-topic refusal at admission only; held sends keep their original thread across a kind change |

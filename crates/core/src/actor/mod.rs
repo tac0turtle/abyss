@@ -21,6 +21,7 @@ mod merge;
 mod onboarding;
 mod paused;
 mod peers;
+mod reads;
 mod sends;
 #[cfg(all(test, feature = "fake"))]
 mod tests;
@@ -57,9 +58,7 @@ use crate::core::ShutdownReport;
 use crate::events::EventSender;
 use crate::model::{ChatId, FolderEdit, MsgId, ThreadKey};
 use crate::session::{PersistHandle, SessionSnapshot};
-use crate::store::{
-    Badges, Dialogs, KindChecks, MAX_DIALOGS, PeerScheduler, ViewGen, Window, Windows,
-};
+use crate::store::{Badges, Dialogs, KindChecks, PeerScheduler, ViewGen, Window, Windows};
 
 /// Shutdown's deadline for retirement and the persistence seal, counted from
 /// its start (plan section 5).
@@ -183,8 +182,9 @@ pub(crate) struct Actor<B: Backend> {
     fences: KindChecks,
     /// The revisions the last membership pass saw (`fences`).
     members: Option<fences::Members>,
-    /// Highest displayed id per thread, flushed every `READ_FLUSH`.
-    reads: HashMap<ThreadKey, MsgId>,
+    /// Read intents per thread, flushed every `READ_FLUSH` until they
+    /// land (at most `reads::MAX_READS`).
+    reads: HashMap<ThreadKey, reads::ReadMark>,
     sends: sends::PendingSends,
     deadline: Duration,
     updates_tx: mpsc::Sender<(ClientGen, StreamItem)>,
@@ -527,17 +527,17 @@ impl<B: Backend> Actor<B> {
     }
 
     /// Drops queued snapshot and history loads (their views are going away) and
-    /// dialogs loads; sends and read marks stay queued for the next instance.
+    /// dialogs loads; sends stay queued for the next instance, and read marks
+    /// are sent again from the read intents (`reads`).
     /// What a purged load owed the UI is left to the caller: retirement
     /// answers it, and a full bootstrap invalidates its view (task 10g).
     fn purge_queued(&mut self) {
-        // Sends, read marks and folder changes are the user's intent: they
-        // run on the next instance.
+        // Sends and folder changes are the user's intent: they run on the
+        // next instance.
         let keep = |job: &Job| {
             matches!(
                 job,
                 Job::Send { .. }
-                    | Job::Read { .. }
                     | Job::Folders(FolderJob::SetPeerFolder { .. } | FolderJob::Edit { .. })
             )
         };
@@ -556,7 +556,8 @@ impl<B: Backend> Actor<B> {
                     self.topics_job_purged(call);
                 }
                 Job::PeerDialogs { .. } => self.peer_job_dropped(),
-                Job::Send { .. } | Job::Read { .. } | Job::Folders(_) => {}
+                Job::Read { thread, max_id, .. } => self.read_job_dropped(thread, max_id),
+                Job::Send { .. } | Job::Folders(_) => {}
             }
         }
     }
@@ -956,34 +957,6 @@ impl<B: Backend> Actor<B> {
                 self.history_ended(load.thread, dir, Some(UserError::Busy))
                     .await;
             }
-        }
-    }
-
-    async fn mark_read(&mut self, thread: ThreadKey, max_id: MsgId) {
-        if self.reads.len() >= MAX_DIALOGS && !self.reads.contains_key(&thread) {
-            return;
-        }
-        let entry = self.reads.entry(thread).or_insert(max_id);
-        *entry = (*entry).max(max_id);
-        // A forum's badge is the server's only (plan section 7).
-        if self.is_forum(thread.chat) {
-            return;
-        }
-        let now = self.badges.now();
-        if let Some(summary) = self.dialogs.set_unread(thread.chat, 0, now).cloned() {
-            self.emit(Event::ChatBumped(summary)).await;
-        }
-    }
-
-    /// Queues coalesced read marks. While no instance is live they keep
-    /// coalescing instead of piling up in the queue.
-    async fn flush_reads(&mut self) {
-        if self.life.phase != Phase::Live {
-            return;
-        }
-        let reads: Vec<(ThreadKey, MsgId)> = self.reads.drain().collect();
-        for (thread, max_id) in reads {
-            self.enqueue(Job::Read { thread, max_id }).await;
         }
     }
 }
