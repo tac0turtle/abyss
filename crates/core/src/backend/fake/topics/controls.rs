@@ -27,6 +27,22 @@ impl FakeHandle {
         });
     }
 
+    /// Topics calls as they reached the server, oldest first.
+    pub fn topics_calls(&self) -> Vec<super::super::TopicsCallRecord> {
+        self.shared.with(|s| s.topics_log.clone())
+    }
+
+    /// From now on, every later page of the forum repeats its first page
+    /// while still reporting more topics (a server whose `count` is
+    /// inflated): only core's duplicate-page stop ends the traversal.
+    pub fn repeat_topic_pages(&self, chat: ChatId) {
+        self.shared.with(|s| {
+            if !s.repeat_pages.contains(&chat) {
+                s.repeat_pages.push(chat);
+            }
+        });
+    }
+
     /// Whether the account may post in the forum's closed topics.
     pub fn set_post_closed(&self, chat: ChatId, post_closed: PostClosed) {
         self.shared.with(|s| {

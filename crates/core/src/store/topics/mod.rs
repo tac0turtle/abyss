@@ -153,6 +153,9 @@ pub struct TopicList {
     tombstones: Tombstones,
     /// The open topic: never cut by the cap, first in every drain.
     open: Option<TopicId>,
+    /// When the open topic, while unlisted, may be fetched by id again:
+    /// it backs off when a call fails or leaves it unanswered.
+    open_retry: due::Retry,
     /// The clock at the last live event that touched a topic not in the
     /// list (or a deletion, whose ids may be such a topic's): results
     /// dispatched at or before it can't be trusted for topics they add.
@@ -177,6 +180,7 @@ impl TopicList {
             drain_cursor: None,
             tombstones: Tombstones::default(),
             open: None,
+            open_retry: due::Retry::default(),
             unlisted_change: FetchSeq::default(),
         }
     }
@@ -199,6 +203,11 @@ impl TopicList {
 
     pub fn needs_first_page(&self) -> bool {
         self.first_page == FirstPage::Needed
+    }
+
+    /// Whether a page is in flight or queued.
+    pub fn page_pending(&self) -> bool {
+        self.page.is_some() || self.queued_page.is_some()
     }
 
     /// Every retained topic, hidden ones included (routing, the closed check).
@@ -231,9 +240,14 @@ impl TopicList {
     /// Sets the open topic. An unlisted one is fetched by id in the next
     /// call's reserved slot. Closing one that sat past the cap cuts the
     /// lowest-ranked topic.
+    /// A new open intent may fetch an unlisted open topic at once.
     pub fn set_open(&mut self, open: Option<TopicId>) -> Vec<ListChange> {
         let before = self.shown_keys();
         self.open = open;
+        // Discovery keeps an open topic's id; dispatch skips it while it
+        // is open (its slot has its own backoff), and it is fetched as
+        // discovery again once another topic is open.
+        self.open_retry = due::Retry::default();
         let cut = self.enforce_cap();
         let changes = cut.into_iter().map(ListChange::Removed).collect();
         self.checked(&before, changes, Replay::Exact)
@@ -279,20 +293,24 @@ impl TopicList {
         }
         let seq = self.seq.next();
         let mut ids = Vec::with_capacity(MAX_TOPICS_BY_ID);
-        if let Some(open) = self.open
-            && self.entry(open).is_none()
+        if let Some(open) = self.unlisted_open()
+            && self.open_retry.eligible(now)
         {
             ids.push(open);
         }
         let room = MAX_TOPICS_BY_ID - ids.len();
         ids.extend(self.take_due(now, room, seq));
-        while ids.len() < MAX_TOPICS_BY_ID {
-            let Some(id) = self.discovery.pop_first() else {
-                break;
-            };
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
+        let room = MAX_TOPICS_BY_ID - ids.len();
+        let discovered: Vec<TopicId> = self
+            .discovery
+            .iter()
+            .filter(|id| Some(**id) != self.open && !ids.contains(id))
+            .take(room)
+            .copied()
+            .collect();
+        for id in discovered {
+            self.discovery.remove(&id);
+            ids.push(id);
         }
         if ids.is_empty() {
             return None;
@@ -309,7 +327,9 @@ impl TopicList {
             self.page = None;
         } else if let Some(call) = self.by_id.take_if(|c| c.seq == seq) {
             for id in call.ids {
-                if self.is_due(id) {
+                if Some(id) == self.unlisted_open() {
+                    self.open_retry.back_off(now);
+                } else if self.is_due(id) {
                     self.back_off(id, now);
                 } else {
                     self.rediscover(id);
@@ -342,6 +362,11 @@ impl TopicList {
     /// A live event touched a topic the list doesn't hold.
     fn note_unlisted(&mut self) {
         self.unlisted_change = self.seq;
+    }
+
+    /// The open topic, if the list doesn't hold it.
+    fn unlisted_open(&self) -> Option<TopicId> {
+        self.open.filter(|o| self.entry(*o).is_none())
     }
 
     fn rediscover(&mut self, id: TopicId) {

@@ -514,6 +514,7 @@ impl<B: Backend> Actor<B> {
     async fn reset_account_data(&mut self) {
         self.dialogs = crate::store::Dialogs::default();
         self.windows = crate::store::Windows::default();
+        self.topics = super::topics::TopicLists::default();
         self.open = None;
         self.viewing = None;
         // Loads of the old account's views owe the UI nothing (round 20).

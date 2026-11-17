@@ -1092,3 +1092,11 @@ Follow-ups (not Stage 2 tasks):
 |---|---|---|
 | 1 (ready) | P3: the query-plan test explained a simplified query | Fixing it exposed a real bug: topic pages used the primary key and filtered other topics row by row. Page SQL now comes from one builder shared with the plan test; topic keys read `INDEXED BY messages_thread`; all three page kinds asserted |
 | 2 | Pass | Follow-up (non-blocking): a v4 database whose `messages_thread` index was dropped externally isn't repaired; topic reads then fail as `CacheError::Sql` and degrade to cache misses. Consider recreating missing indexes at open |
+
+### Task 6: core topic lists (3 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 (ready after fixes) | P2: flood deadline not rechecked at admission, so a queued topics job could start during a flood wait; P2: by-id panic path skipped the 1 s interval. P3: an unlisted open topic retried ~1/s forever | Admission skips topics jobs during the wait (order kept, wake at deadline); shared `by_id_ended`; retry record with 1→30 s backoff, reset on open/refresh. Accepted deviations: list reducers for live updates pulled forward from task 8, receipt-time stamping, interval from call end |
+| 2 (changes requested) | P2: discovery lost when the open topic changed. P3: cache-test barrier race | Open id stays in discovery but is skipped by dispatch while open; cache delete queued before `ThreadInvalidated` |
+| 3 | Pass | — |

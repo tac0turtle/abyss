@@ -12,6 +12,7 @@ mod lifecycle;
 mod logout;
 mod onboarding;
 mod topic_keys;
+mod topics;
 mod watchdog;
 
 use std::path::PathBuf;

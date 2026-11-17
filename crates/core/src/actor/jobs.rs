@@ -12,11 +12,11 @@ use tokio_util::sync::CancellationToken;
 use crate::api::{ClientGen, HistoryDir};
 use crate::backend::{
     BackendError, Client, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, StreamError,
-    StreamItem, UpdateStream,
+    StreamItem, TopicsById, TopicsCursor, TopicsPage, UpdateStream,
 };
 use crate::cache::CacheHandle;
-use crate::model::{ChatSummary, LocalId, Message, MsgId, ThreadKey};
-use crate::store::ViewGen;
+use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId, ThreadKey, TopicId};
+use crate::store::{FetchSeq, PageKind, TOPICS_PAGE, TopicsGen, ViewGen};
 
 /// Messages per history page (server and cache).
 pub(super) const PAGE: u32 = 50;
@@ -43,6 +43,16 @@ pub(super) struct Load {
     pub(super) thread: ThreadKey,
     pub(super) view: ViewGen,
     pub(super) req: ReqId,
+}
+
+/// Identity of one topics fetch (page or by-id): the list it fills, by
+/// forum and generation, and its dispatch seq on that list's clock. A
+/// completion applies only while both still match (plan section 6.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TopicsCall {
+    pub(super) chat: ChatId,
+    pub(super) view: TopicsGen,
+    pub(super) seq: FetchSeq,
 }
 
 /// A backend call waiting for admission.
@@ -73,6 +83,24 @@ pub(super) enum Job {
         thread: ThreadKey,
         max_id: MsgId,
     },
+    TopicsPage {
+        call: TopicsCall,
+        kind: PageKind,
+        /// `None` for a first page.
+        cursor: Option<TopicsCursor>,
+    },
+    /// At most `MAX_TOPICS_BY_ID` ids.
+    TopicsById {
+        call: TopicsCall,
+        ids: Vec<TopicId>,
+    },
+}
+
+impl Job {
+    /// A topics call, which waits out a topics flood wait.
+    pub(super) fn is_topics(&self) -> bool {
+        matches!(self, Job::TopicsPage { .. } | Job::TopicsById { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +154,15 @@ pub(super) enum Outcome {
         local_id: LocalId,
     },
     Read(CallResult<()>),
+    TopicsPage {
+        call: TopicsCall,
+        kind: PageKind,
+        res: CallResult<TopicsPage>,
+    },
+    TopicsById {
+        call: TopicsCall,
+        res: CallResult<TopicsById>,
+    },
     CacheChats(Option<Vec<ChatSummary>>),
     CacheHistory {
         load: Load,
@@ -153,6 +190,8 @@ pub(super) enum TaskKind {
     History(Load, HistoryDir),
     Send(LocalId),
     Read,
+    TopicsPage(TopicsCall),
+    TopicsById(TopicsCall),
     CacheChats,
     Updates,
     /// A login call (task 6b), for panic handling.
@@ -287,7 +326,25 @@ pub(super) fn job_future<C: Client>(
             let fut = admitted.run(call, Outcome::Read);
             (TaskKind::Read, Box::pin(fut))
         }
+        Job::TopicsPage { call, kind, cursor } => {
+            let topics = async move { client.topics(call.chat, cursor, TOPICS_PAGE).await };
+            let fut = admitted.run(topics, move |res| Outcome::TopicsPage { call, kind, res });
+            (TaskKind::TopicsPage(call), Box::pin(fut))
+        }
+        Job::TopicsById { call, ids } => topics_by_id(client, admitted, call, ids),
     }
+}
+
+/// The future of a by-id topics call.
+fn topics_by_id<C: Client>(
+    client: Arc<C>,
+    admitted: Admitted,
+    call: TopicsCall,
+    ids: Vec<TopicId>,
+) -> (TaskKind, DoneFuture) {
+    let topics = async move { client.topics_by_id(call.chat, &ids).await };
+    let fut = admitted.run(topics, move |res| Outcome::TopicsById { call, res });
+    (TaskKind::TopicsById(call), Box::pin(fut))
 }
 
 /// Reads a page from the cache. `anchor` is the window edge for older/newer reads.

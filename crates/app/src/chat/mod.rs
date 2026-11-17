@@ -362,7 +362,14 @@ impl ChatShell {
             // `LoadEnded` needs the time: see [`Self::load_ended`]. Errors
             // never end a load: core says which load ended.
             Event::Connection(state) => self.on_connection(state),
-            Event::Auth(_)
+            // Topic lists are shown from Stage 2 task 10.
+            Event::TopicsReset { .. }
+            | Event::TopicsAppended { .. }
+            | Event::TopicsPaging { .. }
+            | Event::TopicBumped { .. }
+            | Event::TopicRemoved { .. }
+            | Event::ForumInvalidated(_)
+            | Event::Auth(_)
             | Event::CredentialSource(_)
             | Event::CredentialItem(_)
             | Event::Error(_)
@@ -385,6 +392,8 @@ impl ChatShell {
                     w.load_ended(dir, error, now);
                 }
             }
+            // Topic lists are shown from Stage 2 task 10.
+            LoadTarget::Topics(_) => {}
         }
     }
 

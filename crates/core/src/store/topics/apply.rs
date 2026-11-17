@@ -22,6 +22,14 @@ enum Unlisted {
     Drop,
 }
 
+/// Whether a later page brought a topic the list didn't hold (an empty page
+/// counts as news: it ends paging by its own `rest`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum News {
+    None,
+    Some,
+}
+
 /// What a result did to the emitted list, in the order it happened, so a
 /// consumer applying it in sequence repeats the store's steps.
 #[derive(Debug, Default)]
@@ -147,10 +155,20 @@ impl TopicList {
         let before = self.shown_keys();
         let mut out = Emitted::default();
         let mut in_page: Vec<Topic> = Vec::with_capacity(page.topics.len());
+        // A non-empty page made only of topics the list already holds ends
+        // paging: an inflated server `count` can't drive redundant requests.
+        let mut news = if page.topics.is_empty() {
+            News::Some
+        } else {
+            News::None
+        };
         for snap in page.topics {
             let id = snap.topic.id;
             if in_page.iter().any(|t| t.id == id) {
                 continue;
+            }
+            if self.position(id).is_none() {
+                news = News::Some;
             }
             if self.position(id).is_some() {
                 let merged = self.merge_known(seq, snap, Source::Page, &mut out);
@@ -173,7 +191,10 @@ impl TopicList {
         self.mark_missed_between(&in_page, now);
         order::pinned_first(&mut self.entries);
         if self.paging != Paging::Capped {
-            self.paging = paging_after(page.rest);
+            self.paging = match news {
+                News::Some => paging_after(page.rest),
+                News::None => Paging::Complete,
+            };
         }
         for id in self.enforce_cap() {
             out.removed(id);
@@ -254,7 +275,9 @@ impl TopicList {
             }
         }
         for id in unanswered {
-            if self.is_due(id) {
+            if Some(id) == self.unlisted_open() {
+                self.open_retry.back_off(now);
+            } else if self.is_due(id) {
                 self.back_off(id, now);
             }
         }

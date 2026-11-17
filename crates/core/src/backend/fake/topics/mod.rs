@@ -245,7 +245,10 @@ pub(super) fn page(
     require_forum(s, chat)?;
     let order = order_of(s, chat);
     let all = server_order(s, chat, order);
-    let start = cursor.map_or(0, |c| to_usize(c.index)).min(all.len());
+    let start = match cursor {
+        Some(_) if s.repeat_pages.contains(&chat) => 0,
+        cursor => cursor.map_or(0, |c| to_usize(c.index)).min(all.len()),
+    };
     let topics: Vec<TopicSnapshot> = all
         .iter()
         .skip(start)

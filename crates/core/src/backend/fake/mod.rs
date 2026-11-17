@@ -95,6 +95,23 @@ pub enum Fault {
     Queued(Duration),
 }
 
+/// A topics call as it reached the fake server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TopicsRequest {
+    /// `getForumTopics`; `first` when it had no cursor.
+    Page { chat: ChatId, first: bool },
+    /// `getForumTopicsByID`.
+    ById { chat: ChatId, ids: Vec<TopicId> },
+}
+
+/// One entry of [`FakeHandle::topics_calls`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopicsCallRecord {
+    pub request: TopicsRequest,
+    /// When the call reached the server (the runtime's clock).
+    pub at: tokio::time::Instant,
+}
+
 /// A fault applied to the next build.
 #[derive(Clone, Copy, Debug)]
 pub enum BuildFault {
@@ -318,6 +335,10 @@ struct State {
     topics: HashMap<ChatId, Vec<TopicSnapshot>>,
     topic_order: HashMap<ChatId, TopicOrder>,
     post_closed: HashMap<ChatId, PostClosed>,
+    /// Topics calls in arrival order (capped).
+    topics_log: Vec<TopicsCallRecord>,
+    /// Forums whose later pages repeat the first page (`repeat_topic_pages`).
+    repeat_pages: Vec<ChatId>,
     /// Updates still to be dropped instead of delivered (`drop_next_update`).
     drop_updates: usize,
     /// Per chat, the newest message id and date ever held: new messages are
@@ -1067,6 +1088,8 @@ impl Client for FakeClient {
         cursor: Option<TopicsCursor>,
         limit: u32,
     ) -> Result<TopicsPage, BackendError> {
+        let first = cursor.is_none();
+        self.log_topics(TopicsRequest::Page { chat, first });
         self.snapshot(Op::Topics, |s| topics::page(s, chat, cursor, limit))
             .await
     }
@@ -1076,6 +1099,11 @@ impl Client for FakeClient {
         chat: ChatId,
         ids: &[TopicId],
     ) -> Result<TopicsById, BackendError> {
+        let ids_logged = ids.to_vec();
+        self.log_topics(TopicsRequest::ById {
+            chat,
+            ids: ids_logged,
+        });
         self.snapshot(Op::TopicsById, |s| topics::by_id(s, chat, ids))
             .await
     }
@@ -1091,6 +1119,12 @@ impl Client for FakeClient {
 }
 
 impl FakeClient {
+    fn log_topics(&self, request: TopicsRequest) {
+        let at = tokio::time::Instant::now();
+        self.shared
+            .with(|s| push_capped(&mut s.topics_log, TopicsCallRecord { request, at }));
+    }
+
     /// The server accepts a send: one new message, remembered by `random_id`.
     fn accept(&self, thread: ThreadKey, text: &str, random_id: i64) -> Result<MsgId, BackendError> {
         self.shared.with(|s| {

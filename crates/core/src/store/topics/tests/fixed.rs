@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::store::topics::entry::Deletion;
-use crate::store::topics::{MAX_TOMBSTONES, MAX_TOPICS_BY_ID, Tail};
+use crate::store::topics::{MAX_TOMBSTONES, MAX_TOPICS_BY_ID, Paging, Tail};
 
 fn with_unread(n: i32, unread: u32, last: i32) -> TopicSnapshot {
     snap(Topic {
@@ -307,4 +307,119 @@ fn a_fresh_by_id_deletion_removes_without_a_suspicion() {
             .is_empty()
     );
     assert!(l.get(tid(2)).is_some() && l.is_due(tid(2)));
+}
+
+/// Task 4 review: a non-empty later page that adds no topic (the server
+/// repeated a page) ends paging, whatever its cursor says; one that adds a
+/// topic keeps paging.
+#[test]
+fn a_page_of_duplicates_ends_paging() {
+    let now = Instant::now();
+    let mut l = loaded(TopicOrder::LastActivity, &[5, 4, 3], now);
+    assert_eq!(l.paging(), Paging::More);
+    load(
+        &mut l,
+        PageKind::Next,
+        page(TopicOrder::LastActivity, snaps(&[4, 3]), Rest::More),
+        now,
+    );
+    assert_eq!(l.paging(), Paging::Complete, "nothing new: paging stops");
+    l.request_page(PageKind::Next);
+    assert!(l.dispatch_page().is_none(), "no redundant request");
+
+    let mut l = loaded(TopicOrder::LastActivity, &[5, 4, 3], now);
+    load(
+        &mut l,
+        PageKind::Next,
+        page(TopicOrder::LastActivity, snaps(&[3, 2]), Rest::More),
+        now,
+    );
+    assert_eq!(l.paging(), Paging::More, "one new topic keeps paging");
+}
+
+/// When the drain has something to fetch: at once for an unlisted open
+/// topic or discovery, at a due topic's backoff end, never while a call is
+/// in flight.
+#[test]
+fn next_by_id_follows_the_backoff() {
+    let now = Instant::now();
+    let mut l = loaded(TopicOrder::LastActivity, &[3, 2], now);
+    assert_eq!(l.next_by_id(now), None, "nothing owed");
+    l.mark_due(tid(3), now);
+    assert_eq!(l.next_by_id(now), Some(now));
+    let (seq, _) = dispatch(&mut l, now);
+    assert_eq!(l.next_by_id(now), None, "one call in flight");
+    l.fail(seq, now).unwrap();
+    assert_eq!(l.next_by_id(now), Some(now + Duration::from_secs(1)));
+    l.set_open(Some(tid(9)));
+    assert_eq!(l.next_by_id(now), Some(now), "the unlisted open topic");
+}
+
+/// Task 6 review: an unlisted open topic that responses neither find nor
+/// delete (or whose calls fail) backs off up to 30 s, instead of costing a
+/// call per second; a new open intent or a refresh makes it eligible again.
+#[test]
+fn an_unanswered_open_topic_backs_off() {
+    let now = Instant::now();
+    let mut l = loaded(TopicOrder::LastActivity, &[3, 2], now);
+    l.set_open(Some(tid(9)));
+    let mut at = now;
+    let mut waits = Vec::new();
+    for _ in 0..8 {
+        let next = l.next_by_id(at).unwrap();
+        waits.push((next - at).as_secs());
+        at = next;
+        let (seq, ids) = dispatch(&mut l, at);
+        assert_eq!(ids, [tid(9)]);
+        l.apply_by_id(seq, by_id(vec![], vec![]), at).unwrap();
+    }
+    assert_eq!(waits, [0, 1, 2, 4, 8, 16, 30, 30]);
+    assert!(
+        l.dispatch_by_id(at).is_none(),
+        "not before its backoff ends"
+    );
+
+    // A failed call backs off too.
+    l.reset_backoff(at);
+    assert_eq!(l.next_by_id(at), Some(at), "a refresh resets it");
+    let (seq, _) = dispatch(&mut l, at);
+    l.fail(seq, at).unwrap();
+    assert_eq!(l.next_by_id(at), Some(at + Duration::from_secs(1)));
+    assert_eq!(l.discover(tid(9)), crate::store::Discovered::Queued);
+    assert_eq!(
+        l.next_by_id(at),
+        Some(at + Duration::from_secs(1)),
+        "discovery doesn't bypass the open topic's backoff"
+    );
+    assert!(l.dispatch_by_id(at).is_none());
+
+    l.set_open(Some(tid(9)));
+    assert_eq!(l.next_by_id(at), Some(at), "a new open intent resets it");
+}
+
+/// Review round 2: an unlisted open topic whose new message arrives while
+/// nothing can be fetched (a flood wait), then is closed: its discovery
+/// intent survives, so the next call fetches it. The same when it was
+/// discovered before it was opened.
+#[test]
+fn closing_an_unlisted_open_topic_keeps_its_discovery() {
+    let now = Instant::now();
+    let mut l = loaded(TopicOrder::LastActivity, &[3, 2], now);
+    l.set_open(Some(tid(9)));
+    l.on_new_message(&message(tid(9), 95), Tail::Hidden, now);
+    l.set_open(None);
+    assert_eq!(l.next_by_id(now), Some(now));
+    let (_, ids) = dispatch(&mut l, now);
+    assert_eq!(ids, [tid(9)], "fetched as discovery");
+
+    let mut l = loaded(TopicOrder::LastActivity, &[3, 2], now);
+    l.on_new_message(&message(tid(8), 85), Tail::Hidden, now);
+    l.set_open(Some(tid(8)));
+    let (seq, ids) = dispatch(&mut l, now);
+    assert_eq!(ids, [tid(8)], "once, in the open slot");
+    l.apply_by_id(seq, by_id(vec![], vec![]), now).unwrap();
+    assert!(l.dispatch_by_id(now).is_none(), "the open slot backs off");
+    l.set_open(None);
+    let (_, ids) = dispatch(&mut l, now);
+    assert_eq!(ids, [tid(8)], "discovered again once closed");
 }

@@ -35,6 +35,8 @@ fn call_error(outcome: &Outcome) -> Option<CallError> {
         Outcome::Dialogs { res: Err(e), .. }
         | Outcome::History { res: Err(e), .. }
         | Outcome::Send { res: Err(e), .. }
+        | Outcome::TopicsPage { res: Err(e), .. }
+        | Outcome::TopicsById { res: Err(e), .. }
         | Outcome::Read(Err(e)) => Some(*e),
         _ => None,
     }
@@ -172,6 +174,8 @@ impl<B: Backend> Actor<B> {
                 let req = HistoryReq { dir, query, floor };
                 self.on_history_done(load, req, res).await;
             }
+            Outcome::TopicsPage { call, kind, res } => self.on_topics_page(call, kind, res).await,
+            Outcome::TopicsById { call, res } => self.on_topics_by_id(call, res).await,
             // Read marks are best effort; the next read covers a lost one.
             Outcome::Read(_) | Outcome::UpdatesEnded(StreamEnd::Cancelled) => {}
             Outcome::CacheChats(chats) => self.on_cache_chats(chats).await,
@@ -713,9 +717,10 @@ impl<B: Backend> Actor<B> {
                 }
             }
             Update::MessageId { random_id, id } => self.on_message_id(random_id, id).await,
-            // Topic reads and topic metadata are triggers for the topic lists,
-            // the forum badge and the kind checks (plan tasks 8 and 9); until
-            // those exist nothing shows topics, so there is nothing to update.
+            // A topic edit reached the retained topic lists when it was
+            // received (`topics::topics_on_update`). Topic reads, pins and
+            // chat changes are triggers for the topic lists, the forum badge
+            // and the kind checks (plan tasks 8 and 9).
             Update::ReadInbox { topic: Some(_), .. }
             | Update::ReadTopicMax { .. }
             | Update::TopicEdited { .. }
@@ -740,7 +745,7 @@ impl<B: Backend> Actor<B> {
     /// Whether the user is looking at `thread`'s live tail right now: the
     /// window is active, the UI reports this thread's tail on screen, and the
     /// window holds the tail. Only then does a new message not count as unread.
-    fn tail_visible(&self, thread: ThreadKey) -> bool {
+    pub(super) fn tail_visible(&self, thread: ThreadKey) -> bool {
         self.window == WindowState::Active
             && self.viewing == Some(thread)
             && self.open == Some(thread)

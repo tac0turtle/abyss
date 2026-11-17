@@ -165,14 +165,19 @@ impl<B: Backend> Actor<B> {
     pub(super) async fn on_feed(&mut self, item: StreamItem) {
         match item {
             StreamItem::Baseline => self.on_baseline().await,
-            StreamItem::Update(update) => match self.boot.as_mut() {
-                Some(boot) => {
-                    if boot.push(update).is_err() {
-                        self.rebuild(Reason::BootOverflow).await;
+            StreamItem::Update(update) => {
+                // Topic lists stamp an update when it is received, also
+                // while it waits here for the windows (`topics`).
+                self.topics_on_update(&update).await;
+                match self.boot.as_mut() {
+                    Some(boot) => {
+                        if boot.push(update).is_err() {
+                            self.rebuild(Reason::BootOverflow).await;
+                        }
                     }
+                    None => self.on_update(update, Origin::Live).await,
                 }
-                None => self.on_update(update, Origin::Live).await,
-            },
+            }
         }
     }
 
@@ -225,6 +230,7 @@ impl<B: Backend> Actor<B> {
                 self.emit(Event::ThreadInvalidated(thread)).await;
             }
         }
+        self.topics_snapshots(kind).await;
         let dialogs = !self.dialogs_busy;
         if dialogs {
             self.dialogs_busy = true;

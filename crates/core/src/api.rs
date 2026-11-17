@@ -1,7 +1,9 @@
 //! Commands the UI sends to core and events core sends back.
 
-use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId, ThreadKey};
-use crate::store::ViewGen;
+use crate::model::{
+    ChatId, ChatSummary, LocalId, Message, MsgId, ThreadKey, Topic, TopicId, TopicOrder,
+};
+use crate::store::{TopicsGen, ViewGen};
 
 pub use crate::auth_types::{
     ApiCredentials, ApiHash, ApiHashError, ApiId, ApiIdError, AuthState, CodeDelivery,
@@ -59,6 +61,16 @@ pub enum Command {
     /// incoming messages; until the app sends it, every incoming message
     /// counts as unread and is cleared by `MarkRead`.
     ViewingTail(Option<ThreadKey>),
+    /// Shows a forum's topic list: the retained copy at once (`TopicsReset`),
+    /// then the server's first page. Closes any other forum view. Inside a
+    /// topics flood wait, only the retained copy is shown and the load ends
+    /// with `LoadEnded { Topics, FloodWait }` at once.
+    OpenForum(ChatId),
+    /// Leaves a forum's topic list; the list stays retained (LRU).
+    CloseForum(ChatId),
+    /// The next topics page of the shown forum. Answered by `TopicsPaging`
+    /// after the page, or by `LoadEnded { Topics }`.
+    LoadTopics(ChatId),
     /// Signs out: remote `auth.logOut`, then local deletion of the session
     /// item and the cache (plan sections 5, 16). While signed out, it retries
     /// the local deletion only.
@@ -120,6 +132,9 @@ impl std::fmt::Debug for Command {
                 .field("max_id", max_id)
                 .finish(),
             Self::ViewingTail(t) => f.debug_tuple("ViewingTail").field(t).finish(),
+            Self::OpenForum(c) => f.debug_tuple("OpenForum").field(c).finish(),
+            Self::CloseForum(c) => f.debug_tuple("CloseForum").field(c).finish(),
+            Self::LoadTopics(c) => f.debug_tuple("LoadTopics").field(c).finish(),
             Self::Logout => f.write_str("Logout"),
             Self::SubmitCredentials { .. } => f.write_str("SubmitCredentials(<redacted>)"),
             Self::ForgetStoredCredentials => f.write_str("ForgetStoredCredentials"),
@@ -231,6 +246,8 @@ pub enum LoadTarget {
     Dialogs,
     /// `LoadOlder` (`dir: Older`) or `LoadNewer` (`dir: Newer`) of `thread`.
     History { thread: ThreadKey, dir: HistoryDir },
+    /// `OpenForum` or `LoadTopics` of this forum.
+    Topics(ChatId),
 }
 
 /// Which part of a window a history event extends.
@@ -317,6 +334,47 @@ pub enum Event {
         thread: ThreadKey,
         sends: Vec<LocalId>,
     },
+    /// A forum's whole topic list (shown topics, in display order),
+    /// replacing the UI's copy and its order. `view` tags the list's
+    /// generation: later `TopicsAppended`/`TopicsPaging` of another view
+    /// are stale.
+    TopicsReset {
+        chat: ChatId,
+        view: TopicsGen,
+        order: TopicOrder,
+        topics: Vec<Topic>,
+        /// The user may post in closed topics.
+        can_post_closed: bool,
+    },
+    /// Topics a page or by-id result added or changed, in the order core
+    /// applied them (see `store::ListChange` for the placement rule).
+    TopicsAppended {
+        chat: ChatId,
+        view: TopicsGen,
+        topics: Vec<Topic>,
+    },
+    /// Whether more topics pages can be loaded (`LoadTopics`), after every
+    /// applied page.
+    TopicsPaging {
+        chat: ChatId,
+        view: TopicsGen,
+        has_more: bool,
+    },
+    /// A topic of the shown forum changed live; it moves only as
+    /// `store::ListChange::Bumped` says.
+    TopicBumped {
+        chat: ChatId,
+        topic: Topic,
+    },
+    /// A topic left the shown list: deleted (then its open thread is
+    /// invalidated), hidden, or cut by the cap.
+    TopicRemoved {
+        chat: ChatId,
+        topic: TopicId,
+    },
+    /// The forum's topic list was dropped (reconcile, a forum flag change):
+    /// drop the copy and wait for `TopicsReset`.
+    ForumInvalidated(ChatId),
     Edited(Message),
     Deleted {
         chat: ChatId,
@@ -369,6 +427,11 @@ impl Event {
             Event::Edited(m) => m.retained_bytes(),
             Event::Deleted { ids, .. } => ids.capacity() * std::mem::size_of::<MsgId>(),
             Event::SendsCovered { sends, .. } => sends.capacity() * std::mem::size_of::<LocalId>(),
+            Event::TopicsReset { topics, .. } | Event::TopicsAppended { topics, .. } => {
+                topics.capacity() * std::mem::size_of::<Topic>()
+                    + topics.iter().map(Topic::retained_bytes).sum::<usize>()
+            }
+            Event::TopicBumped { topic, .. } => topic.retained_bytes(),
             _ => 0,
         }
     }

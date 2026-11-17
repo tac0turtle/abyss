@@ -21,6 +21,7 @@ mod peers;
 mod sends;
 #[cfg(all(test, feature = "fake"))]
 mod tests;
+mod topics;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -84,6 +85,9 @@ fn account_scoped(cmd: &Command) -> bool {
             | Command::DiscardSend(_)
             | Command::MarkRead { .. }
             | Command::ViewingTail(_)
+            | Command::OpenForum(_)
+            | Command::CloseForum(_)
+            | Command::LoadTopics(_)
     )
 }
 
@@ -146,6 +150,8 @@ pub(crate) struct Actor<B: Backend> {
     viewing: Option<ThreadKey>,
     /// The peer set last handed to the instance (`Client::retain_peers`).
     peers: peers::PeerSync,
+    /// Forum topic lists and their account-level limits (`topics`).
+    topics: topics::TopicLists,
     /// Highest displayed id per thread, flushed every `READ_FLUSH`.
     reads: HashMap<ThreadKey, MsgId>,
     sends: sends::PendingSends,
@@ -232,6 +238,7 @@ impl<B: Backend> Actor<B> {
             open: None,
             viewing: None,
             peers: peers::PeerSync::default(),
+            topics: topics::TopicLists::default(),
             reads: HashMap::new(),
             sends: sends::PendingSends::default(),
             deadline: CALL_DEADLINE,
@@ -264,6 +271,7 @@ impl<B: Backend> Actor<B> {
             let baseline_by = self.boot.as_ref().and_then(Boot::baseline_deadline);
             let refresh_at = self.refresh_due();
             let flood_over = self.auth.flood_deadline();
+            let topics_at = self.topics_wake();
             // Paused while a logout hides the account (`paused`).
             let send_due = self
                 .sends
@@ -292,6 +300,8 @@ impl<B: Backend> Actor<B> {
                 () = sleep_until(refresh_at) => self.refresh().await,
                 () = sleep_until(flood_over) => self.flood_over().await,
                 () = sleep_until(send_due) => self.resume_flooded_sends().await,
+                // `pump_topics` below dispatches what became due.
+                () = sleep_until(topics_at) => {}
                 _ = flush.tick() => self.flush_reads().await,
             }
             // User loads first; background coverage only when idle.
@@ -299,6 +309,7 @@ impl<B: Backend> Actor<B> {
             self.run_cover_fetch().await;
             debug_assert!(self.owed_is_current(), "owed load of an old view");
             debug_assert!(self.open_is_retained(), "open chat without its window");
+            self.pump_topics().await;
             self.pump();
             self.sync_peers();
         }
@@ -419,18 +430,22 @@ impl<B: Backend> Actor<B> {
             return;
         };
         let user = self.life.phase == Phase::Live;
+        // A topics flood wait is checked at admission too: a topics job
+        // queued before it began stays queued (in order, the queue still
+        // bounded) while other jobs pass it.
+        let held = self.topics.flooded();
+        let admissible = |job: &Job| !(held && job.is_topics());
         loop {
-            let queue = if !self.priority.is_empty() {
-                &mut self.priority
-            } else if user && !self.queue.is_empty() {
-                &mut self.queue
-            } else {
-                return;
+            let first = |q: &VecDeque<Job>| q.iter().position(admissible);
+            let (queue, at) = match (first(&self.priority), first(&self.queue)) {
+                (Some(at), _) => (&mut self.priority, at),
+                (None, Some(at)) if user => (&mut self.queue, at),
+                _ => return,
             };
             let Some(permit) = self.admission.try_acquire() else {
                 return;
             };
-            let Some(job) = queue.pop_front() else {
+            let Some(job) = queue.remove(at) else {
                 return;
             };
             let ctx = CallCtx {
@@ -460,6 +475,9 @@ impl<B: Backend> Actor<B> {
                 Job::History { load, .. } => {
                     self.release_history(load);
                     self.covers.fetch_ended(load.thread, load.req);
+                }
+                Job::TopicsPage { call, .. } | Job::TopicsById { call, .. } => {
+                    self.topics_job_purged(call);
                 }
                 Job::Send { .. } | Job::Read { .. } => {}
             }
@@ -532,6 +550,12 @@ impl<B: Backend> Actor<B> {
                     self.emit(Event::SendState { local_id, state }).await;
                 }
             }
+            Some(TaskKind::TopicsPage(call)) => {
+                self.topics_call_panicked(call, topics::Fetch::Page).await;
+            }
+            Some(TaskKind::TopicsById(call)) => {
+                self.topics_call_panicked(call, topics::Fetch::ById).await;
+            }
             Some(TaskKind::Updates) => {
                 self.error(UserError::Internal).await;
                 return self.rebuild(Reason::StreamFailed).await;
@@ -572,7 +596,10 @@ impl<B: Backend> Actor<B> {
         match cmd {
             Command::LoadDialogs => self.load_dialogs().await,
             Command::OpenThread(thread) => self.open_thread(thread).await,
-            Command::CloseThread(thread) => self.close_thread(thread),
+            Command::CloseThread(thread) => self.close_thread(thread).await,
+            Command::OpenForum(chat) => self.open_forum(chat).await,
+            Command::CloseForum(chat) => self.close_forum(chat),
+            Command::LoadTopics(chat) => self.load_topics(chat).await,
             Command::LoadOlder(thread) => {
                 self.load_more(Deferred::fresh(thread, HistoryDir::Older))
                     .await;
@@ -648,7 +675,8 @@ impl<B: Backend> Actor<B> {
             self.windows.invalidate(thread);
         }
         let view = self.windows.open(thread);
-        self.open = Some(thread);
+        let prev = self.open.replace(thread);
+        self.follow_open_thread(prev).await;
         self.seed_view(thread, view).await;
         let load = self.begin_load(thread, view);
         self.claim_if_booting(load);
@@ -716,11 +744,12 @@ impl<B: Backend> Actor<B> {
         }
     }
 
-    fn close_thread(&mut self, thread: ThreadKey) {
+    async fn close_thread(&mut self, thread: ThreadKey) {
         self.windows.close(thread);
         self.forget_owed(thread);
         if self.open == Some(thread) {
             self.open = None;
+            self.follow_open_thread(Some(thread)).await;
         }
     }
 

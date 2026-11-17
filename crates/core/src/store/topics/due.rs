@@ -22,6 +22,32 @@ pub(super) fn backoff(step: u8) -> Duration {
     }
 }
 
+/// The by-id retry state of an unlisted open topic: eligible at once,
+/// backing off (1 s, 2 s, … up to [`MAX_DUE_BACKOFF`]) after each call that
+/// failed or left it unanswered. A new open intent or a refresh resets it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Retry {
+    /// `None`: eligible now.
+    next_try: Option<Instant>,
+    step: u8,
+}
+
+impl Retry {
+    pub(super) fn eligible(self, now: Instant) -> bool {
+        self.next_try.is_none_or(|at| at <= now)
+    }
+
+    pub(super) fn back_off(&mut self, now: Instant) {
+        self.step = self.step.saturating_add(1).min(8);
+        self.next_try = Some(now + backoff(self.step));
+    }
+
+    /// When it is eligible, at or after `now`.
+    fn at(self, now: Instant) -> Instant {
+        self.next_try.map_or(now, |at| at.max(now))
+    }
+}
+
 /// A topic's owed refetch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Due {
@@ -92,10 +118,33 @@ impl TopicList {
 
     /// Light refresh and reconcile: every due topic may be tried now.
     pub fn reset_backoff(&mut self, now: Instant) {
+        self.open_retry = Retry::default();
         for due in self.entries.iter_mut().filter_map(|e| e.due.as_mut()) {
             due.step = 0;
             due.next_try = now;
         }
+    }
+
+    /// The earliest time at or after `now` when [`TopicList::dispatch_by_id`]
+    /// has something to fetch, ignoring the caller's rate limits: `now` for
+    /// an unlisted open topic or discovery ids, else the earliest backoff
+    /// end of a due topic no call is serving. `None` while a by-id call is
+    /// in flight or nothing is owed, so a caller can sleep until it.
+    pub fn next_by_id(&self, now: Instant) -> Option<Instant> {
+        if self.by_id.is_some() {
+            return None;
+        }
+        if self.discovery.iter().any(|id| Some(*id) != self.open) {
+            return Some(now);
+        }
+        let open = self.unlisted_open().map(|_| self.open_retry.at(now));
+        self.entries
+            .iter()
+            .filter_map(|e| e.due)
+            .filter(|d| d.flight.is_none())
+            .map(|d| d.next_try.max(now))
+            .chain(open)
+            .min()
     }
 
     pub fn is_due(&self, id: TopicId) -> bool {
