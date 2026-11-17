@@ -1,7 +1,9 @@
 use std::time::Instant;
 
 use abyss_core::api::{Command, HistoryDir, LoadTarget, SendState, UserError, WindowState};
-use abyss_core::model::{Body, ChatKind, LocalId, PeerFolder, PeerKind, ThreadKey};
+use abyss_core::model::{
+    Body, ChatKind, LocalId, MsgId, PeerFolder, PeerKind, ReadState, ThreadKey,
+};
 use abyss_core::rich_text::RichText;
 use abyss_core::store::ViewGen;
 
@@ -54,7 +56,10 @@ fn summary() -> ChatSummary {
         title: "c".into(),
         kind: ChatKind::Private { contact: false },
         pinned: false,
-        unread: 2,
+        read: ReadState {
+            unread: 2,
+            read_inbox_max: MsgId(0),
+        },
         unread_mentions: 0,
         last: None,
         last_date: 0,
@@ -62,6 +67,7 @@ fn summary() -> ChatSummary {
         can_send: true,
         muted_until: 0,
         folder: PeerFolder::Main,
+        reading: None,
     }
 }
 

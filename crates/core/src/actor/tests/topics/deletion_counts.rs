@@ -33,7 +33,7 @@ fn counts(events: &[Event], t: TopicId) -> Vec<u32> {
 
 /// The forum's badge as the events report it, last first.
 fn badge(events: &[Event], f: ChatId) -> Option<u32> {
-    last_bump(events, f).map(|s| s.unread)
+    last_bump(events, f).map(|s| s.read.unread)
 }
 
 /// Forum 100: topics A (2) and B (3), with unread posts 10 and 11 in A

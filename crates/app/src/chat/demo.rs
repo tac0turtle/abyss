@@ -11,7 +11,7 @@
 use abyss_core::backend::fake::FakeScript;
 use abyss_core::model::{
     Body, ChatFolder, ChatId, ChatKind, ChatSummary, FolderRules, MediaKind, Message, MsgId,
-    PeerFolder, PeerKind, Preview, Sender, ThreadKey, TopicOrder,
+    PeerFolder, PeerKind, Preview, ReadState, Sender, ThreadKey, TopicOrder,
 };
 use abyss_core::rich_text::{EntityKind, MAX_ENTITIES, RawEntity, RichText};
 use abyss_core::sanitize::display_name;
@@ -73,7 +73,10 @@ fn summary(n: i64, now: i64) -> ChatSummary {
         title: display_name(&title),
         kind,
         pinned: n <= 3,
-        unread: u32::try_from(n % 9).unwrap_or(0) * u32::try_from(n % 3).unwrap_or(0),
+        read: ReadState {
+            unread: u32::try_from(n % 9).unwrap_or(0) * u32::try_from(n % 3).unwrap_or(0),
+            read_inbox_max: MsgId(0),
+        },
         unread_mentions: 0,
         last: Some(last),
         last_date: now - n * 3_600,
@@ -92,6 +95,7 @@ fn summary(n: i64, now: i64) -> ChatSummary {
         } else {
             PeerFolder::Main
         },
+        reading: None,
     }
 }
 

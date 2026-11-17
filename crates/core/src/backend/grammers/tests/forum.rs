@@ -477,7 +477,7 @@ fn forum_updates_map_to_domain_updates() {
     let read = U::ReadHistoryInbox(history_read(peer_user(7), Some(3)));
     assert!(matches!(
         lists::update(&read, &dir),
-        Some(Update::ReadInbox { chat, topic: Some(t), still_unread: 2 })
+        Some(Update::ReadInbox { chat, topic: Some(t), still_unread: 2, max_id: MsgId(9) })
             if chat == ANN && t == topic_id(3)
     ));
     let chat_read = U::ReadHistoryInbox(history_read(peer_user(7), None));
@@ -918,7 +918,7 @@ async fn peer_dialogs_ask_for_known_peers_and_map_the_kind() {
     let ids: Vec<ChatId> = before.iter().map(|c| c.id).collect();
     assert_eq!(ids, vec![GROUP, ANN]);
     let group = &before[0];
-    assert_eq!(group.unread, 4);
+    assert_eq!(group.read.unread, 4);
     assert_eq!(group.last_id, Some(MsgId(30)));
     assert_eq!(
         group.kind,

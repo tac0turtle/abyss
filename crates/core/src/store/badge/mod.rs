@@ -47,6 +47,10 @@ struct ChatBadge {
 pub struct Badges {
     seq: BadgeSeq,
     chats: BTreeMap<ChatId, ChatBadge>,
+    /// The one chat tracked beyond the retained dialogs: the chat the pane
+    /// shows when it isn't listed (a window only), so a read of it is
+    /// refreshed too (stage 2 plan, section 17.6.2).
+    extra: Option<ChatId>,
 }
 
 impl Badges {
@@ -55,9 +59,40 @@ impl Badges {
         self.chats.entry(chat).or_default();
     }
 
-    /// Keeps only the chats still retained.
+    /// Keeps only the chats still retained, and the extra chat.
     pub fn retain(&mut self, mut keep: impl FnMut(ChatId) -> bool) {
-        self.chats.retain(|c, _| keep(*c));
+        let extra = self.extra;
+        self.chats.retain(|c, _| keep(*c) || extra == Some(*c));
+    }
+
+    /// Tracks `chat`, which isn't a retained dialog, as the one extra chat.
+    /// The previous extra chat's state goes unless `listed` says it is
+    /// retained, so at most one chat is tracked beyond the dialogs.
+    pub fn track_extra(&mut self, chat: ChatId, listed: impl Fn(ChatId) -> bool) {
+        if let Some(old) = self.extra.replace(chat)
+            && old != chat
+            && !listed(old)
+        {
+            self.chats.remove(&old);
+        }
+        self.track(chat);
+    }
+
+    /// Keeps the extra chat only while it is `shown` and not `listed`.
+    /// Otherwise the marker goes, and with it the chat's state unless it is
+    /// listed (then it is an ordinary retained dialog).
+    pub fn reconcile_extra(&mut self, shown: Option<ChatId>, listed: impl Fn(ChatId) -> bool) {
+        let Some(extra) = self.extra else {
+            return;
+        };
+        let is_listed = listed(extra);
+        if shown == Some(extra) && !is_listed {
+            return;
+        }
+        self.extra = None;
+        if !is_listed {
+            self.chats.remove(&extra);
+        }
     }
 
     pub fn len(&self) -> usize {

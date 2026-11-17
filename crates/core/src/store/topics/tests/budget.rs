@@ -165,13 +165,14 @@ fn list_bound() -> usize {
 }
 
 /// The worst case for the whole account: the outer containers, every list,
-/// the badge stamps (one per retained dialog) and the kind-check FIFO with
+/// the badge stamps (one per retained dialog, plus the pane's chat when it
+/// isn't listed: `Badges::track_extra`) and the kind-check FIFO with
 /// its per-chat marks (bounded by the required-peer set; task 8 builds them,
 /// so they are charged generously: a FIFO of twice the bound, and 16 bytes
 /// of marks per chat).
 fn account_bound() -> usize {
     let badges = btree_bytes(
-        MAX_DIALOGS,
+        MAX_DIALOGS + 1,
         size_of::<ChatId>() + crate::store::badge::CHAT_BADGE_BYTES,
     );
     let kind_fifo = heap(2 * MAX_PINNED_PEERS * size_of::<ChatId>());

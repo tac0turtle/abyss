@@ -288,7 +288,7 @@ async fn a_topic_read_lowers_its_count_and_the_forum_badge() {
     // Every third topic has unread posts: General, 3, 6, ... (ids 1, 4, 7, ...).
     let before = f.by_id(4).await.unwrap().topic;
     assert!(before.unread > 0);
-    let badge = |peers: Vec<crate::model::ChatSummary>| peers[0].unread;
+    let badge = |peers: Vec<crate::model::ChatSummary>| peers[0].read.unread;
     let unread_topics = badge(f.client.peer_dialogs(&[FORUM]).await.unwrap());
     assert_eq!(unread_topics, 21);
     f.client
@@ -303,7 +303,7 @@ async fn a_topic_read_lowers_its_count_and_the_forum_badge() {
     );
     let page = f.client.dialogs(None, 10).await.unwrap();
     let row = page.chats.iter().find(|c| c.id == FORUM).unwrap();
-    assert_eq!(row.unread, 20, "dialogs pages agree");
+    assert_eq!(row.read.unread, 20, "dialogs pages agree");
 }
 
 #[tokio::test(start_paused = true)]
@@ -443,11 +443,16 @@ async fn a_delayed_answer_is_the_state_at_call_time() {
             .closed
     );
     assert_eq!(
-        peers.await.unwrap().unwrap()[0].unread,
+        peers.await.unwrap().unwrap()[0].read.unread,
         21,
         "taken before the post"
     );
-    assert_eq!(f.client.peer_dialogs(&[FORUM]).await.unwrap()[0].unread, 22);
+    assert_eq!(
+        f.client.peer_dialogs(&[FORUM]).await.unwrap()[0]
+            .read
+            .unread,
+        22
+    );
     assert!(
         f.by_id(2).await.unwrap().topic.closed,
         "a later call sees it"

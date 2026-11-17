@@ -792,7 +792,10 @@ fn the_unread_filter_keeps_opened_topics_under_the_forum(cx: &mut TestAppContext
     topics_listed(&harness, cx, topics, Pages::Done);
     assert_eq!(inline(&root, cx), topic_rows([1, 2]));
     let badge = |unread| ChatSummary {
-        unread,
+        read: abyss_core::model::ReadState {
+            unread,
+            read_inbox_max: MsgId(0),
+        },
         ..forum_chat(IS_FORUM)
     };
     core_sends(&harness, cx, Event::ChatBumped(badge(5)));
@@ -917,7 +920,7 @@ fn a_demo_topic_thread_keeps_to_itself() {
 
 /// The demo forum's badge.
 fn badge(shell: &crate::chat::ChatShell) -> Option<u32> {
-    shell.list.get(DEMO_FORUM).map(|c| c.unread)
+    shell.list.get(DEMO_FORUM).map(|c| c.read.unread)
 }
 
 /// Whether the open thread's window loaded some messages.

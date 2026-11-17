@@ -9,7 +9,9 @@ use super::message::{message, raw_date, raw_key};
 use super::peers::{Directory, MAX_DIRECTORY, channel_chat, chat_id};
 use super::topics::{forum_update, topic_of};
 use crate::backend::{DialogsCursor, HistoryPage, HistoryQuery, Update};
-use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerFolder, Preview, ThreadKey};
+use crate::model::{
+    ChatId, ChatSummary, Message, MsgId, PeerFolder, Preview, ReadState, ThreadKey,
+};
 use crate::store::{ForumStatus, Route, route};
 
 /// Ids accepted from one deletion update. Telegram batches at most 100 per
@@ -215,7 +217,10 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
         title: entry.title.clone(),
         kind: entry.kind,
         pinned: d.pinned,
-        unread: count(d.unread_count),
+        read: ReadState {
+            unread: count(d.unread_count),
+            read_inbox_max: MsgId(d.read_inbox_max_id.max(0)),
+        },
         unread_mentions: count(d.unread_mentions_count),
         last: last_message.as_ref().map(Preview::of),
         last_date: last_message.as_ref().map_or(0, |m| m.date),
@@ -225,6 +230,7 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
         can_send: entry.can_send,
         muted_until: muted_until(&d.notify_settings),
         folder: peer_folder(d.folder_id.unwrap_or(0)),
+        reading: None,
     };
     if summary.is_valid() {
         out.chats.push(summary);
@@ -386,11 +392,13 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
                 None => None,
             },
             still_unread: count(u.still_unread_count),
+            max_id: MsgId(u.max_id.max(0)),
         }),
         U::ReadChannelInbox(u) => Some(Update::ReadInbox {
             chat: channel_chat(u.channel_id)?,
             topic: None,
             still_unread: count(u.still_unread_count),
+            max_id: MsgId(u.max_id.max(0)),
         }),
         // A chat folder was created, edited, deleted or reordered: core
         // refetches the list (folders plan, part B).

@@ -19,10 +19,10 @@ async fn mark_read(h: &Harness, thread: ThreadKey, max_id: i32) {
 /// A topic read fails transiently, then times out, then lands only after
 /// a long delay: the intent is retried with backoff without a second
 /// `MarkRead`. Until it lands nothing is refetched and the badge keeps the
-/// server's count; once it lands the topic shows `ReadSince`, is refetched
-/// by id, and the badge is refreshed to the count after the read. Remote
-/// reads of each kind make their topic due (`Stale`). Marks of two threads
-/// in one flush are two reads.
+/// server's count; once it lands the topic's pointer rises to it, the topic
+/// shows `ReadSince`, is refetched by id, and the badge is refreshed to the
+/// count after the read. Remote reads of each kind make their topic due
+/// (`Stale`). Marks of two threads in one flush are two reads.
 #[tokio::test(start_paused = true)]
 async fn a_topic_read_triggers_only_once_it_lands() {
     let f = forum(100);
@@ -51,8 +51,9 @@ async fn a_topic_read_triggers_only_once_it_lands() {
     assert_eq!(h.fake.read_calls(), vec![(topic_key(f, 2), MsgId(10))]);
     let states = states_of(&late, tid(2));
     assert_eq!(
-        states.first().map(|t| t.freshness),
-        Some(Freshness::ReadSince)
+        states.first().map(|t| (t.freshness, t.read_inbox_max)),
+        Some((Freshness::ReadSince, MsgId(10))),
+        "the pointer rises with the read"
     );
     assert_eq!(
         states.last().map(|t| (t.unread, t.freshness)),
@@ -65,13 +66,14 @@ async fn a_topic_read_triggers_only_once_it_lands() {
             .any(|(ids, _)| ids.contains(&tid(2)))
     );
     assert_eq!(peer_calls_with(&h, f).len(), peers + 1);
-    assert_eq!(last_bump(&late, f).map(|c| c.unread), Some(0));
+    assert_eq!(last_bump(&late, f).map(|c| c.read.unread), Some(0));
 
     h.fake
         .push_update(Update::ReadInbox {
             chat: f,
             topic: Some(TopicId::GENERAL),
             still_unread: 0,
+            max_id: MsgId(0),
         })
         .await;
     h.fake

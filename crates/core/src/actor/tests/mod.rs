@@ -13,6 +13,7 @@ mod folders;
 mod lifecycle;
 mod logout;
 mod onboarding;
+mod reads;
 mod topic_keys;
 mod topics;
 mod watchdog;
@@ -532,7 +533,7 @@ async fn live_messages_extend_open_window_and_bump_others() {
     let (ev, _) = h
         .until(|e| matches!(e, Event::ChatBumped(s) if s.id == chat(2)))
         .await;
-    assert!(matches!(ev, Event::ChatBumped(s) if s.unread == 1));
+    assert!(matches!(ev, Event::ChatBumped(s) if s.read.unread == 1));
     h.fake
         .push_update(Update::Deleted {
             chat: Some(chat(1)),

@@ -609,9 +609,10 @@ fn disclosure(inline: Inline, cx: &mut Context<'_, Root>) -> Stateful<Div> {
         }))
 }
 
-/// A chat row's unread count.
+/// A chat row's unread count, as displayed (core's read overlay applied).
 fn unread_badge(chat: &ChatSummary, surface: Rgba, ink: Rgba) -> Option<Div> {
-    (chat.unread > 0).then(|| count_badge(chat.unread, chat.unread_mentions, surface, ink))
+    let unread = chat.displayed_unread();
+    (unread > 0).then(|| count_badge(unread, chat.unread_mentions, surface, ink))
 }
 
 /// An unread count, marked when it holds mentions: the row's own two

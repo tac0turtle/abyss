@@ -143,6 +143,8 @@ pub enum Update {
         chat: ChatId,
         topic: Option<TopicId>,
         still_unread: u32,
+        /// The highest id read (`max_id`).
+        max_id: MsgId,
     },
     /// A topic read on another device, without a count
     /// (`updateReadChannelDiscussionInbox`).

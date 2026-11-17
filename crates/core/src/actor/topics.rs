@@ -623,16 +623,17 @@ impl<B: Backend> Actor<B> {
         })
     }
 
-    /// A local read of `thread`'s topic completed: the topic's count may
-    /// have changed, so it is due (`ReadSince`).
-    pub(super) async fn topic_read(&mut self, thread: ThreadKey) {
+    /// A local read of `thread`'s topic up to `max_id` completed: the
+    /// topic's pointer rises to it, and its count may have changed, so it
+    /// is due (`ReadSince`).
+    pub(super) async fn topic_read(&mut self, thread: ThreadKey, max_id: MsgId) {
         let Some(topic) = thread.topic else {
             return;
         };
         let Some(list) = self.topics.lists.get_mut(thread.chat) else {
             return;
         };
-        let changes = list.trigger_unread(topic, UnreadTrigger::ReadLocally, now());
+        let changes = list.read_locally(topic, max_id, now());
         self.emit_list_changes(thread.chat, changes).await;
     }
 

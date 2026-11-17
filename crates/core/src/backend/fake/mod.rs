@@ -10,7 +10,7 @@
 //! history, sends and reads per thread, peer dialogs, and controls that change
 //! topics on the server and emit the matching updates (see `topics`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,7 +28,7 @@ use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
 use crate::credentials::{CredentialSlot, EnvResolution};
 use crate::model::{
     Body, ChatFolder, ChatId, ChatKind, ChatSummary, FolderEdit, FolderRules, Message, MsgId,
-    PeerFolder, PeerKind, ThreadKey, TopicId, TopicOrder, TopicSnapshot,
+    PeerFolder, PeerKind, ReadState, ThreadKey, TopicId, TopicOrder, TopicSnapshot,
 };
 use crate::rich_text::RichText;
 use crate::session::AbyssSession;
@@ -295,7 +295,7 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
             ChatKind::Private { contact: false }
         },
         pinned: false,
-        unread: 0,
+        read: ReadState::default(),
         unread_mentions: 0,
         last: None,
         last_date: 0,
@@ -303,6 +303,7 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
         can_send: true,
         muted_until: 0,
         folder: PeerFolder::Main,
+        reading: None,
     }
 }
 
@@ -465,6 +466,9 @@ struct State {
     /// The last `Client::retain_peers` set.
     retained: Option<Vec<ChatId>>,
     read: Vec<(ThreadKey, MsgId)>,
+    /// Chats whose read pointer a read moved: their count is served from
+    /// their history (`topics::current_summary`).
+    pointed: HashSet<ChatId>,
     topics: HashMap<ChatId, Vec<TopicSnapshot>>,
     topic_order: HashMap<ChatId, TopicOrder>,
     post_closed: HashMap<ChatId, PostClosed>,
@@ -679,6 +683,16 @@ impl FakeHandle {
     /// one), unless [`Self::drop_next_update`] asked for it to be lost.
     pub async fn push_update(&self, update: Update) {
         let lost = self.shared.with(|s| {
+            // A read on another device moves the server's pointer too.
+            if let Update::ReadInbox {
+                chat,
+                topic: None,
+                max_id,
+                ..
+            } = update
+            {
+                topics::move_pointer(s, chat, max_id);
+            }
             let lost = s.drop_updates > 0;
             s.drop_updates = s.drop_updates.saturating_sub(1);
             lost

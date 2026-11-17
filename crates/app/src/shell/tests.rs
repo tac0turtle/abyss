@@ -661,7 +661,7 @@ mod fake {
             },
             "Bumped",
         );
-        bumped.unread = 4;
+        bumped.read.unread = 4;
         // A new message (a newer id) moves the chat up; read-state changes
         // alone do not.
         bumped.last_date = i64::from(i32::MAX);

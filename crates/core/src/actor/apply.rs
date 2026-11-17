@@ -864,7 +864,8 @@ impl<B: Backend> Actor<B> {
                 chat,
                 topic: None,
                 still_unread,
-            } => self.chat_read(chat, still_unread).await,
+                max_id,
+            } => self.chat_read(chat, still_unread, max_id).await,
             // Topic reads on another device: the topics were triggered when
             // received (`topics::topics_on_update`); the badge refreshes.
             Update::ReadInbox {

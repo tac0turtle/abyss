@@ -253,7 +253,7 @@ impl Dialogs {
         summary.last_date = summary.last_date.max(last.date);
         summary.last_id = Some(last.id);
         if unread == Unread::Increment {
-            summary.unread = summary.unread.saturating_add(1);
+            summary.read.unread = summary.read.unread.saturating_add(1);
         }
         let insert_at = if summary.pinned {
             pos
@@ -287,7 +287,7 @@ impl Dialogs {
             list.iter().find(|c| c.id == id).map(|c| Current {
                 kind: c.kind,
                 folder: c.folder,
-                unread: c.unread,
+                read: c.read,
             })
         };
         self.fields.guard(page, seq, held, current)
@@ -334,7 +334,8 @@ impl Dialogs {
         let before = summary.clone();
         summary.title = fresh.title;
         summary.kind = fresh.kind;
-        summary.unread = fresh.unread;
+        summary.read = fresh.read;
+        summary.reading = fresh.reading;
         summary.unread_mentions = fresh.unread_mentions;
         summary.can_send = fresh.can_send;
         summary.muted_until = fresh.muted_until;
@@ -362,13 +363,56 @@ impl Dialogs {
         Some(summary)
     }
 
-    /// Sets the unread count, live (a local read, or a chat-level read on
-    /// another device) at badge clock `now`.
-    pub fn set_unread(&mut self, chat: ChatId, unread: u32, now: BadgeSeq) -> Option<&ChatSummary> {
+    /// A chat-level read update from the server (a read here or on another
+    /// device), live at badge clock `now`: the count it states, and the
+    /// pointer raised to its `max_id`.
+    pub fn server_read(
+        &mut self,
+        chat: ChatId,
+        still_unread: u32,
+        max_id: MsgId,
+        now: BadgeSeq,
+    ) -> Option<&ChatSummary> {
         let summary = self.list.iter_mut().find(|c| c.id == chat)?;
-        summary.unread = unread;
+        summary.read.unread = still_unread;
+        summary.read.read_inbox_max = summary.read.read_inbox_max.max(max_id);
         self.fields.unread_changed(chat, now);
-        self.list.iter().find(|c| c.id == chat)
+        Some(summary)
+    }
+
+    /// A read up to `max_id` succeeded at badge clock `now`: the server's
+    /// pointer is at least that high. It proves no count, so nothing is
+    /// stamped. A chat that isn't listed (a window only) has it remembered
+    /// for the page that lists it. `None` when the chat isn't listed or its
+    /// pointer was already there.
+    pub fn read_landed(
+        &mut self,
+        chat: ChatId,
+        max_id: MsgId,
+        now: BadgeSeq,
+    ) -> Option<&ChatSummary> {
+        if self.get(chat).is_none() {
+            self.fields.read_landed_unlisted(chat, max_id, now);
+            return None;
+        }
+        let summary = self
+            .list
+            .iter_mut()
+            .find(|c| c.id == chat && c.read.read_inbox_max < max_id)?;
+        summary.read.read_inbox_max = max_id;
+        Some(summary)
+    }
+
+    /// Sets the row's read overlay ([`ChatSummary::reading`]) to what the
+    /// read intents say now. `None` when the chat isn't listed or it was
+    /// already that.
+    pub fn set_reading(&mut self, chat: ChatId, reading: Option<MsgId>) -> Option<&ChatSummary> {
+        let summary = self
+            .list
+            .iter_mut()
+            .find(|c| c.id == chat && c.reading != reading)?;
+        summary.reading = reading;
+        Some(summary)
     }
 
     /// A counted live message changed `chat`'s unread count (Stage 1
@@ -388,7 +432,7 @@ impl Dialogs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ChatKind, PeerKind};
+    use crate::model::{ChatKind, PeerKind, ReadState};
     use crate::store::Badges;
 
     fn id(id: i64) -> ChatId {
@@ -404,7 +448,7 @@ mod tests {
             title: format!("c{n}"),
             kind: ChatKind::Private { contact: false },
             pinned: false,
-            unread: 0,
+            read: ReadState::default(),
             unread_mentions: 0,
             last: None,
             last_date: 0,
@@ -412,6 +456,7 @@ mod tests {
             can_send: true,
             muted_until: 0,
             folder: PeerFolder::Main,
+            reading: None,
         }
     }
 
@@ -446,11 +491,11 @@ mod tests {
         // Same timestamp, newer id: a new message, counted.
         assert!(matches!(
             d.bump(id(2), last(11), Unread::Increment),
-            Bump::Updated(ref s) if s.unread == 2 && s.last_id == Some(MsgId(11))
+            Bump::Updated(ref s) if s.read.unread == 2 && s.last_id == Some(MsgId(11))
         ));
         // Already reflected: nothing changes, nothing is counted twice.
         assert_eq!(d.bump(id(2), last(11), Unread::Increment), Bump::Reflected);
-        assert_eq!(d.get(id(2)).map(|c| c.unread), Some(2));
+        assert_eq!(d.get(id(2)).map(|c| c.read.unread), Some(2));
     }
 
     #[test]
@@ -458,7 +503,7 @@ mod tests {
         let mut d = Dialogs::default();
         d.reset(vec![pinned(1), pinned(2), chat(3), chat(4)]);
         let r = d.bump(id(4), last(10), Unread::Increment);
-        assert!(matches!(r, Bump::Updated(ref s) if s.unread == 1));
+        assert!(matches!(r, Bump::Updated(ref s) if s.read.unread == 1));
         assert_eq!(ids(&d), vec![1, 2, 4, 3]);
     }
 
@@ -535,23 +580,23 @@ mod tests {
         let mut d = Dialogs::default();
         d.reset(vec![chat(1), chat(2)]);
         let mut fresh = chat(1);
-        fresh.unread = 3;
+        fresh.read.unread = 3;
         let changed = d
             .append(vec![fresh.clone(), chat(2), chat(3)], Rest::More)
             .changed;
         assert_eq!(changed, vec![fresh, chat(3)]);
         assert_eq!(ids(&d), vec![1, 2, 3]);
-        assert_eq!(d.as_slice()[0].unread, 3);
+        assert_eq!(d.as_slice()[0].read.unread, 3);
     }
 
     #[test]
     fn unread_saturates() {
         let mut d = Dialogs::default();
         let mut c = chat(1);
-        c.unread = u32::MAX;
+        c.read.unread = u32::MAX;
         d.reset(vec![c]);
         d.bump(id(1), last(0), Unread::Increment);
-        assert_eq!(d.as_slice()[0].unread, u32::MAX);
+        assert_eq!(d.as_slice()[0].read.unread, u32::MAX);
     }
 
     #[test]
@@ -569,8 +614,8 @@ mod tests {
         let mut d = Dialogs::default();
         d.reset(vec![chat(1), chat(2), chat(3)]);
         let mut fresh = chat(3);
-        fresh.unread = 4;
-        assert!(d.refresh(fresh.clone()).is_some_and(|c| c.unread == 4));
+        fresh.read.unread = 4;
+        assert!(d.refresh(fresh.clone()).is_some_and(|c| c.read.unread == 4));
         assert_eq!(ids(&d), vec![1, 2, 3], "in place");
         assert!(d.refresh(fresh.clone()).is_none(), "unchanged");
         fresh.last_id = Some(MsgId(9));
@@ -665,7 +710,10 @@ mod tests {
         let older = clock.dispatch();
         let newer = clock.dispatch();
         let fresh = ChatSummary {
-            unread: 7,
+            read: ReadState {
+                unread: 7,
+                read_inbox_max: MsgId(0),
+            },
             kind: forum,
             ..base.clone()
         };
@@ -674,12 +722,12 @@ mod tests {
         d.refresh(page.remove(0));
         let mut stale = vec![base.clone()];
         d.guard(&mut stale, older, |_| None);
-        assert_eq!((stale[0].kind, stale[0].unread), (forum, 7));
+        assert_eq!((stale[0].kind, stale[0].read.unread), (forum, 7));
         // A live read outranks every snapshot dispatched before it.
-        d.set_unread(id(1), 0, clock.now());
+        d.server_read(id(1), 0, MsgId(0), clock.now());
         let mut late = vec![fresh.clone()];
         d.guard(&mut late, newer, |_| None);
-        assert_eq!(late[0].unread, 0);
+        assert_eq!(late[0].read.unread, 0);
         // Fenced: no snapshot sets the kind; the commit's stamp outranks
         // older snapshots, also one newer than the last kind it accepted.
         let middle = clock.dispatch();

@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use abyss_core::model::{ChatId, Topic, TopicId};
+use abyss_core::model::{ChatId, ChatSummary, Topic, TopicId};
 
 use super::list::{Beneath, ChatList, Opened, SidebarRow, Step, topic_unread};
 use super::topics::TopicList;
@@ -63,7 +63,7 @@ fn rows(
         .filter(|&(ix, t)| ix < INLINE_TOPICS || open == Some(t.id))
         .map(|(_, &t)| t)
         .collect();
-    let badge = chats.get(forum).map_or(0, |c| c.unread);
+    let badge = chats.get(forum).map_or(0, ChatSummary::displayed_unread);
     let unread_shown = shown.iter().filter(|t| topic_unread(t)).count();
     let more = candidates.len() > shown.len()
         || copy.has_more()

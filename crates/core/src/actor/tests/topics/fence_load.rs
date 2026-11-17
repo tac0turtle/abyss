@@ -83,7 +83,11 @@ async fn forty_dirty_badges_with_three_fences() {
     for f in &forums {
         let at = first_call(&calls, *f).unwrap_or_else(|| panic!("{f:?} never refreshed"));
         assert!(at <= 1 + 40usize.div_ceil(CURSOR_SLOTS), "{f:?} at {at}");
-        assert_eq!(last_bump(&seen, *f).map(|c| c.unread), Some(0), "{f:?}");
+        assert_eq!(
+            last_bump(&seen, *f).map(|c| c.read.unread),
+            Some(0),
+            "{f:?}"
+        );
     }
     assert!(seen.iter().any(|e| matches!(
         e,

@@ -158,7 +158,7 @@ async fn open_topic(h: &mut Harness, f: ChatId, t: i32) {
 }
 
 /// Waits until online.
-async fn online(script: FakeScript) -> Harness {
+pub(super) async fn online(script: FakeScript) -> Harness {
     let mut h = harness(script, None).await;
     h.online().await;
     h
@@ -238,7 +238,7 @@ fn states_of(events: &[Event], topic: TopicId) -> Vec<Topic> {
 
 /// Collects events for `d` of the paused clock, taking them as they come
 /// so the bounded event queue never holds the actor up.
-async fn events_for(h: &mut Harness, d: Duration) -> Vec<Event> {
+pub(super) async fn events_for(h: &mut Harness, d: Duration) -> Vec<Event> {
     const STEP: Duration = Duration::from_millis(100);
     let mut seen = Vec::new();
     let mut left = d;
@@ -387,7 +387,7 @@ fn peer_calls(h: &Harness) -> Vec<PeerCallRecord> {
 }
 
 /// When each `peer_dialogs` call that asked for `chat` reached the server.
-fn peer_calls_with(h: &Harness, chat: ChatId) -> Vec<tokio::time::Instant> {
+pub(super) fn peer_calls_with(h: &Harness, chat: ChatId) -> Vec<tokio::time::Instant> {
     peer_calls(h)
         .into_iter()
         .filter(|r| r.chats.contains(&chat))
@@ -423,7 +423,7 @@ fn assert_spaced(h: &Harness) {
 }
 
 /// The kind a summary event states for `chat`'s last `ChatBumped`.
-fn last_bump(events: &[Event], chat: ChatId) -> Option<ChatSummary> {
+pub(super) fn last_bump(events: &[Event], chat: ChatId) -> Option<ChatSummary> {
     events.iter().rev().find_map(|e| match e {
         Event::ChatBumped(s) if s.id == chat => Some(s.clone()),
         _ => None,

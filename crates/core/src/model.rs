@@ -33,7 +33,17 @@ pub struct ChatId {
 
 /// Server message id, unique per chat (supergroups) or per account (others).
 #[derive(
-    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
 )]
 pub struct MsgId(pub i32);
 
@@ -164,7 +174,10 @@ pub struct ChatSummary {
     pub title: String,
     pub kind: ChatKind,
     pub pinned: bool,
-    pub unread: u32,
+    /// The confirmed unread count and read pointer: server evidence only
+    /// (stage 2 plan, section 17.6.1). Shown through
+    /// [`ChatSummary::displayed_unread`].
+    pub read: ReadState,
     pub unread_mentions: u32,
     pub last: Option<Preview>,
     /// Unix seconds.
@@ -182,6 +195,24 @@ pub struct ChatSummary {
     /// The main list or the archive. The list holds both; the UI shows one
     /// at a time.
     pub folder: PeerFolder,
+    /// The id an outstanding read of the whole chat goes up to, if one
+    /// does: a display overlay that core projects from its read intents
+    /// whenever it installs or emits the row. Never stored, cached or part
+    /// of a snapshot.
+    #[serde(skip)]
+    pub reading: Option<MsgId>,
+}
+
+/// A chat's confirmed read state, one value under the unread stamp: the
+/// server's unread count (plus Stage 1's counted messages) and the server's
+/// read pointer, which only ever rises.
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash,
+)]
+pub struct ReadState {
+    pub unread: u32,
+    /// The highest incoming message id read (`read_inbox_max_id`).
+    pub read_inbox_max: MsgId,
 }
 
 /// How the server ordered a forum's topic list
@@ -301,6 +332,21 @@ impl FolderRules {
 }
 
 impl ChatSummary {
+    /// The unread count to show: 0 while an outstanding read covers every
+    /// known message (Stage 1's overlay), the confirmed count otherwise. A
+    /// forum's count is its badge, which no read overlays.
+    pub fn displayed_unread(&self) -> u32 {
+        let forum = matches!(self.kind, ChatKind::Supergroup { forum: true, .. });
+        let covered = self
+            .reading
+            .is_some_and(|r| self.last_id.is_none_or(|last| r >= last));
+        if covered && !forum {
+            0
+        } else {
+            self.read.unread
+        }
+    }
+
     /// Whether notifications are muted at `now` (Unix seconds).
     pub fn muted_at(&self, now: i64) -> bool {
         self.muted_until > now
@@ -384,7 +430,7 @@ impl ChatFolder {
         kind && !(r.has(FolderRules::EXCLUDE_MUTED) && chat.muted_at(now) && !mentioned)
             && !(r.has(FolderRules::EXCLUDE_READ)
                 && read == ReadRule::Applies
-                && chat.unread == 0
+                && chat.displayed_unread() == 0
                 && chat.unread_mentions == 0)
             && !(r.has(FolderRules::EXCLUDE_ARCHIVED) && chat.folder == PeerFolder::Archive)
     }

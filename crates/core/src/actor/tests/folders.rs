@@ -7,7 +7,7 @@ use crate::api::{Command, Event, WindowState};
 use crate::backend::fake::{FakeBackend, FakeScript, Fault, Op};
 use crate::backend::{BackendError, Update};
 use crate::cache::{CacheCmd, CacheHandle, CacheKey};
-use crate::model::{ChatId, PeerFolder, ThreadKey};
+use crate::model::{ChatId, MsgId, PeerFolder, ThreadKey};
 
 /// A live `updateFolderPeers` changes listed chats in place, once, and
 /// ignores chats the list does not hold.
@@ -34,6 +34,7 @@ async fn archive_moves_update_listed_chats_in_place() {
             chat: chat(1),
             topic: None,
             still_unread: 0,
+            max_id: MsgId(0),
         })
         .await;
     let (ev, skipped) = h.until(|e| matches!(e, Event::ChatBumped(_))).await;

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use proptest::prelude::*;
 
 use super::*;
-use crate::model::{ChatKind, ChatSummary, PeerFolder, PeerKind};
+use crate::model::{ChatKind, ChatSummary, MsgId, PeerFolder, PeerKind, ReadState};
 use crate::store::Dialogs;
 
 fn chat(id: i64) -> ChatId {
@@ -213,6 +213,8 @@ fn a_flood_wait_pauses_the_scheduler_and_only_extends() {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Server {
     unread: u32,
+    /// The read pointer: it only rises.
+    pointer: i32,
     folder: PeerFolder,
     forum: bool,
 }
@@ -221,8 +223,9 @@ struct Server {
 enum Op {
     /// The server count changes (a message, a topic read, a deletion): a trigger.
     Change(i64, u32),
-    /// A chat-level read update carrying the server's count.
-    ChatRead(i64, u32),
+    /// A chat-level read update carrying the server's count, raising the
+    /// server's pointer.
+    ChatRead(i64, u32, i32),
     /// The chat moves in or out of the archive: a live folder update.
     Move(i64, bool),
     /// The forum flag changes, silently: only snapshots tell.
@@ -245,7 +248,7 @@ const LISTED: i64 = 4;
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => (0..CHATS, 0u32..9).prop_map(|(c, v)| Op::Change(c, v)),
-        1 => (0..CHATS, 0u32..9).prop_map(|(c, v)| Op::ChatRead(c, v)),
+        1 => (0..CHATS, 0u32..9, 0i32..20).prop_map(|(c, v, p)| Op::ChatRead(c, v, p)),
         1 => (0..CHATS, any::<bool>()).prop_map(|(c, a)| Op::Move(c, a)),
         1 => (0..CHATS, any::<bool>()).prop_map(|(c, f)| Op::Kind(c, f)),
         1 => (0..CHATS).prop_map(Op::Leave),
@@ -260,7 +263,7 @@ fn op() -> impl Strategy<Value = Op> {
 #[derive(Debug)]
 enum Event {
     Trigger(ChatId),
-    Read(ChatId, u32),
+    Read(ChatId, u32, MsgId),
     Move(ChatId, PeerFolder),
 }
 
@@ -275,7 +278,10 @@ struct Flight {
 /// The row as a dialog snapshot of `server` states it.
 fn summary(c: ChatId, server: Server) -> ChatSummary {
     ChatSummary {
-        unread: server.unread,
+        read: ReadState {
+            unread: server.unread,
+            read_inbox_max: MsgId(server.pointer),
+        },
         folder: server.folder,
         kind: ChatKind::Supergroup {
             forum: server.forum,
@@ -290,15 +296,21 @@ fn summary(c: ChatId, server: Server) -> ChatSummary {
         last_id: None,
         can_send: true,
         muted_until: 0,
+        reading: None,
     }
 }
 
-/// A row's guarded fields: unread, archived, forum.
-fn fields(s: &ChatSummary) -> [u64; 3] {
+/// The field index of the read pointer, which follows the highest source
+/// instead of the newest.
+const POINTER: usize = 3;
+
+/// A row's guarded fields: unread, archived, forum, and the read pointer.
+fn fields(s: &ChatSummary) -> [u64; 4] {
     [
-        u64::from(s.unread),
+        u64::from(s.read.unread),
         u64::from(s.folder == PeerFolder::Archive),
         u64::from(matches!(s.kind, ChatKind::Supergroup { forum: true, .. })),
+        u64::try_from(s.read.read_inbox_max.0).unwrap_or(0),
     ]
 }
 
@@ -324,7 +336,8 @@ struct Source {
 /// The reference model, kept from the delivery history alone: for every
 /// chat and field, every source delivered since the chat was last
 /// forgotten (it left the list), and which chats are listed. A field
-/// should show the value of its newest source.
+/// should show the value of its newest source; the read pointer, the
+/// highest.
 #[derive(Debug, Default)]
 struct Model {
     log: BTreeMap<(ChatId, usize), Vec<Source>>,
@@ -344,15 +357,17 @@ impl Model {
         self.log.entry((c, field)).or_default().push(source);
     }
 
-    fn expected(&self, c: ChatId) -> Option<[u64; 3]> {
-        let mut out = [0; 3];
+    fn expected(&self, c: ChatId) -> Option<[u64; 4]> {
+        let mut out = [0; 4];
         for (field, slot) in out.iter_mut().enumerate() {
-            let newest = self
-                .log
-                .get(&(c, field))?
-                .iter()
-                .max_by_key(|s| (s.stamp, s.origin, s.order))?;
-            *slot = newest.value;
+            let log = self.log.get(&(c, field))?;
+            *slot = if field == POINTER {
+                log.iter().map(|s| s.value).max()?
+            } else {
+                log.iter()
+                    .max_by_key(|s| (s.stamp, s.origin, s.order))?
+                    .value
+            };
         }
         Some(out)
     }
@@ -379,6 +394,7 @@ impl Sim {
     fn new() -> Self {
         let start = Server {
             unread: 0,
+            pointer: 0,
             folder: PeerFolder::Main,
             forum: false,
         };
@@ -437,9 +453,11 @@ impl Sim {
                 prop_assert!(self.badges.is_dirty(c), "every trigger leads to a refresh");
             }
             // A read of a chat that isn't listed has no row to change.
-            Some(Event::Read(c, v)) => {
-                if self.dialogs.set_unread(c, v, now).is_some() {
+            Some(Event::Read(c, v, max_id)) => {
+                if self.dialogs.server_read(c, v, max_id, now).is_some() {
                     self.model.deliver(c, 0, now, Origin::Live, u64::from(v));
+                    let pointer = u64::try_from(max_id.0).unwrap_or(0);
+                    self.model.deliver(c, POINTER, now, Origin::Live, pointer);
                 }
             }
             // A move is remembered, listed or not.
@@ -516,8 +534,15 @@ impl Sim {
     fn run(&mut self, op: Op) -> Result<(), TestCaseError> {
         match op {
             Op::Change(c, v) => self.set(chat(c), |s| s.unread = v, Some(Event::Trigger(chat(c)))),
-            Op::ChatRead(c, v) => {
-                self.set(chat(c), |s| s.unread = v, Some(Event::Read(chat(c), v)));
+            Op::ChatRead(c, v, p) => {
+                let mut max_id = MsgId(p);
+                let read = |s: &mut Server| {
+                    s.unread = v;
+                    s.pointer = s.pointer.max(p);
+                    max_id = MsgId(s.pointer);
+                };
+                self.set(chat(c), read, None);
+                self.events.push_back(Event::Read(chat(c), v, max_id));
             }
             Op::Move(c, archive) => {
                 let folder = if archive {
@@ -614,9 +639,10 @@ proptest! {
     /// chats are moved and refreshed. After every step each listed row
     /// shows, field by field (unread, folder, kind), the value of the
     /// newest source the model logged for it, so an older source never
-    /// replaces a newer one, also across a chat's admission; every trigger
-    /// is followed by a refresh; and once everything is answered every row
-    /// equals the server's.
+    /// replaces a newer one, also across a chat's admission, and the read
+    /// pointer the highest any source stated, so it never moves back;
+    /// every trigger is followed by a refresh; and once everything is
+    /// answered every row equals the server's.
     #[test]
     fn dialog_rows_follow_the_newest_source(ops in proptest::collection::vec(op(), 1..100)) {
         let mut sim = Sim::new();

@@ -100,7 +100,10 @@ fn user(id: i64) -> ChatId {
 /// Chat `id` as core lists it, with `unread` messages.
 fn listed(id: i64, unread: u32) -> ChatSummary {
     ChatSummary {
-        unread,
+        read: abyss_core::model::ReadState {
+            unread,
+            ..Default::default()
+        },
         ..summary(user(id), &format!("Chat {id}"))
     }
 }

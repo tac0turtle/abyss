@@ -2,7 +2,7 @@
 //! into account B, even when B has a chat with the same peer id.
 
 use abyss_core::api::{Command, HistoryDir, SendState};
-use abyss_core::model::{Body, ChatKind, PeerFolder, PeerKind, ThreadKey};
+use abyss_core::model::{Body, ChatKind, MsgId, PeerFolder, PeerKind, ReadState, ThreadKey};
 use abyss_core::rich_text::RichText;
 use abyss_core::store::ViewGen;
 
@@ -21,7 +21,10 @@ fn summary(title: &str) -> ChatSummary {
         title: title.into(),
         kind: ChatKind::Private { contact: false },
         pinned: false,
-        unread: 1,
+        read: ReadState {
+            unread: 1,
+            read_inbox_max: MsgId(0),
+        },
         unread_mentions: 0,
         last: None,
         last_date: 0,
@@ -29,6 +32,7 @@ fn summary(title: &str) -> ChatSummary {
         can_send: true,
         muted_until: 0,
         folder: PeerFolder::Main,
+        reading: None,
     }
 }
 

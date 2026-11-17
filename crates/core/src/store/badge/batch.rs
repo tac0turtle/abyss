@@ -1,6 +1,7 @@
 //! The account's `peer_dialogs` scheduler (plan section 7): one call in
 //! flight, calls spaced, batches split into reserved slots for kind checks,
-//! the shown forum's badge and the badge cursor, unused slots spilling over.
+//! the shown chat (the one the pane shows, forum or not) and the badge
+//! cursor, unused slots spilling over.
 
 use std::ops::Bound;
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use crate::store::NotBefore;
 pub const MAX_PEER_DIALOGS: usize = 20;
 /// Slots reserved for kind checks (plan section 6.6).
 pub const KIND_SLOTS: usize = 10;
-/// The slot reserved for the shown forum's badge.
+/// The slot reserved for the chat the pane shows, forum or not.
 pub const SHOWN_SLOTS: usize = 1;
 /// Slots reserved for the badge cursor.
 pub const CURSOR_SLOTS: usize = MAX_PEER_DIALOGS - KIND_SLOTS - SHOWN_SLOTS;
@@ -166,7 +167,7 @@ impl PeerScheduler {
         self.not_before
     }
 
-    /// Up to `room` dirty, eligible chats other than the shown forum, in
+    /// Up to `room` dirty, eligible chats other than the shown chat, in
     /// ascending order after the cursor, wrapping around.
     fn take_cursor(
         &mut self,

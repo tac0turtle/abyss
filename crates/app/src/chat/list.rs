@@ -150,11 +150,12 @@ impl SidebarRow {
 }
 
 /// Whether a chat counts as unread for the filter and the archive's entry
-/// (plan section 17.4): a chat that isn't a forum by its count or its
-/// mentions, a forum by its badge (the server's unread topics). Muted chats
-/// count; a chat marked unread doesn't (decision D8).
+/// (plan section 17.4): a chat that isn't a forum by its displayed count
+/// (0 while a read covering it is outstanding) or its mentions, a forum by
+/// its badge (the server's unread topics). Muted chats count; a chat
+/// marked unread doesn't (decision D8).
 pub(crate) fn chat_unread(chat: &ChatSummary) -> bool {
-    chat.unread > 0 || chat.unread_mentions > 0
+    chat.displayed_unread() > 0 || chat.unread_mentions > 0
 }
 
 /// Whether a topic counts as unread: whatever its row marks, a count or a
@@ -763,7 +764,7 @@ pub(crate) fn initials(title: &str) -> SharedString {
 #[cfg(test)]
 mod tests {
     use abyss_core::model::ReadRule::{Applies, Waived};
-    use abyss_core::model::{ChatKind, FolderRules, MediaKind, MsgId, PeerKind};
+    use abyss_core::model::{ChatKind, FolderRules, MediaKind, MsgId, PeerKind, ReadState};
 
     use super::*;
 
@@ -780,7 +781,7 @@ mod tests {
             title: format!("c{n}"),
             kind: ChatKind::Private { contact: false },
             pinned: false,
-            unread: 0,
+            read: ReadState::default(),
             unread_mentions: 0,
             last: None,
             last_date: 0,
@@ -788,6 +789,7 @@ mod tests {
             can_send: true,
             muted_until: 0,
             folder: PeerFolder::Main,
+            reading: None,
         }
     }
 
@@ -817,10 +819,10 @@ mod tests {
         let mut list = ChatList::default();
         list.reset(vec![pinned(1), chat(2), chat(3)]);
         let mut fresh = chat(3);
-        fresh.unread = 7;
+        fresh.read.unread = 7;
         list.upsert_page(vec![fresh, chat(4)]);
         assert_eq!(ids(&list), [1, 2, 3, 4]);
-        assert_eq!(list.get(id(3)).unwrap().unread, 7);
+        assert_eq!(list.get(id(3)).unwrap().read.unread, 7);
         // A reset is core's merged list: it replaces ours wholesale.
         list.reset(vec![chat(4), chat(1)]);
         assert_eq!(ids(&list), [4, 1]);
@@ -833,7 +835,7 @@ mod tests {
         list.bump(with_message(3, 10));
         assert_eq!(ids(&list), [1, 3, 2]);
         let mut read = with_message(3, 10);
-        read.unread = 0;
+        read.read.unread = 0;
         list.bump(chat(2)); // unchanged last message: in place
         list.bump(read);
         assert_eq!(ids(&list), [1, 3, 2]);
@@ -867,10 +869,10 @@ mod tests {
         list.bump(with_id(2, 21));
         assert_eq!(ids(&list), [2, 3, 1], "same date and preview, newer id");
         let mut stale = with_id(3, 30);
-        stale.unread = 5;
+        stale.read.unread = 5;
         list.bump(stale);
         assert_eq!(ids(&list), [2, 3, 1], "an older id never moves a chat");
-        assert_eq!(list.get(id(3)).unwrap().unread, 5, "but updates it");
+        assert_eq!(list.get(id(3)).unwrap().read.unread, 5, "but updates it");
         list.bump(with_id(2, 21));
         assert_eq!(ids(&list), [2, 3, 1], "a repeated bump is deduped");
     }
@@ -981,7 +983,7 @@ mod tests {
         list.show(Shown::default());
         assert_eq!(row_ids(&list), [0, 1, 2, 3, 4]);
         let mut unread = archived(5);
-        unread.unread = 2;
+        unread.read.unread = 2;
         list.bump(unread);
         assert!(matches!(
             list.rows()[0],
@@ -1051,7 +1053,10 @@ mod tests {
                 && !f.contains(&stranger, 0, Applies)
         );
         let unread = ChatSummary {
-            unread: 1,
+            read: ReadState {
+                unread: 1,
+                ..ReadState::default()
+            },
             ..contact.clone()
         };
         assert!(
@@ -1106,7 +1111,10 @@ mod tests {
         };
         let mentioned = ChatSummary {
             unread_mentions: 1,
-            unread: 1,
+            read: ReadState {
+                unread: 1,
+                ..ReadState::default()
+            },
             ..muted.clone()
         };
         let archived_mention = ChatSummary {
@@ -1371,7 +1379,10 @@ mod tests {
     fn member(n: i64) -> ChatSummary {
         ChatSummary {
             kind: kind_of(u8::try_from(n).unwrap()),
-            unread: u32::from(n % 3 == 0),
+            read: ReadState {
+                unread: u32::from(n % 3 == 0),
+                ..ReadState::default()
+            },
             muted_until: if n % 4 == 1 { i64::MAX } else { 0 },
             folder: if n % 5 == 4 {
                 PeerFolder::Archive
@@ -1459,7 +1470,7 @@ mod tests {
             };
             let archived = c.folder == PeerFolder::Archive;
             let muted = c.muted_until != 0 && (c.unread_mentions == 0 || archived);
-            let read_out = c.unread == 0 && c.unread_mentions == 0 && read == Applies;
+            let read_out = c.read.unread == 0 && c.unread_mentions == 0 && read == Applies;
             kind && !(bit(4) && muted) && !(bit(5) && read_out) && !(bit(6) && archived)
         }
 
@@ -1489,7 +1500,7 @@ mod tests {
         /// From the generated counts, and the pane's forum's topics.
         fn unread(&self, n: usize) -> bool {
             let c = &self.chats[n];
-            c.unread > 0 || c.unread_mentions > 0 || self.opened == Some((n, true))
+            c.read.unread > 0 || c.unread_mentions > 0 || self.opened == Some((n, true))
         }
 
         fn kept(&self, n: usize) -> bool {
@@ -1521,7 +1532,7 @@ mod tests {
                 Change::Bump { n, field } => {
                     let (n, c) = (ix(*n), &mut self.chats[ix(*n)]);
                     match field {
-                        0 => c.unread = u32::from(c.unread == 0),
+                        0 => c.read.unread = u32::from(c.read.unread == 0),
                         1 => c.unread_mentions = u32::from(c.unread_mentions == 0),
                         2 => {
                             let k = u8::try_from(n).unwrap();

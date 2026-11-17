@@ -706,6 +706,7 @@ async fn shutdown_completes_while_the_event_queue_is_full() {
                 chat: chat(1),
                 topic: None,
                 still_unread,
+                max_id: MsgId(0),
             })
             .await;
         }

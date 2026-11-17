@@ -15,7 +15,9 @@
 //!   a result dispatched after the stamp clears it.
 //! - **One call per account** in flight, [`crate::store::PEER_CALL_INTERVAL`]
 //!   apart, never before `peer_not_before`; batches split into reserved
-//!   slots for kind checks, the shown forum and the badge cursor. Dispatch
+//!   slots for kind checks, the chat the pane shows and the badge cursor.
+//!   A successful read of a chat makes it dirty too (stage 2 plan,
+//!   section 17.6.2), so its count comes from the server. Dispatch
 //!   waits for the update baseline, like the topic snapshots.
 //! - **Snapshots.** A `peer_dialogs` result is a dialog snapshot: it passes
 //!   the same per-field guard as a dialogs page (stamped at admission), so
@@ -28,7 +30,7 @@ use super::threads::kind_status;
 use crate::api::Event;
 use crate::backend::{Backend, BackendError};
 use crate::cache::CacheCmd;
-use crate::model::{ChatId, ChatKind, ChatSummary};
+use crate::model::{ChatId, ChatKind, ChatSummary, MsgId};
 use crate::store::{BadgeSeq, Completed, ForumStatus, Guarded, MAX_PEER_DIALOGS, Verdict};
 
 /// The store's clock: the runtime's (paused in tests) as a std instant.
@@ -50,12 +52,17 @@ impl<B: Backend> Actor<B> {
         }
     }
 
-    /// A chat-level read on another device (`ReadInbox { topic: None }`):
-    /// a live change of the row's count, which no snapshot dispatched
-    /// before it can revert (for a forum, its unread-topic count).
-    pub(super) async fn chat_read(&mut self, chat: ChatId, still_unread: u32) {
+    /// A chat-level read update (`ReadInbox { topic: None }`, a read here
+    /// or on another device): a live change of the row's count, which no
+    /// snapshot dispatched before it can revert (for a forum, its
+    /// unread-topic count), and the pointer raised to `max_id`.
+    pub(super) async fn chat_read(&mut self, chat: ChatId, still_unread: u32, max_id: MsgId) {
         let now = self.badges.now();
-        if let Some(summary) = self.dialogs.set_unread(chat, still_unread, now).cloned() {
+        if let Some(summary) = self
+            .dialogs
+            .server_read(chat, still_unread, max_id, now)
+            .cloned()
+        {
             self.emit(Event::ChatBumped(summary)).await;
         }
     }
@@ -72,6 +79,9 @@ impl<B: Backend> Actor<B> {
     ) -> crate::store::Guarded {
         let fences = &self.fences;
         let guarded = self.dialogs.guard(chats, stamp, |c| fences.before(c));
+        // The read overlay is re-derived on every install: no snapshot
+        // supplies or clears it (stage 2 plan, section 17.6.1).
+        self.reads.project(chats);
         if guarded != crate::store::Guarded::Discard {
             for chat in chats.iter() {
                 if kind_status(chat.kind) == ForumStatus::Forum {
@@ -83,6 +93,13 @@ impl<B: Backend> Actor<B> {
         guarded
     }
 
+    /// The chat the pane shows, forum or not, for the shown slot (stage 2
+    /// plan, section 17.6.2): the open thread's chat, else the shown
+    /// forum's list.
+    pub(super) fn shown_chat(&self) -> Option<ChatId> {
+        self.open.map(|t| t.chat).or(self.topics.lists.shown())
+    }
+
     /// Plans and queues the next `peer_dialogs` call, if one is due: once
     /// the baseline is established, one in flight, spaced, outside a flood
     /// wait. Kind checks take their slots from the FIFO's head.
@@ -91,7 +108,7 @@ impl<B: Backend> Actor<B> {
             return;
         }
         let kinds = self.fences.head(MAX_PEER_DIALOGS);
-        let shown = self.topics.lists.shown();
+        let shown = self.shown_chat();
         let Some(batch) = self.peer.reserve(now(), &kinds, shown, &self.badges) else {
             return;
         };

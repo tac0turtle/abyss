@@ -110,7 +110,8 @@ impl TopicEntry {
         if merged.unread == Verdict::Apply {
             topic.unread = new.unread;
             topic.unread_mentions = new.unread_mentions;
-            topic.read_inbox_max = new.read_inbox_max;
+            // The server's pointer never moves back (stage 2 plan, 17.6.3).
+            topic.read_inbox_max = topic.read_inbox_max.max(new.read_inbox_max);
             topic.freshness = Freshness::Current;
             self.unread.set_seen(seq);
         }

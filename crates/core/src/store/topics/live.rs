@@ -132,6 +132,17 @@ impl TopicList {
         self.bumped(newer.then_some(at))
     }
 
+    /// A local read of `topic` up to `max_id` succeeded: the server's
+    /// pointer is at least that high, so a known topic's pointer rises to
+    /// it (stage 2 plan, section 17.6.3). The count is the server's to
+    /// say: the read is a [`UnreadTrigger::ReadLocally`] trigger.
+    pub fn read_locally(&mut self, topic: TopicId, max_id: MsgId, now: Instant) -> Vec<ListChange> {
+        if let Some(entry) = self.position(topic).and_then(|at| self.entries.get_mut(at)) {
+            entry.topic.read_inbox_max = entry.topic.read_inbox_max.max(max_id);
+        }
+        self.trigger_unread(topic, UnreadTrigger::ReadLocally, now)
+    }
+
     /// An unread trigger for a known topic: the hint changes and the topic
     /// becomes due; the count is untouched.
     pub fn trigger_unread(

@@ -1562,7 +1562,7 @@ The rule:
 | Anchored windows | ordinary windows: `MAX_WINDOWS = 8`, `MAX_STORE_BYTES` | Stage 1 LRU |
 | Coverage tail and restoring tail | one tail per anchored open (plus `Around` when it doesn't prove coverage), and one per return to the tail | single-flight per thread |
 | Read state | `ReadState` replaces `unread`: +4 bytes per dialog row and per unlisted record | ≤ `MAX_DIALOGS` each |
-| Refreshes after reads | section 7's dirty bits (≤ `MAX_DIALOGS`) and `peer_dialogs` rate; topics through the existing by-id drain | no new queue or call |
+| Refreshes after reads | section 7's dirty bits (≤ `MAX_DIALOGS` + 1: the pane's chat when unlisted, tracked as one extra record) and `peer_dialogs` rate; topics through the existing by-id drain | no new queue or call |
 | Topic requests | none new | inline rows read the shown list |
 
 **Per-render cost.**
@@ -1793,3 +1793,11 @@ The round 3 overlay fix is closed; the install-site list was checked against mai
 |---|---|---|
 | 1 | P2: archive count stale when the filter was off; the membership property re-used production logic; kept ids survived peer-folder moves and kind changes | `set_opened` always recomputes; property reworked around an independent model (reference `contains`, mutation-checked); every recompute prunes kept chats that are unlisted or fail their base rule with only reading waived. `read_waived` became `ReadRule { Applies, Waived }` (clippy forbids bool params) |
 | 2 | Pass | — |
+
+#### Task 16: read pointers and partial reads (3 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 | P2: a successful read of an unlisted shown chat lost its pointer advance and its refresh trigger | Unlisted records keep a rising pointer floor (no count, no stamp; counts toward the eviction cutoff); the pane's unlisted chat is tracked as one extra badge record (budget `MAX_DIALOGS` + 1) |
+| 2 | P2: the extra badge record never lost its status on pane change or admission | `Badges::reconcile_extra` on every loop turn: kept only while shown and unlisted |
+| 3 | Pass | Accepted: an old-`ClientGen` read settles its intent without raising the pointer; forums ignore the overlay |

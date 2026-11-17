@@ -611,9 +611,12 @@ fn dialogs_map_kinds_counts_previews_and_exclude_broadcasts() {
     d7.pinned = true;
     d7.unread_count = 4;
     d7.unread_mentions_count = -3;
+    d7.read_inbox_max_id = 38;
+    let mut d8 = dialog(peer_user(8), 2);
+    d8.read_inbox_max_id = -5; // floored at 0
     let dialogs: Vec<tl::enums::Dialog> = [
         d7,
-        dialog(peer_user(8), 2),
+        d8,
         dialog(peer_channel(20), 3),
         dialog(peer_channel(21), 4),
         dialog(peer_channel(22), 5),
@@ -635,7 +638,9 @@ fn dialogs_map_kinds_counts_previews_and_exclude_broadcasts() {
     assert_eq!(ids, vec![7, 8, 21, 22, 3]);
     let ann = &out.chats[0];
     assert!(ann.pinned);
-    assert_eq!((ann.unread, ann.unread_mentions), (4, 0));
+    let pointers = [MsgId(38), MsgId(0)];
+    assert_eq!((ann.read.unread, ann.unread_mentions), (4, 0));
+    assert!((0..2).all(|i| out.chats[i].read.read_inbox_max == pointers[i]));
     assert_eq!(ann.last, Some(Preview::Text("last line".into())));
     assert_eq!(ann.last_date, 1_700_000_001);
     assert_eq!(out.chats[1].kind, ChatKind::Bot);
@@ -1168,7 +1173,8 @@ fn live_updates_map_to_domain_updates() {
     });
     assert!(matches!(
         lists::update(&read, &dir),
-        Some(Update::ReadInbox { chat, topic: None, still_unread: 2 }) if chat == cid(10)
+        Some(Update::ReadInbox { chat, topic: None, still_unread: 2, max_id: MsgId(9) })
+            if chat == cid(10)
     ));
     let id_map = U::MessageId(tl::types::UpdateMessageId {
         id: 41,

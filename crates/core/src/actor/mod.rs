@@ -184,7 +184,7 @@ pub(crate) struct Actor<B: Backend> {
     members: Option<fences::Members>,
     /// Read intents per thread, flushed every `READ_FLUSH` until they
     /// land (at most `reads::MAX_READS`).
-    reads: HashMap<ThreadKey, reads::ReadMark>,
+    reads: reads::Reads,
     sends: sends::PendingSends,
     deadline: Duration,
     updates_tx: mpsc::Sender<(ClientGen, StreamItem)>,
@@ -277,7 +277,7 @@ impl<B: Backend> Actor<B> {
             peer: PeerScheduler::default(),
             fences: KindChecks::default(),
             members: None,
-            reads: HashMap::new(),
+            reads: reads::Reads::default(),
             sends: sends::PendingSends::default(),
             deadline: CALL_DEADLINE,
             updates_tx,

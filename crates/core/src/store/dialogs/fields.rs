@@ -6,11 +6,15 @@
 //! - **The clock** is the badge clock: it advances at every dialogs and
 //!   `peer_dialogs` dispatch, so a snapshot's stamp is when it was sent.
 //!   Cached chats are the oldest source (stamp zero).
-//! - **Snapshots.** A field (kind, folder, unread) takes a snapshot's value
-//!   only if the snapshot was dispatched after the field's accepted stamp;
-//!   then the stamp moves to the snapshot's. Otherwise the current value
-//!   is kept, whatever the source: an older dialogs page can't revert what
-//!   a newer `peer_dialogs` result set, nor the reverse.
+//! - **Snapshots.** A field (kind, folder, read state) takes a snapshot's
+//!   value only if the snapshot was dispatched after the field's accepted
+//!   stamp; then the stamp moves to the snapshot's. Otherwise the current
+//!   value is kept, whatever the source: an older dialogs page can't revert
+//!   what a newer `peer_dialogs` result set, nor the reverse.
+//! - **The read state** is one field, the count and the pointer together
+//!   (stage 2 plan, section 17.6.1). The pointer only rises: whichever
+//!   value is kept, its pointer is the higher of the two, since any
+//!   snapshot proves the server's pointer was at least that high.
 //! - **Live changes** (a folder move, a read, a counted message) stamp the
 //!   field with the clock's value now: a snapshot dispatched before them
 //!   can't revert them, one dispatched after them is authoritative.
@@ -21,13 +25,16 @@
 //!   vouches for: for a chat that isn't listed (a live move, a
 //!   `peer_dialogs` result about a chat with a window only), the accepted
 //!   values are remembered with their stamps until a page admits the chat.
+//!   A read that landed for such a chat (a window only) is remembered too,
+//!   as a pointer floor with no count and no stamp: a page admitted later
+//!   can't lower the pointer below it.
 //! - **Bounds.** Stamps are kept for listed rows (pruned with them) and
 //!   records for at most [`MAX_UNLISTED`] chats that aren't listed;
 //!   evicting one discards every response that could still need it.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{ChatId, ChatKind, ChatSummary, PeerFolder};
+use crate::model::{ChatId, ChatKind, ChatSummary, MsgId, PeerFolder, ReadState};
 use crate::store::{BadgeSeq, ForumStatus, with_status};
 
 /// Live moves of unlisted chats remembered for the page that lists them.
@@ -52,7 +59,7 @@ pub enum Guarded {
 pub(super) struct Current {
     pub(super) kind: ChatKind,
     pub(super) folder: PeerFolder,
-    pub(super) unread: u32,
+    pub(super) read: ReadState,
 }
 
 /// One chat's accepted stamps.
@@ -73,7 +80,10 @@ struct Accepted {
 struct Unlisted {
     kind: Option<ChatKind>,
     folder: Option<PeerFolder>,
-    unread: Option<u32>,
+    read: Option<ReadState>,
+    /// The highest id a landed read proved, and the clock then (only an
+    /// eviction's cutoff: it stamps no field).
+    landed: Option<(MsgId, BadgeSeq)>,
     /// For eviction, oldest first.
     order: u64,
 }
@@ -81,7 +91,11 @@ struct Unlisted {
 impl Accepted {
     /// The newest stamp it holds (an eviction's cutoff).
     fn newest(&self) -> BadgeSeq {
-        self.kind.max(self.folder).max(self.unread)
+        let landed = self.unlisted.and_then(|u| u.landed).map(|(_, at)| at);
+        self.kind
+            .max(self.folder)
+            .max(self.unread)
+            .max(landed.unwrap_or_default())
     }
 }
 
@@ -128,7 +142,7 @@ impl Fields {
             let row = self.rows.entry(chat.id).or_default();
             let kept = row.unlisted;
             // What this snapshot sets, for an unlisted chat's record.
-            let (mut kind, mut folder, mut unread) = (None, None, None);
+            let (mut kind, mut folder, mut read) = (None, None, None);
             match held(chat.id) {
                 Some(before) => chat.kind = with_status(chat.kind, before),
                 None if seq > row.kind => {
@@ -148,16 +162,26 @@ impl Fields {
                 conflict |= chat.folder != newer;
                 chat.folder = newer;
             }
+            // The count by its stamp; the pointer by the max, either way.
+            let before = now.map(|c| c.read).or(kept.and_then(|u| u.read));
+            if let Some(before) = before {
+                let pointer = before.read_inbox_max.max(chat.read.read_inbox_max);
+                chat.read.read_inbox_max = pointer;
+            }
+            if let Some((floor, _)) = kept.and_then(|u| u.landed) {
+                chat.read.read_inbox_max = chat.read.read_inbox_max.max(floor);
+            }
             if seq > row.unread {
                 row.unread = seq;
-                unread = Some(chat.unread);
-            } else if let Some(newer) = now.map(|c| c.unread).or(kept.and_then(|u| u.unread)) {
-                chat.unread = newer;
+                read = Some(chat.read);
+            } else if let Some(before) = before {
+                chat.read.unread = before.unread;
+                read = Some(chat.read);
             }
             if let Some(kept) = row.unlisted.as_mut() {
                 kept.kind = kind.or(kept.kind);
                 kept.folder = folder.or(kept.folder);
-                kept.unread = unread.or(kept.unread);
+                kept.read = read.or(kept.read);
             }
         }
         if conflict {
@@ -197,9 +221,27 @@ impl Fields {
         self.rows.entry(chat).or_default().unlisted = Some(Unlisted {
             kind: None,
             folder: None,
-            unread: None,
+            read: None,
+            landed: None,
             order,
         });
+    }
+
+    /// A read of `chat`, which isn't listed, landed up to `max_id` at clock
+    /// `now`: remembered (bounded) as a pointer floor for the page that
+    /// lists it. No count changes and no field is stamped.
+    pub(super) fn read_landed_unlisted(&mut self, chat: ChatId, max_id: MsgId, now: BadgeSeq) {
+        if !self.has_record(chat) {
+            self.make_room(1, &[chat]);
+            self.remember(chat);
+        }
+        if let Some(kept) = self.rows.get_mut(&chat).and_then(|r| r.unlisted.as_mut()) {
+            let floor = kept.landed.map_or(max_id, |(f, _)| f.max(max_id));
+            kept.landed = Some((floor, now));
+            if let Some(read) = kept.read.as_mut() {
+                read.read_inbox_max = read.read_inbox_max.max(max_id);
+            }
+        }
     }
 
     /// A live change of the unread count at clock `now`.

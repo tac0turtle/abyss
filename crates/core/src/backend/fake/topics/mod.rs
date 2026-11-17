@@ -155,14 +155,18 @@ pub(super) fn check_send(s: &State, thread: ThreadKey) -> Result<(), BackendErro
 }
 
 /// A topic read (`readDiscussion`) moves the topic's `read_inbox_max`
-/// forward. A whole-chat read changes no topic: core never marks a forum
-/// read as a whole (plan section 2, U2).
+/// forward. A whole-chat read moves the chat's pointer
+/// ([`move_pointer`]) and changes no topic: core never marks a forum read
+/// as a whole (plan section 2, U2).
 pub(super) fn mark_read(
     s: &mut State,
     thread: ThreadKey,
     max_id: MsgId,
 ) -> Result<(), BackendError> {
     let Some(topic) = thread.topic else {
+        if forum_status(s, thread.chat) != ForumStatus::Forum {
+            move_pointer(s, thread.chat, max_id);
+        }
         return Ok(());
     };
     if forum_status(s, thread.chat) != ForumStatus::Forum {
@@ -292,17 +296,45 @@ pub(super) fn by_id(s: &State, chat: ChatId, ids: &[TopicId]) -> Result<TopicsBy
     })
 }
 
+/// Raises a chat's read pointer (`read_inbox_max_id`) to `max_id`, by a
+/// read or a pushed read update. From then on the chat's count is served
+/// from its history ([`current_summary`]).
+pub(super) fn move_pointer(s: &mut State, chat: ChatId, max_id: MsgId) {
+    if let Some(dialog) = s.dialogs.iter_mut().find(|d| d.id == chat) {
+        dialog.read.read_inbox_max = dialog.read.read_inbox_max.max(max_id);
+        s.pointed.insert(chat);
+    }
+}
+
 /// A chat's summary as the server reports it now. A forum's `unread` is its
-/// number of unread topics (plan section 7, D1).
+/// number of unread topics (plan section 7, D1). Once a read moved another
+/// chat's pointer, its `unread` is the number of incoming messages above
+/// the pointer, so the pair is consistent; before that the scripted pair
+/// is served.
 pub(super) fn current_summary(s: &State, summary: &ChatSummary) -> ChatSummary {
     let mut out = summary.clone();
-    if forum_status(s, summary.id) == ForumStatus::Forum && s.topics.contains_key(&summary.id) {
-        let unread = server_order(s, summary.id, TopicOrder::LastActivity)
+    let unread = if forum_status(s, summary.id) == ForumStatus::Forum {
+        if !s.topics.contains_key(&summary.id) {
+            return out;
+        }
+        server_order(s, summary.id, TopicOrder::LastActivity)
             .iter()
             .filter(|t| t.topic.unread > 0)
-            .count();
-        out.unread = u32::try_from(unread).unwrap_or(u32::MAX);
-    }
+            .count()
+    } else if s.pointed.contains(&summary.id) {
+        let pointer = summary.read.read_inbox_max;
+        let thread = ThreadKey {
+            chat: summary.id,
+            topic: None,
+        };
+        thread_history(s, thread)
+            .iter()
+            .filter(|m| !m.outgoing && m.id > pointer)
+            .count()
+    } else {
+        return out;
+    };
+    out.read.unread = u32::try_from(unread).unwrap_or(u32::MAX);
     out
 }
 

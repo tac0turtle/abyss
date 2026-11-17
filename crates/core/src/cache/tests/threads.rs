@@ -277,7 +277,7 @@ fn version_3_messages_and_chats_are_dropped() {
         .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     db.put_messages(key(forum(), 2), &posts(2, [1])).unwrap();
     assert_eq!(ids(&db.tail(key(forum(), 2), 10).unwrap()), [1]);
 }

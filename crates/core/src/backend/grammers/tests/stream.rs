@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::backend::grammers::stream::{Pull, Source, Updates};
 use crate::backend::{StreamError, StreamItem, Update};
-use crate::model::{ChatId, PeerKind};
+use crate::model::{ChatId, MsgId, PeerKind};
 
 type Item = Result<Option<Update>, InvocationError>;
 
@@ -84,6 +84,7 @@ fn read(still_unread: u32) -> Update {
         },
         topic: None,
         still_unread,
+        max_id: MsgId(0),
     }
 }
 

@@ -17,9 +17,9 @@ fn badges_of(events: &[Event], chat: ChatId) -> Vec<u32> {
     events
         .iter()
         .filter_map(|e| match e {
-            Event::ChatBumped(s) if s.id == chat => Some(s.unread),
+            Event::ChatBumped(s) if s.id == chat => Some(s.read.unread),
             Event::DialogsReset(v) | Event::DialogsAppended(v) => {
-                v.iter().find(|s| s.id == chat).map(|s| s.unread)
+                v.iter().find(|s| s.id == chat).map(|s| s.read.unread)
             }
             _ => None,
         })

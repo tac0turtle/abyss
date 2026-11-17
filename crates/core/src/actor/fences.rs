@@ -244,6 +244,13 @@ impl<B: Backend> Actor<B> {
     /// kind-check state and fences are retired for chats that left the
     /// required-peer set, and the badge state follows the retained dialogs.
     pub(super) async fn sync_members(&mut self) {
+        // The pane's chat beyond the dialogs (a window only) is tracked
+        // only while it is shown and unlisted: checked every turn, since
+        // the pane can change without the membership revision.
+        let shown = self.shown_chat();
+        let dialogs = &self.dialogs;
+        self.badges
+            .reconcile_extra(shown, |c| dialogs.get(c).is_some());
         let members = (self.sends.rev(), self.windows.rev(), self.dialogs.rev());
         if self.members == Some(members) {
             return;

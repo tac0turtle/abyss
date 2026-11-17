@@ -2,17 +2,25 @@
 //! a read intent, coalesced and flushed every [`super::READ_FLUSH`] as one
 //! read per thread, and kept until a read covering it lands.
 //!
-//! - **Admission** changes no forum count and schedules nothing. A
-//!   non-forum chat's row is cleared at once, as in Stage 1.
-//! - **A successful topic read** (under the current instance) makes the
-//!   topic due with `ReadSince` and the forum's badge dirty. Only now, so
-//!   neither refetch can be answered from state that predates the read.
+//! - **Admission** changes no count and schedules nothing. Stage 1's
+//!   cleared badge is a display overlay: a chat's row carries the id its
+//!   outstanding read goes up to (`ChatSummary::reading`), projected from
+//!   the intents whenever the row is installed, replaced or emitted, and
+//!   whenever an intent is admitted, grows or settles (stage 2 plan,
+//!   section 17.6.1). The intents are the only record of pending reads.
+//! - **A successful read** (under the current instance) settles only its
+//!   own `max_id`: it proves the server's pointer is at least that high,
+//!   and no count. A chat's pointer rises to it, unstamped, and its row is
+//!   made dirty for a `peer_dialogs` refresh, which brings the server's
+//!   pair. A topic's pointer rises to it, the topic is due with
+//!   `ReadSince`, and the forum's badge is dirty. Only now, so no refetch
+//!   can be answered from state that predates the read.
 //! - **A failed read** schedules nothing, and its intent stays:
 //!   - an unknown outcome (transient, time-out, dropped by a rebuild, a
 //!     migration) is retried after a backoff doubling from
 //!     [`FIRST_BACKOFF`] up to [`MAX_BACKOFF`];
 //!   - a flood wait is retried after its deadline;
-//!   - a rejection is final.
+//!   - a rejection is final, and changes no read state.
 //!
 //!   A newer mark of the thread coalesces into the intent and waits for the
 //!   same deadline. Only a read's first time-out counts for stall
@@ -21,6 +29,7 @@
 //! - **Bounds.** At most [`MAX_READS`] intents, each with at most one read
 //!   queued or running, and none more often than its backoff allows.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -30,7 +39,7 @@ use super::jobs::{CallError, CallResult, Job};
 use super::lifecycle::Phase;
 use crate::api::{ClientGen, Event, UserError};
 use crate::backend::{Backend, BackendError};
-use crate::model::{MsgId, ThreadKey};
+use crate::model::{ChatId, ChatSummary, MsgId, ThreadKey};
 use crate::store::{MAX_DIALOGS, MAX_TOPICS_PER_FORUM};
 
 /// Threads with a read intent: every listed chat plus a forum's topics.
@@ -44,7 +53,7 @@ const MIN_FLOOD_WAIT: Duration = Duration::from_secs(1);
 
 /// A thread's read intent, until a read covering it lands.
 #[derive(Debug)]
-pub(super) struct ReadMark {
+struct ReadMark {
     /// The highest id the user saw.
     max_id: MsgId,
     /// The read queued or running: its instance and id.
@@ -71,10 +80,10 @@ impl ReadMark {
         self.flight.is_none_or(|(at, _)| at != cgen) && self.not_before.is_none_or(|t| t <= now)
     }
 
-    /// A failed attempt: the next waits `wait`.
-    fn hold(&mut self, wait: Duration) {
+    /// A failed attempt at `now`: the next waits `wait`.
+    fn hold(&mut self, wait: Duration, now: Instant) {
         self.failures = self.failures.saturating_add(1);
-        self.not_before = Some(Instant::now() + wait);
+        self.not_before = Some(now + wait);
     }
 
     /// The doubling backoff after this many failures.
@@ -86,22 +95,165 @@ impl ReadMark {
     }
 }
 
-impl<B: Backend> Actor<B> {
-    pub(super) async fn mark_read(&mut self, thread: ThreadKey, max_id: MsgId) {
-        if self.reads.len() >= MAX_READS && !self.reads.contains_key(&thread) {
-            return self.error(UserError::Busy).await;
+/// How a read's attempt ended, for its intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Outcome {
+    /// The server took it.
+    Landed,
+    /// A flood wait: again after this long.
+    FloodWait(Duration),
+    /// Unknown (transient, time-out, dropped, a migration): again after a
+    /// backoff.
+    Unknown,
+    /// The server refused it: final.
+    Refused,
+}
+
+impl Outcome {
+    fn of(res: CallResult<()>) -> Self {
+        match res {
+            Ok(()) => Self::Landed,
+            Err(CallError::Backend(BackendError::FloodWait { seconds })) => {
+                Self::FloodWait(Duration::from_secs(u64::from(seconds)).max(MIN_FLOOD_WAIT))
+            }
+            Err(
+                CallError::Backend(BackendError::Transient | BackendError::Migrated)
+                | CallError::Timeout
+                | CallError::Dropped,
+            ) => Self::Unknown,
+            Err(CallError::Backend(_)) => Self::Refused,
+        }
+    }
+}
+
+/// No room for another thread's intent (at most [`MAX_READS`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Full;
+
+/// The read intents, one per thread, until a read covering each lands.
+#[derive(Debug, Default)]
+pub(super) struct Reads {
+    marks: HashMap<ThreadKey, ReadMark>,
+}
+
+impl Reads {
+    /// The user saw `thread` up to `max_id`: the intent grows to it.
+    pub(super) fn admit(&mut self, thread: ThreadKey, max_id: MsgId) -> Result<(), Full> {
+        if self.marks.len() >= MAX_READS && !self.marks.contains_key(&thread) {
+            return Err(Full);
         }
         let mark = self
-            .reads
+            .marks
             .entry(thread)
             .or_insert_with(|| ReadMark::new(max_id));
         mark.max_id = mark.max_id.max(max_id);
-        // A forum's badge is the server's only (plan section 7).
-        if self.is_forum(thread.chat) {
-            return;
+        Ok(())
+    }
+
+    /// The id an outstanding read of the whole of `chat` goes up to: what
+    /// its row's overlay shows (`ChatSummary::reading`).
+    pub(super) fn outstanding(&self, chat: ChatId) -> Option<MsgId> {
+        let thread = ThreadKey { chat, topic: None };
+        self.marks.get(&thread).map(|m| m.max_id)
+    }
+
+    /// Sets the overlay of every summary in `chats` from the intents: a
+    /// snapshot never supplies or clears it.
+    pub(super) fn project(&self, chats: &mut [ChatSummary]) {
+        for chat in chats {
+            chat.reading = self.outstanding(chat.id);
         }
-        let now = self.badges.now();
-        if let Some(summary) = self.dialogs.set_unread(thread.chat, 0, now).cloned() {
+    }
+
+    /// The intents a read goes for at a flush on `cgen` at `now`, with
+    /// their failures so far.
+    fn due(&self, cgen: ClientGen, now: Instant) -> Vec<(ThreadKey, MsgId, u8)> {
+        self.marks
+            .iter()
+            .filter(|(_, m)| m.due(cgen, now))
+            .map(|(t, m)| (*t, m.max_id, m.failures))
+            .collect()
+    }
+
+    /// The read up to `max_id` was queued on `cgen`.
+    fn queued(&mut self, thread: ThreadKey, cgen: ClientGen, max_id: MsgId) {
+        if let Some(mark) = self.marks.get_mut(&thread) {
+            mark.flight = Some((cgen, max_id));
+        }
+    }
+
+    /// The read couldn't be queued at `now`: it waits a backoff.
+    fn unqueued(&mut self, thread: ThreadKey, now: Instant) {
+        if let Some(mark) = self.marks.get_mut(&thread) {
+            let wait = mark.backoff();
+            mark.hold(wait, now);
+        }
+    }
+
+    /// A queued read was dropped unrun: its intent goes again.
+    fn dropped(&mut self, thread: ThreadKey, max_id: MsgId) {
+        if let Some(mark) = self.marks.get_mut(&thread)
+            && mark.flight.is_some_and(|(_, id)| id == max_id)
+        {
+            mark.flight = None;
+        }
+    }
+
+    /// The read up to `max_id` on `cgen` ended at `now` with `outcome`.
+    /// `false` when it isn't its intent's read in flight (the intent was
+    /// cleared by a logout, or sent again after a rebuild): nothing
+    /// changes. A landed or refused read settles only its own `max_id`: an
+    /// intent that grew meanwhile stays, and goes at the next flush.
+    pub(super) fn ended(
+        &mut self,
+        cgen: ClientGen,
+        thread: ThreadKey,
+        max_id: MsgId,
+        outcome: Outcome,
+        now: Instant,
+    ) -> bool {
+        let Some(mark) = self.marks.get_mut(&thread) else {
+            return false;
+        };
+        if mark.flight != Some((cgen, max_id)) {
+            return false;
+        }
+        mark.flight = None;
+        match outcome {
+            Outcome::Landed | Outcome::Refused => {
+                if mark.max_id <= max_id {
+                    self.marks.remove(&thread);
+                } else {
+                    *mark = ReadMark::new(mark.max_id);
+                }
+            }
+            Outcome::FloodWait(wait) => mark.hold(wait, now),
+            Outcome::Unknown => {
+                let wait = mark.backoff();
+                mark.hold(wait, now);
+            }
+        }
+        true
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.marks.clear();
+    }
+}
+
+impl<B: Backend> Actor<B> {
+    pub(super) async fn mark_read(&mut self, thread: ThreadKey, max_id: MsgId) {
+        if self.reads.admit(thread, max_id).is_err() {
+            return self.error(UserError::Busy).await;
+        }
+        self.project_reading(thread.chat).await;
+    }
+
+    /// Re-derives `chat`'s row overlay from the intents, and emits the row
+    /// if that changed it.
+    async fn project_reading(&mut self, chat: ChatId) {
+        let reading = self.reads.outstanding(chat);
+        if let Some(summary) = self.dialogs.set_reading(chat, reading).cloned() {
             self.emit(Event::ChatBumped(summary)).await;
         }
     }
@@ -113,13 +265,7 @@ impl<B: Backend> Actor<B> {
             return;
         }
         let (cgen, now) = (self.cgen, Instant::now());
-        let due: Vec<(ThreadKey, MsgId, u8)> = self
-            .reads
-            .iter()
-            .filter(|(_, m)| m.due(cgen, now))
-            .map(|(t, m)| (*t, m.max_id, m.failures))
-            .collect();
-        for (thread, max_id, retry) in due {
+        for (thread, max_id, retry) in self.reads.due(cgen, now) {
             let queued = self
                 .enqueue(Job::Read {
                     thread,
@@ -127,14 +273,10 @@ impl<B: Backend> Actor<B> {
                     retry,
                 })
                 .await;
-            let Some(mark) = self.reads.get_mut(&thread) else {
-                continue;
-            };
             if queued {
-                mark.flight = Some((cgen, max_id));
+                self.reads.queued(thread, cgen, max_id);
             } else {
-                let wait = mark.backoff();
-                mark.hold(wait);
+                self.reads.unqueued(thread, now);
             }
         }
     }
@@ -142,16 +284,10 @@ impl<B: Backend> Actor<B> {
     /// A queued read was dropped unrun (the instance went): its intent goes
     /// again at a later flush.
     pub(super) fn read_job_dropped(&mut self, thread: ThreadKey, max_id: MsgId) {
-        if let Some(mark) = self.reads.get_mut(&thread)
-            && mark.flight.is_some_and(|(_, id)| id == max_id)
-        {
-            mark.flight = None;
-        }
+        self.reads.dropped(thread, max_id);
     }
 
-    /// A read ended, on any instance (see the module docs). One that isn't
-    /// its intent's read in flight (the intent was cleared by a logout, or
-    /// sent again after a rebuild) changes nothing.
+    /// A read ended, on any instance (see the module docs).
     pub(super) async fn on_read(
         &mut self,
         cgen: ClientGen,
@@ -159,48 +295,41 @@ impl<B: Backend> Actor<B> {
         max_id: MsgId,
         res: CallResult<()>,
     ) {
-        let Some(mark) = self.reads.get_mut(&thread) else {
-            return;
-        };
-        if mark.flight != Some((cgen, max_id)) {
+        let outcome = Outcome::of(res);
+        if !self
+            .reads
+            .ended(cgen, thread, max_id, outcome, Instant::now())
+        {
             return;
         }
-        mark.flight = None;
-        match res {
-            Ok(()) => {
-                self.read_settled(thread, max_id);
-                if thread.topic.is_some() && cgen == self.cgen {
-                    self.topic_read(thread).await;
-                    self.badge_trigger(thread.chat);
+        let chat = thread.chat;
+        let mut raised = false;
+        if outcome == Outcome::Landed && cgen == self.cgen {
+            if thread.topic.is_some() {
+                self.topic_read(thread, max_id).await;
+                self.badge_trigger(chat);
+            } else {
+                // The pointer rises, unstamped; the read proves no count,
+                // so the row is refreshed from the server. The pane's chat
+                // is refreshed even when it isn't listed (a window only).
+                let now = self.badges.now();
+                raised = self.dialogs.read_landed(chat, max_id, now).is_some();
+                if self.dialogs.get(chat).is_none() && self.shown_chat() == Some(chat) {
+                    let dialogs = &self.dialogs;
+                    self.badges.track_extra(chat, |c| dialogs.get(c).is_some());
                 }
+                self.badges.trigger(chat);
             }
-            Err(CallError::Backend(BackendError::FloodWait { seconds })) => {
-                let wait = Duration::from_secs(u64::from(seconds)).max(MIN_FLOOD_WAIT);
-                mark.hold(wait);
-            }
-            Err(
-                CallError::Backend(BackendError::Transient | BackendError::Migrated)
-                | CallError::Timeout
-                | CallError::Dropped,
-            ) => {
-                let wait = mark.backoff();
-                mark.hold(wait);
-            }
-            // Final: the server refused it.
-            Err(CallError::Backend(_)) => self.read_settled(thread, max_id),
         }
-    }
-
-    /// A read up to `max_id` is done with: the intent goes, unless a newer
-    /// mark joined it meanwhile, which goes at the next flush.
-    fn read_settled(&mut self, thread: ThreadKey, max_id: MsgId) {
-        let Some(mark) = self.reads.get_mut(&thread) else {
-            return;
-        };
-        if mark.max_id <= max_id {
-            self.reads.remove(&thread);
-        } else {
-            *mark = ReadMark::new(mark.max_id);
+        let reading = self.reads.outstanding(chat);
+        let projected = self.dialogs.set_reading(chat, reading).is_some();
+        if (raised || projected)
+            && let Some(summary) = self.dialogs.get(chat).cloned()
+        {
+            self.emit(Event::ChatBumped(summary)).await;
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
