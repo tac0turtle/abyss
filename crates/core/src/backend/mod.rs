@@ -59,7 +59,8 @@ pub struct TopicsCursor {
     pub(crate) offset_date: i32,
     pub(crate) offset_id: i32,
     pub(crate) offset_topic: i32,
-    /// Index for backends that page by position (the fake).
+    /// The number of topics listed before this position: the fake pages by
+    /// it, grammers stops at the server's `count` with it.
     pub(crate) index: u32,
 }
 

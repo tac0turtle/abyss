@@ -17,28 +17,28 @@ use crate::backend::grammers::calls::{Calls, history_offsets};
 use crate::backend::grammers::invoke::Invoke;
 use crate::backend::grammers::{GrammersControl, connection_params};
 use crate::backend::{BackendError, HistoryQuery, InstanceControl, RejectReason, SessionSnapshot};
-use crate::model::{ChatId, MsgId, PeerKind};
+use crate::model::{ChatId, MsgId, PeerKind, ThreadKey};
 use crate::session::{AbyssSession, MAX_PINNED_PEERS};
 
-type Reply = Result<Vec<u8>, InvocationError>;
+pub(super) type Reply = Result<Vec<u8>, InvocationError>;
 
 /// Answers each request with the next scripted reply and records the request
 /// bytes. An exhausted script answers `Dropped`.
 #[derive(Default)]
-struct Mock {
+pub(super) struct Mock {
     script: Mutex<VecDeque<Reply>>,
     requests: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Mock {
-    fn with(replies: Vec<Reply>) -> Arc<Self> {
+    pub(super) fn with(replies: Vec<Reply>) -> Arc<Self> {
         Arc::new(Mock {
             script: Mutex::new(replies.into()),
             requests: Mutex::default(),
         })
     }
 
-    fn requests(&self) -> Vec<Vec<u8>> {
+    pub(super) fn requests(&self) -> Vec<Vec<u8>> {
         self.requests.lock().unwrap().clone()
     }
 }
@@ -74,7 +74,7 @@ fn flood(seconds: u32) -> Reply {
     }))
 }
 
-fn rpc(code: i32, name: &str) -> Reply {
+pub(super) fn rpc(code: i32, name: &str) -> Reply {
     Err(InvocationError::Rpc(RpcError {
         code,
         name: name.into(),
@@ -114,11 +114,11 @@ fn short_sent(id: i32) -> Vec<u8> {
     .to_bytes()
 }
 
-const ANN: ChatId = ChatId {
+pub(super) const ANN: ChatId = ChatId {
     kind: PeerKind::User,
     id: 7,
 };
-const GROUP: ChatId = ChatId {
+pub(super) const GROUP: ChatId = ChatId {
     kind: PeerKind::Channel,
     id: 10,
 };
@@ -128,7 +128,7 @@ fn session() -> Arc<AbyssSession> {
 }
 
 /// A session that knows Ann's and the group's access hashes.
-async fn setup(mock: &Arc<Mock>) -> Calls<Arc<Mock>> {
+pub(super) async fn setup(mock: &Arc<Mock>) -> Calls<Arc<Mock>> {
     let session = session();
     session
         .cache_peer(PeerInfo::User {
@@ -155,7 +155,10 @@ async fn read_class_sleeps_short_floods_at_most_twice() {
     let mock = Mock::with(vec![flood(3), flood(3), Ok(history_reply(&[1, 2]))]);
     let calls = setup(&mock).await;
     let start = tokio::time::Instant::now();
-    let page = calls.history(ANN, HistoryQuery::Tail, 10).await.unwrap();
+    let page = calls
+        .history(ThreadKey::whole(ANN), HistoryQuery::Tail, 10)
+        .await
+        .unwrap();
     assert_eq!(page.messages.len(), 2);
     assert_eq!(mock.requests().len(), 3);
     assert_eq!(start.elapsed(), Duration::from_secs(6));
@@ -163,7 +166,7 @@ async fn read_class_sleeps_short_floods_at_most_twice() {
     let mock = Mock::with(vec![flood(2), flood(2), flood(2), Ok(history_reply(&[1]))]);
     let calls = setup(&mock).await;
     let err = calls
-        .history(ANN, HistoryQuery::Tail, 10)
+        .history(ThreadKey::whole(ANN), HistoryQuery::Tail, 10)
         .await
         .unwrap_err();
     assert_eq!(err, BackendError::FloodWait { seconds: 2 });
@@ -176,7 +179,7 @@ async fn read_class_does_not_sleep_long_floods() {
     let calls = setup(&mock).await;
     let start = tokio::time::Instant::now();
     let err = calls
-        .history(ANN, HistoryQuery::Tail, 10)
+        .history(ThreadKey::whole(ANN), HistoryQuery::Tail, 10)
         .await
         .unwrap_err();
     assert_eq!(err, BackendError::FloodWait { seconds: 6 });
@@ -190,7 +193,7 @@ async fn read_class_retries_io_once() {
     assert!(
         setup(&mock)
             .await
-            .history(ANN, HistoryQuery::Tail, 10)
+            .history(ThreadKey::whole(ANN), HistoryQuery::Tail, 10)
             .await
             .is_ok()
     );
@@ -199,7 +202,7 @@ async fn read_class_retries_io_once() {
     let mock = Mock::with(vec![io(), io(), Ok(history_reply(&[1]))]);
     let err = setup(&mock)
         .await
-        .history(ANN, HistoryQuery::Tail, 10)
+        .history(ThreadKey::whole(ANN), HistoryQuery::Tail, 10)
         .await
         .unwrap_err();
     assert_eq!(err, BackendError::Transient);
@@ -210,18 +213,29 @@ async fn read_class_retries_io_once() {
 async fn sends_are_never_retried_by_the_adapter_and_keep_their_random_id() {
     let mock = Mock::with(vec![io(), flood(1), Ok(short_sent(99))]);
     let calls = setup(&mock).await;
-    let err = calls.send_text(ANN, "hi".into(), 42).await.unwrap_err();
+    let err = calls
+        .send_text(ThreadKey::whole(ANN), "hi".into(), 42)
+        .await
+        .unwrap_err();
     assert_eq!(
         err,
         BackendError::Transient,
         "unknown outcome: core retries"
     );
     assert_eq!(mock.requests().len(), 1);
-    let err = calls.send_text(ANN, "hi".into(), 42).await.unwrap_err();
+    let err = calls
+        .send_text(ThreadKey::whole(ANN), "hi".into(), 42)
+        .await
+        .unwrap_err();
     assert_eq!(err, BackendError::FloodWait { seconds: 1 });
     assert_eq!(mock.requests().len(), 2);
     // Core's retry of the same logical send.
-    assert_eq!(calls.send_text(ANN, "hi".into(), 42).await, Ok(MsgId(99)));
+    assert_eq!(
+        calls
+            .send_text(ThreadKey::whole(ANN), "hi".into(), 42)
+            .await,
+        Ok(MsgId(99))
+    );
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 3);
@@ -249,7 +263,10 @@ async fn accepted_sends_without_an_id_are_unconfirmed() {
     let mock = Mock::with(vec![no_mapping, rpc(400, "RANDOM_ID_DUPLICATE")]);
     let calls = setup(&mock).await;
     for _ in 0..2 {
-        let err = calls.send_text(ANN, "hi".into(), 7).await.unwrap_err();
+        let err = calls
+            .send_text(ThreadKey::whole(ANN), "hi".into(), 7)
+            .await
+            .unwrap_err();
         assert_eq!(err, BackendError::SentUnconfirmed);
     }
 }
@@ -263,12 +280,14 @@ async fn unknown_peers_are_rejected_without_a_request() {
         id: 8,
     };
     assert_eq!(
-        calls.send_text(stranger, "x".into(), 1).await,
+        calls
+            .send_text(ThreadKey::whole(stranger), "x".into(), 1)
+            .await,
         Err(BackendError::Rejected(RejectReason::Other))
     );
     assert_eq!(
         calls
-            .history(stranger, HistoryQuery::Tail, 1)
+            .history(ThreadKey::whole(stranger), HistoryQuery::Tail, 1)
             .await
             .unwrap_err(),
         BackendError::Rejected(RejectReason::Other)
@@ -287,8 +306,14 @@ async fn read_history_sends_the_displayed_max_id() {
     .to_bytes());
     let mock = Mock::with(vec![affected, Ok(true.to_bytes())]);
     let calls = setup(&mock).await;
-    calls.read_history(ANN, MsgId(41)).await.unwrap();
-    calls.read_history(GROUP, MsgId(42)).await.unwrap();
+    calls
+        .read_history(ThreadKey::whole(ANN), MsgId(41))
+        .await
+        .unwrap();
+    calls
+        .read_history(ThreadKey::whole(GROUP), MsgId(42))
+        .await
+        .unwrap();
     let requests = mock.requests();
     let user = tl::functions::messages::ReadHistory::from_boxed_bytes(&requests[0]).unwrap();
     assert_eq!(user.max_id, 41);
@@ -330,7 +355,10 @@ async fn dialogs_teach_the_session_hashes_for_later_calls() {
         kind: PeerKind::User,
         id: 8,
     };
-    calls.history(bob, HistoryQuery::Tail, 20).await.unwrap();
+    calls
+        .history(ThreadKey::whole(bob), HistoryQuery::Tail, 20)
+        .await
+        .unwrap();
     let requests = mock.requests();
     let first = tl::functions::messages::GetDialogs::from_boxed_bytes(&requests[0]).unwrap();
     assert_eq!((first.limit, first.offset_id), (20, 0));
@@ -393,7 +421,10 @@ async fn rebuilt_peer(snapshot: SessionSnapshot, chat: ChatId) -> Option<i64> {
     let session = Arc::new(AbyssSession::from_snapshot(snapshot).unwrap());
     let mock = Mock::with(vec![Ok(history_reply(&[]))]);
     let calls = Calls::new(Arc::clone(&mock), session);
-    calls.history(chat, HistoryQuery::Tail, 5).await.ok()?;
+    calls
+        .history(ThreadKey::whole(chat), HistoryQuery::Tail, 5)
+        .await
+        .ok()?;
     let request = mock.requests().pop()?;
     match tl::functions::messages::GetHistory::from_boxed_bytes(&request)
         .unwrap()
@@ -418,7 +449,10 @@ async fn a_refreshed_first_page_keeps_later_pages_and_open_chats_across_a_rebuil
     let second = calls.dialogs(first.next, 2).await.unwrap();
     assert_eq!(second.chats.len(), 2);
     // Open a chat from page two, then refresh page one.
-    calls.history(uid(24), HistoryQuery::Tail, 5).await.unwrap();
+    calls
+        .history(ThreadKey::whole(uid(24)), HistoryQuery::Tail, 5)
+        .await
+        .unwrap();
     calls.dialogs(None, 2).await.unwrap();
 
     // Core's required set: the open chat, then its merged list.
@@ -505,7 +539,7 @@ async fn in_flight_chats_stay_pinned_until_the_call_ends() {
     let session = knowing_session([7, 8, 9]).await;
     let calls = Calls::new(Hang, Arc::clone(&session));
     calls.retain(&[uid(7)]);
-    let mut call = Box::pin(calls.history(uid(9), HistoryQuery::Tail, 5));
+    let mut call = Box::pin(calls.history(ThreadKey::whole(uid(9)), HistoryQuery::Tail, 5));
     let waited = tokio::time::timeout(Duration::from_secs(1), call.as_mut()).await;
     assert!(waited.is_err(), "the call is still in flight");
     // Core has not listed 9 yet; a rebuild now must still carry it.
@@ -579,7 +613,7 @@ async fn oversized_responses_are_backend_errors() {
     let calls = setup(&mock).await;
     assert_eq!(
         calls
-            .history(ANN, HistoryQuery::Tail, 10)
+            .history(ThreadKey::whole(ANN), HistoryQuery::Tail, 10)
             .await
             .unwrap_err(),
         BackendError::Rejected(RejectReason::Other)
@@ -610,7 +644,7 @@ async fn retire_revokes_before_snapshotting() {
 /// against *their* (absent) default, so this thread could miss events. A
 /// global dispatcher makes every callsite interested; the writer then keeps
 /// only this thread's output.
-fn capture_logs(buf: &LogBuf) -> CaptureGuard {
+pub(super) fn capture_logs(buf: &LogBuf) -> CaptureGuard {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
         let subscriber = tracing_subscriber::fmt()
@@ -628,7 +662,7 @@ thread_local! {
 }
 
 /// Stops capturing on drop.
-struct CaptureGuard;
+pub(super) struct CaptureGuard;
 
 impl Drop for CaptureGuard {
     fn drop(&mut self) {
@@ -656,7 +690,7 @@ impl std::io::Write for ThreadCapture {
 
 /// Collects formatted log output.
 #[derive(Clone, Default)]
-struct LogBuf(Arc<Mutex<Vec<u8>>>);
+pub(super) struct LogBuf(pub(super) Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for LogBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -697,8 +731,12 @@ async fn logs_never_carry_text_phones_or_payloads() {
     ]);
     let calls = setup(&mock).await;
     calls.dialogs(None, 1).await.unwrap();
-    let _ = calls.send_text(ANN, "secret outgoing".into(), 1).await;
-    let _ = calls.send_text(ANN, "secret outgoing".into(), 1).await;
+    let _ = calls
+        .send_text(ThreadKey::whole(ANN), "secret outgoing".into(), 1)
+        .await;
+    let _ = calls
+        .send_text(ThreadKey::whole(ANN), "secret outgoing".into(), 1)
+        .await;
 
     let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
     assert!(
@@ -737,7 +775,10 @@ async fn responses_before_reconciliation_do_not_evict_handed_off_pages() {
     let first = calls.dialogs(None, 100).await.unwrap();
     let second = calls.dialogs(first.next, 100).await.unwrap();
     assert_eq!(second.next.and_then(|c| c.offset_peer), Some(uid(200)));
-    calls.history(uid(7), HistoryQuery::Tail, 5).await.unwrap();
+    calls
+        .history(ThreadKey::whole(uid(7)), HistoryQuery::Tail, 5)
+        .await
+        .unwrap();
     calls.retain(&uids(1..=200));
     assert_eq!(calls.pin_state().1, 0);
     assert_eq!(carried_users(&retire(calls.session())).len(), 200);

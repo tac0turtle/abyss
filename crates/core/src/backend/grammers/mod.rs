@@ -33,7 +33,6 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -48,8 +47,8 @@ pub use stream::GrammersUpdates;
 use super::{
     Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest, CredentialSlot,
     DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl,
-    PasswordChallenge, RejectReason, Seed, SessionSeed, SessionSnapshot, SignIn, TopicsById,
-    TopicsCursor, TopicsPage,
+    PasswordChallenge, Seed, SessionSeed, SessionSnapshot, SignIn, TopicsById, TopicsCursor,
+    TopicsPage,
 };
 use crate::api::{ApiCredentials, PasswordBuf};
 use crate::model::{ChatId, ChatSummary, MsgId, ThreadKey, TopicId};
@@ -278,7 +277,7 @@ impl Client for GrammersClient {
         query: HistoryQuery,
         limit: u32,
     ) -> Result<HistoryPage, BackendError> {
-        self.calls.history(thread.chat, query, limit).await
+        self.calls.history(thread, query, limit).await
     }
 
     async fn send_text(
@@ -287,54 +286,37 @@ impl Client for GrammersClient {
         text: String,
         random_id: i64,
     ) -> Result<MsgId, BackendError> {
-        self.calls.send_text(thread.chat, text, random_id).await
+        self.calls.send_text(thread, text, random_id).await
     }
 
     async fn read_history(&self, thread: ThreadKey, max_id: MsgId) -> Result<(), BackendError> {
-        self.calls.read_history(thread.chat, max_id).await
+        self.calls.read_history(thread, max_id).await
     }
 
-    fn topics(
+    async fn topics(
         &self,
         chat: ChatId,
         cursor: Option<TopicsCursor>,
         limit: u32,
-    ) -> impl Future<Output = Result<TopicsPage, BackendError>> + Send {
-        let _ = (chat, cursor, limit);
-        std::future::ready(Err(not_yet_implemented("topics")))
+    ) -> Result<TopicsPage, BackendError> {
+        self.calls.topics(chat, cursor, limit).await
     }
 
-    fn topics_by_id(
+    async fn topics_by_id(
         &self,
         chat: ChatId,
         ids: &[TopicId],
-    ) -> impl Future<Output = Result<TopicsById, BackendError>> + Send {
-        let _ = (chat, ids);
-        std::future::ready(Err(not_yet_implemented("topics_by_id")))
+    ) -> Result<TopicsById, BackendError> {
+        self.calls.topics_by_id(chat, ids).await
     }
 
-    fn peer_dialogs(
-        &self,
-        chats: &[ChatId],
-    ) -> impl Future<Output = Result<Vec<ChatSummary>, BackendError>> + Send {
-        let _ = chats;
-        std::future::ready(Err(not_yet_implemented("peer_dialogs")))
+    async fn peer_dialogs(&self, chats: &[ChatId]) -> Result<Vec<ChatSummary>, BackendError> {
+        self.calls.peer_dialogs(chats).await
     }
 
     fn retain_peers(&self, required: &[ChatId]) {
         self.calls.retain(required);
     }
-}
-
-/// The forum calls are not implemented over grammers yet (Stage 2 task 4).
-/// Nothing in core calls them before then; a call is a definite failure,
-/// never a panic.
-fn not_yet_implemented(call: &'static str) -> BackendError {
-    tracing::warn!(
-        call,
-        "forum call not yet implemented in the grammers backend"
-    );
-    BackendError::Rejected(RejectReason::Other)
 }
 
 /// Retirement hooks of one grammers instance.

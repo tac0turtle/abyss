@@ -280,7 +280,7 @@ enum Update {
 - **`topics`:** `messages.GetForumTopics { q: None, .. }`.
   - The response is size-checked before mapping, like `dialogs_parts` (`map/lists.rs`): `topics ≤ limit + RESPONSE_SLACK`, `messages ≤ 2 ×` that, peers `≤ MAX_RESPONSE_PEERS`. Otherwise the call fails as `Oversized`.
   - Each topic is mapped with its top message from `messages` (preview, date, and `top_version` from its `edit_date`; section 3). `order` comes from `order_by_create_date`. `forumTopicDeleted` entries are skipped.
-  - `next` is `None` when the page had fewer than `limit` topics, or when `count` is reached.
+  - `next` is `None` when the page was empty, or when the topics listed so far reach `count`. A short page is not the end: `getForumTopics` may return fewer topics than requested while more remain (task 4 review).
 - **`topics_by_id`:** `messages.GetForumTopicsByID`, at most `MAX_TOPICS_BY_ID` ids, same size checks. `forumTopicDeleted { id }` goes to `deleted`.
 - **`peer_dialogs`:** `messages.GetPeerDialogs`, at most `MAX_PEER_DIALOGS` peers, size-checked like a dialogs page. The dialogs are mapped with the existing dialog mapping (kind from `chats`, unread, top message). Broadcasts are excluded as in Stage 1.
 - **`history`:**
@@ -899,7 +899,7 @@ Each task is one implementation and review cycle on `agent/stage-2`, recorded in
    - Applying page and by-id results through the merge policy; the by-id drain (shown forum only, open topic first, rate-limited); fresh by-id deletions.
    - Bootstrap, reconcile and light-refresh additions, including the open topic by id.
    
-   *Done when:* the "opening a forum", "crossing responses", "top-message deletion", "draining" (with reordering and a continuously due open topic), "repeated overflow", "by-id flood wait", "open topic beyond page one", "deleted while offline" and bootstrap actor tests pass, and a stale page is provably dropped.
+   *Done when:* the "opening a forum", "crossing responses", "top-message deletion", "draining" (with reordering and a continuously due open topic), "repeated overflow", "by-id flood wait", "open topic beyond page one", "deleted while offline" and bootstrap actor tests pass, and a stale page is provably dropped. Paging also stops when a non-empty page adds no new topic to the list (duplicates only), so an inflated server `count` can't drive redundant requests (task 4 review); test it with the fake returning a repeated page.
 7. **Core topic threads.** Opening a topic thread, history, the cache per thread under the continuity gate, `Reconciled`, invalidation, and normalization of everything entering windows and the cache through `route`. *Done when:* the "topic thread" and "cache continuity" actor tests pass, and the thread-equals-key invariant holds under the existing history proptests run with topics. This task replaces task 1's temporary `apply::shown_in` (whole-chat keys, raw message topics) with `route` normalization, and enforces key equality for windows and events.
 8. **Core live routing, forum badge, forum flag.**
    - Routing and topic bumps; unknown-topic by-id fetches with caps; General; topic edits and pins; root deletion.
@@ -930,7 +930,11 @@ Each task is one implementation and review cycle on `agent/stage-2`, recorded in
 - **U4:** how topic deletion is signalled (the root message's deletion, `forumTopicDeleted` from by-id), and whether General can be hidden while it has unread messages.
 - **U5:** which update carries a per-topic read from another device (`updateReadChannelDiscussionInbox` or `updateReadHistoryInbox` with `top_msg_id`), and whether the latter ever names a channel (it would hit the grammers assert, risk 2).
 - `getForumTopics` in both orders: the cursor fields (especially `offset_id` in creation order), pinned topics on first pages only, and whether `order_by_create_date` is stable across one traversal.
-- `TOPIC_CLOSED` and `TOPIC_DELETED` error names, and posting in a closed topic as an admin (`can_post_closed`).
+  - Task 4 ends a traversal only on an empty page or when the topics listed so far reach `messages.forumTopics.count` (the cursor's `index` counts them); a short page continues. Check that `count` is the forum's total including pinned and hidden topics, and that `limit = 50` (clamped to 100) is accepted.
+  - Task 4 builds the cursor from the last raw `forumTopic` of a page, including one skipped for a malformed id, and its `LastActivity` date from the raw top message (0 when the response lacks it). Check that a page whose last top message is missing still continues correctly.
+  - `forumTopic.peer` (new in the pinned layer) is not checked against the requested chat. Check what it holds for a supergroup forum.
+- `getForumTopicsByID`: whether an unknown or deleted id comes back as `forumTopicDeleted` or is left out. Task 4 reports only `forumTopicDeleted` as deleted; omitted ids are neither found nor deleted, so core keeps them due.
+- `TOPIC_CLOSED`, `TOPIC_DELETED` and `CHANNEL_FORUM_MISSING` error names (task 4 maps them to `RejectReason::TopicClosed`, `TopicDeleted` and `NotForum` from Telegram's method documentation; grammers carries no error table), and posting in a closed topic as an admin (`can_post_closed`). `TOPIC_ID_INVALID` stays `Other`. `can_post_closed` is `Refused` when a topics response omits the channel entity; check that the entity is always included.
 - `updateEditForumTopic` and `updatePinnedForumTopic(s)` arrive on the update stream for a member who didn't make the change.
 - `updateChannel` arrives when a group is converted to a forum and back.
 - A message sent from another device into a topic arrives with `forum_topic` and the right `reply_to_top_id`/`reply_to_msg_id`.
@@ -1073,3 +1077,10 @@ Follow-ups (not Stage 2 tasks):
 |---|---|---|
 | 1 (ready after fixes) | P2: the fake reused a deleted topic's id. P3: the delayed `peer_dialogs` test posted into an already-unread topic | Per-chat id high-water mark, never lowered, `checked_add` allocation; delayed test posts into a read topic (21 delayed, 22 next) |
 | 2 | Pass | — |
+
+### Task 4: grammers implementation (2 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 (ready after fixes) | P2: a short `getForumTopics` page ended pagination, but Telegram may return fewer than requested | `next` is `None` only for an empty page or when the listed count reaches `count`; regression test; §5/§13 corrected. RPC names confirmed against core.telegram.org (`TOPIC_CLOSED`/`TOPIC_DELETED` are 406 on sendMessage; `CHANNEL_FORUM_MISSING` on getForumTopics) |
+| 2 | Pass. Termination is guaranteed by the cursor's cumulative `index`; duplicate pages could still cause redundant requests, so task 6 now stops paging on a page that adds nothing | — |

@@ -1,9 +1,16 @@
-//! The four Stage 1 calls over raw TL requests (plan sections 7–9).
+//! The client calls over raw TL requests: the Stage 1 calls (plan sections
+//! 7–9) and the forum calls (Stage 2 plan section 5).
 //!
 //! Raw requests rather than grammers' iterators: `iter_dialogs` builds
 //! `Dialog`s, which panic on unknown peers (`peer/dialog.rs:49-66`),
-//! `mark_as_read` hardcodes `max_id: 0`, and `send_message` draws a fresh
-//! `random_id` per call. Responses go through the pure mappers in `map`.
+//! `mark_as_read` hardcodes `max_id: 0`, `send_message` draws a fresh
+//! `random_id` per call, and grammers has no forum API at all (it sends
+//! `top_msg_id: None` everywhere). Responses go through the pure mappers in
+//! `map`.
+//!
+//! Two calls depend on unknowns that only live verification settles (Stage 2
+//! plan section 13), each behind one function: [`general_history`] (U1) and
+//! [`general_read`] (U2).
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -14,15 +21,17 @@ use grammers_client::tl;
 
 use super::errors::{backend_error, kind};
 use super::invoke::{Invoke, RetryClass, call};
-use super::map::{self, Directory};
+use super::map::{self, Directory, input_channel};
 use super::pins::Pins;
 use crate::backend::{
-    BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, RejectReason,
+    BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, RejectReason, TopicsById,
+    TopicsCursor, TopicsPage,
 };
-use crate::model::{ChatId, MsgId};
+use crate::model::{ChatId, ChatSummary, MsgId, PeerKind, ThreadKey, TopicId};
 use crate::session::{AbyssSession, PinRequest, Pinned};
+use crate::store::{MAX_PEER_DIALOGS, MAX_TOPICS_BY_ID};
 
-/// Telegram's page size limit for dialogs and history.
+/// Telegram's page size limit for dialogs, history and topics.
 pub(crate) const MAX_PAGE: u32 = 100;
 
 fn page_limit(limit: u32) -> i32 {
@@ -38,6 +47,38 @@ fn fail(e: &InvocationError) -> BackendError {
 fn oversized() -> BackendError {
     tracing::warn!("oversized telegram response rejected");
     BackendError::Rejected(RejectReason::Other)
+}
+
+/// A request larger than the trait allows: a caller bug, refused without a
+/// request.
+fn too_many(call: &'static str, n: usize) -> BackendError {
+    tracing::warn!(call, n, "request over its id bound refused");
+    BackendError::Rejected(RejectReason::Other)
+}
+
+/// Response items dropped by the mappers (malformed topic ids, topics that
+/// fail validation, deleted entries in a page), counted at debug.
+fn note_skipped(call: &'static str, skipped: usize) {
+    if skipped > 0 {
+        tracing::debug!(call, skipped, "topic entries skipped");
+    }
+}
+
+/// Only supergroups can be forums. A topic call for any other chat is
+/// answered `NotForum` without a request (bot topics are out of scope).
+fn require_channel(chat: ChatId) -> Result<(), BackendError> {
+    match chat.kind {
+        PeerKind::Channel => Ok(()),
+        PeerKind::User | PeerKind::Chat => Err(BackendError::Rejected(RejectReason::NotForum)),
+    }
+}
+
+/// [`require_channel`] for a thread naming a topic; whole chats need nothing.
+fn require_thread(thread: ThreadKey) -> Result<(), BackendError> {
+    match thread.topic {
+        Some(_) => require_channel(thread.chat),
+        None => Ok(()),
+    }
 }
 
 /// Where a later dialogs page starts.
@@ -72,12 +113,35 @@ pub(crate) fn dialogs_request(
     }
 }
 
+/// The `reply_to` that posts into `topic` (plan section 5): a plain post
+/// into topic `t` "replies" to its root, `t`, without `top_msg_id`. A post
+/// into General carries none (Telegram's docs; *live*), nor does one into a
+/// chat that is not a forum.
+pub(crate) fn topic_reply_to(topic: Option<TopicId>) -> Option<tl::enums::InputReplyTo> {
+    let topic = topic.filter(|t| *t != TopicId::GENERAL)?;
+    Some(tl::enums::InputReplyTo::Message(
+        tl::types::InputReplyToMessage {
+            reply_to_msg_id: topic.get(),
+            top_msg_id: None,
+            reply_to_peer_id: None,
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+            monoforum_peer_id: None,
+            todo_item_id: None,
+            poll_option: None,
+            quote_rich: None,
+        },
+    ))
+}
+
 /// The `messages.sendMessage` request for one attempt of a logical send.
 /// Every attempt of the same send must carry the same `random_id`.
 pub(crate) fn send_request(
     peer: tl::enums::InputPeer,
     text: String,
     random_id: i64,
+    reply_to: Option<tl::enums::InputReplyTo>,
 ) -> tl::functions::messages::SendMessage {
     tl::functions::messages::SendMessage {
         no_webpage: true,
@@ -89,7 +153,7 @@ pub(crate) fn send_request(
         invert_media: false,
         allow_paid_floodskip: false,
         peer,
-        reply_to: None,
+        reply_to,
         message: text,
         random_id,
         reply_markup: None,
@@ -112,6 +176,165 @@ pub(crate) fn history_offsets(query: HistoryQuery, limit: i32) -> (i32, i32, i32
         HistoryQuery::Before(id) => (id.0, 0, 0),
         // Newer than `id`: page backwards from it, and let `min_id` cut it off.
         HistoryQuery::After(id) => (id.0, limit.saturating_neg(), id.0),
+    }
+}
+
+/// The request for one page of a thread's history.
+pub(crate) enum HistoryRequest {
+    /// A whole chat: `messages.getHistory`.
+    Chat(tl::functions::messages::GetHistory),
+    /// One forum topic: `messages.getReplies` with the topic's root.
+    Topic(tl::functions::messages::GetReplies),
+}
+
+/// The history request for `thread`'s page. `history_offsets` applies to
+/// both calls, which take the same offset arguments (*live*: the `After`
+/// semantics for `getReplies`, as for `getHistory` in Stage 1).
+pub(crate) fn history_request(
+    peer: tl::enums::InputPeer,
+    topic: Option<TopicId>,
+    query: HistoryQuery,
+    limit: i32,
+) -> HistoryRequest {
+    match topic {
+        None => {
+            let (offset_id, add_offset, min_id) = history_offsets(query, limit);
+            HistoryRequest::Chat(tl::functions::messages::GetHistory {
+                peer,
+                offset_id,
+                offset_date: 0,
+                add_offset,
+                limit,
+                max_id: 0,
+                min_id,
+                hash: 0,
+            })
+        }
+        Some(TopicId::GENERAL) => general_history(peer, query, limit),
+        Some(topic) => HistoryRequest::Topic(replies_request(peer, topic, query, limit)),
+    }
+}
+
+/// **Unknown U1** (plan section 13): how General's history is fetched. Its
+/// messages carry no topic header, so whether `getReplies(msg_id = 1)`
+/// returns them is unverified. The fallback is `messages.search` with
+/// `top_msg_id = 1`, `q = ""` and an empty filter (same response type).
+/// Live verification flips this function only.
+fn general_history(peer: tl::enums::InputPeer, query: HistoryQuery, limit: i32) -> HistoryRequest {
+    HistoryRequest::Topic(replies_request(peer, TopicId::GENERAL, query, limit))
+}
+
+fn replies_request(
+    peer: tl::enums::InputPeer,
+    topic: TopicId,
+    query: HistoryQuery,
+    limit: i32,
+) -> tl::functions::messages::GetReplies {
+    let (offset_id, add_offset, min_id) = history_offsets(query, limit);
+    tl::functions::messages::GetReplies {
+        peer,
+        msg_id: topic.get(),
+        offset_id,
+        offset_date: 0,
+        add_offset,
+        limit,
+        max_id: 0,
+        min_id,
+        hash: 0,
+    }
+}
+
+/// The request marking a thread read up to `max_id`.
+pub(crate) enum ReadRequest {
+    /// A private chat or basic group: `messages.readHistory`.
+    Chat(tl::functions::messages::ReadHistory),
+    /// A whole supergroup: `channels.readHistory`.
+    Channel(tl::functions::channels::ReadHistory),
+    /// One forum topic: `messages.readDiscussion` with the topic's root.
+    Topic(tl::functions::messages::ReadDiscussion),
+}
+
+/// The read request for `thread`'s `max_id` (plan section 5). A topic is
+/// never read with `channels.readHistory`, which has no topic argument.
+pub(crate) fn read_request(
+    peer: tl::enums::InputPeer,
+    topic: Option<TopicId>,
+    max_id: MsgId,
+) -> ReadRequest {
+    match topic {
+        None => match input_channel(&peer) {
+            Some(channel) => ReadRequest::Channel(tl::functions::channels::ReadHistory {
+                channel,
+                max_id: max_id.0,
+            }),
+            None => ReadRequest::Chat(tl::functions::messages::ReadHistory {
+                peer,
+                max_id: max_id.0,
+            }),
+        },
+        Some(TopicId::GENERAL) => general_read(peer, max_id),
+        Some(topic) => ReadRequest::Topic(discussion_request(peer, topic, max_id)),
+    }
+}
+
+/// **Unknown U2** (plan section 13): how General is marked read. Until live
+/// verification shows otherwise it is `readDiscussion(msg_id = 1)`, never
+/// `channels.readHistory`, which might clear every topic of the forum.
+/// Live verification flips this function only.
+fn general_read(peer: tl::enums::InputPeer, max_id: MsgId) -> ReadRequest {
+    ReadRequest::Topic(discussion_request(peer, TopicId::GENERAL, max_id))
+}
+
+fn discussion_request(
+    peer: tl::enums::InputPeer,
+    topic: TopicId,
+    max_id: MsgId,
+) -> tl::functions::messages::ReadDiscussion {
+    tl::functions::messages::ReadDiscussion {
+        peer,
+        msg_id: topic.get(),
+        read_max_id: max_id.0,
+    }
+}
+
+/// The `messages.getForumTopics` request for the page after `cursor` (the
+/// first page without one), in the cursor's fields as the page that built
+/// it reported them (plan section 5). No search query (`q`).
+pub(crate) fn topics_request(
+    peer: tl::enums::InputPeer,
+    cursor: Option<&TopicsCursor>,
+    limit: i32,
+) -> tl::functions::messages::GetForumTopics {
+    tl::functions::messages::GetForumTopics {
+        peer,
+        q: None,
+        offset_date: cursor.map_or(0, |c| c.offset_date),
+        offset_id: cursor.map_or(0, |c| c.offset_id),
+        offset_topic: cursor.map_or(0, |c| c.offset_topic),
+        limit,
+    }
+}
+
+/// The `messages.getForumTopicsByID` request for `ids`.
+pub(crate) fn topics_by_id_request(
+    peer: tl::enums::InputPeer,
+    ids: &[TopicId],
+) -> tl::functions::messages::GetForumTopicsById {
+    tl::functions::messages::GetForumTopicsById {
+        peer,
+        topics: ids.iter().map(|t| t.get()).collect(),
+    }
+}
+
+/// The `messages.getPeerDialogs` request for `peers`.
+pub(crate) fn peer_dialogs_request(
+    peers: Vec<tl::enums::InputPeer>,
+) -> tl::functions::messages::GetPeerDialogs {
+    tl::functions::messages::GetPeerDialogs {
+        peers: peers
+            .into_iter()
+            .map(|peer| tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer }))
+            .collect(),
     }
 }
 
@@ -328,45 +551,42 @@ impl<I: Invoke> Calls<I> {
         })
     }
 
+    /// One page of `thread`'s history. Messages of other threads in the
+    /// response are dropped (plan section 5).
     pub(crate) async fn history(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         query: HistoryQuery,
         limit: u32,
     ) -> Result<HistoryPage, BackendError> {
-        let (peer, _in_flight) = self.resolve_used(chat).await?;
+        require_thread(thread)?;
+        let (peer, _in_flight) = self.resolve_used(thread.chat).await?;
         let limit = page_limit(limit);
-        let (offset_id, add_offset, min_id) = history_offsets(query, limit);
-        let request = tl::functions::messages::GetHistory {
-            peer,
-            offset_id,
-            offset_date: 0,
-            add_offset,
-            limit,
-            max_id: 0,
-            min_id,
-            hash: 0,
-        };
-        let resp = call(&self.invoker, RetryClass::Read, &request)
-            .await
-            .map_err(|e| fail(&e))?;
+        let resp = match history_request(peer, thread.topic, query, limit) {
+            HistoryRequest::Chat(r) => call(&self.invoker, RetryClass::Read, &r).await,
+            HistoryRequest::Topic(r) => call(&self.invoker, RetryClass::Read, &r).await,
+        }
+        .map_err(|e| fail(&e))?;
         let limit = usize::try_from(limit).unwrap_or(0);
         let parts = map::messages_parts(&resp, limit).map_err(|map::Oversized| oversized())?;
         let dir = Directory::from_lists(parts.users, parts.chats);
         self.remember(&dir, &[]);
-        Ok(map::history(&parts, &dir, chat, query, limit))
+        Ok(map::history(&parts, &dir, thread, query, limit))
     }
 
     /// One attempt of a logical send. Never retried here: core retries with
     /// the same `random_id` (plan section 9).
+    /// `TOPIC_CLOSED` and `TOPIC_DELETED` come back as their
+    /// [`RejectReason`]s (`errors::reject_reason`).
     pub(crate) async fn send_text(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         text: String,
         random_id: i64,
     ) -> Result<MsgId, BackendError> {
-        let (peer, _in_flight) = self.resolve_used(chat).await?;
-        let request = send_request(peer, text, random_id);
+        require_thread(thread)?;
+        let (peer, _in_flight) = self.resolve_used(thread.chat).await?;
+        let request = send_request(peer, text, random_id, topic_reply_to(thread.topic));
         let resp = call(&self.invoker, RetryClass::Never, &request)
             .await
             .map_err(|e| fail(&e))?;
@@ -375,31 +595,113 @@ impl<I: Invoke> Calls<I> {
         map::sent_id(&resp, random_id).ok_or(BackendError::SentUnconfirmed)
     }
 
-    /// Raw `readHistory` with the highest displayed id (grammers'
-    /// `mark_as_read` sends `max_id: 0`).
+    /// Raw `readHistory`/`readDiscussion` with the highest displayed id
+    /// (grammers' `mark_as_read` sends `max_id: 0`).
     pub(crate) async fn read_history(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         max_id: MsgId,
     ) -> Result<(), BackendError> {
-        let (peer, _in_flight) = self.resolve_used(chat).await?;
-        let res = if let Some(channel) = map::input_channel(&peer) {
-            let request = tl::functions::channels::ReadHistory {
-                channel,
-                max_id: max_id.0,
-            };
-            call(&self.invoker, RetryClass::Read, &request)
-                .await
-                .map(drop)
-        } else {
-            let request = tl::functions::messages::ReadHistory {
-                peer,
-                max_id: max_id.0,
-            };
-            call(&self.invoker, RetryClass::Read, &request)
-                .await
-                .map(drop)
+        require_thread(thread)?;
+        let (peer, _in_flight) = self.resolve_used(thread.chat).await?;
+        let res = match read_request(peer, thread.topic, max_id) {
+            ReadRequest::Chat(r) => call(&self.invoker, RetryClass::Read, &r).await.map(drop),
+            ReadRequest::Channel(r) => call(&self.invoker, RetryClass::Read, &r).await.map(drop),
+            ReadRequest::Topic(r) => call(&self.invoker, RetryClass::Read, &r).await.map(drop),
         };
         res.map_err(|e| fail(&e))
+    }
+
+    /// One page of a forum's topics after `cursor`. A chat that is not a
+    /// forum is `NotForum` (`CHANNEL_FORUM_MISSING`, or not a supergroup).
+    pub(crate) async fn topics(
+        &self,
+        chat: ChatId,
+        cursor: Option<TopicsCursor>,
+        limit: u32,
+    ) -> Result<TopicsPage, BackendError> {
+        require_channel(chat)?;
+        let (peer, _in_flight) = self.resolve_used(chat).await?;
+        let limit = page_limit(limit);
+        let request = topics_request(peer, cursor.as_ref(), limit);
+        let resp = call(&self.invoker, RetryClass::Read, &request)
+            .await
+            .map_err(|e| fail(&e))?;
+        let limit = usize::try_from(limit).unwrap_or(0);
+        let parts =
+            map::topics::topics_parts(&resp, limit).map_err(|map::Oversized| oversized())?;
+        let dir = Directory::from_lists(parts.users, parts.chats);
+        self.remember(&dir, &[]);
+        let (page, skipped) = map::topics::page(&parts, &dir, chat, cursor.as_ref());
+        note_skipped("topics", skipped);
+        Ok(page)
+    }
+
+    /// The given topics of a forum, at most [`MAX_TOPICS_BY_ID`].
+    pub(crate) async fn topics_by_id(
+        &self,
+        chat: ChatId,
+        ids: &[TopicId],
+    ) -> Result<TopicsById, BackendError> {
+        if ids.len() > MAX_TOPICS_BY_ID {
+            return Err(too_many("topics_by_id", ids.len()));
+        }
+        require_channel(chat)?;
+        let (peer, _in_flight) = self.resolve_used(chat).await?;
+        let request = topics_by_id_request(peer, ids);
+        let resp = call(&self.invoker, RetryClass::Read, &request)
+            .await
+            .map_err(|e| fail(&e))?;
+        let parts =
+            map::topics::topics_parts(&resp, ids.len()).map_err(|map::Oversized| oversized())?;
+        let dir = Directory::from_lists(parts.users, parts.chats);
+        self.remember(&dir, &[]);
+        let (result, skipped) = map::topics::by_id(&parts, &dir, chat);
+        note_skipped("topics_by_id", skipped);
+        Ok(result)
+    }
+
+    /// The current summaries of `chats`, at most [`MAX_PEER_DIALOGS`].
+    /// Chats without an access hash are left out without a request, as are
+    /// chats the server does not return and broadcasts.
+    pub(crate) async fn peer_dialogs(
+        &self,
+        chats: &[ChatId],
+    ) -> Result<Vec<ChatSummary>, BackendError> {
+        if chats.len() > MAX_PEER_DIALOGS {
+            return Err(too_many("peer_dialogs", chats.len()));
+        }
+        let mut asked = Vec::with_capacity(chats.len());
+        let mut peers = Vec::with_capacity(chats.len());
+        let mut in_flight = Vec::with_capacity(chats.len());
+        for &chat in chats {
+            if asked.contains(&chat) {
+                continue;
+            }
+            if let Ok((peer, guard)) = self.resolve_used(chat).await {
+                asked.push(chat);
+                peers.push(peer);
+                in_flight.push(guard);
+            } else {
+                tracing::debug!("peer dialog without an access hash left out");
+            }
+        }
+        if peers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request = peer_dialogs_request(peers);
+        let resp = call(&self.invoker, RetryClass::Read, &request)
+            .await
+            .map_err(|e| fail(&e))?;
+        let parts = map::topics::peer_dialogs_parts(&resp, asked.len())
+            .map_err(|map::Oversized| oversized())?;
+        let dir = Directory::from_lists(parts.users, parts.chats);
+        self.remember(&dir, &asked);
+        let mapped = map::topics::peer_dialogs(&parts, &dir, &asked);
+        if mapped.excluded > 0 {
+            tracing::debug!(excluded = mapped.excluded, "broadcast channels left out");
+        }
+        drop(in_flight);
+        Ok(mapped.chats)
     }
 }

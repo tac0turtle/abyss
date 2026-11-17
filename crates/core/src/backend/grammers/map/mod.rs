@@ -9,6 +9,7 @@
 pub(crate) mod lists;
 pub(crate) mod message;
 pub(crate) mod peers;
+pub(crate) mod topics;
 
 pub(crate) use lists::{
     Oversized, dialogs, dialogs_parts, history, messages_parts, sent_id, update,

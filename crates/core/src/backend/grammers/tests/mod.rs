@@ -5,6 +5,7 @@
 mod auth;
 mod calls;
 mod errors;
+mod forum;
 mod map;
 mod pins;
 mod stream;
@@ -284,7 +285,7 @@ pub(super) fn reply_header(msg: Option<i32>, top: Option<i32>) -> tl::types::Mes
     }
 }
 
-fn notify_settings() -> tl::enums::PeerNotifySettings {
+pub(super) fn notify_settings() -> tl::enums::PeerNotifySettings {
     tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
         show_previews: None,
         silent: None,

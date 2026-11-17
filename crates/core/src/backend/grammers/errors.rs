@@ -29,8 +29,8 @@ pub(crate) enum ErrorKind {
     Server,
     /// `RANDOM_ID_DUPLICATE`: a send with this `random_id` already went through.
     DuplicateRandomId,
-    /// A definite rejection of this request.
-    Rejected,
+    /// A definite rejection of this request, with the reason core acts on.
+    Rejected(RejectReason),
     /// Local trouble: the session store, an unknown DC, key generation.
     Local,
 }
@@ -63,7 +63,22 @@ pub(crate) fn rpc_kind(rpc: &RpcError) -> ErrorKind {
         _ if name.ends_with("_WAIT") && rpc.value.is_some() => ErrorKind::Flood {
             seconds: rpc.value.unwrap_or(DEFAULT_FLOOD_SECONDS),
         },
-        _ => ErrorKind::Rejected,
+        _ => ErrorKind::Rejected(reject_reason(name)),
+    }
+}
+
+/// The rejections core treats specially (plan sections 5 and 6.7), by RPC
+/// error name. The names come from Telegram's method documentation (the
+/// pinned grammers carries no error table); live verification confirms them
+/// (plan section 13). `TOPIC_ID_INVALID` (a malformed or unknown id) stays
+/// `Other`: core never sends an id it did not learn from the server, and it
+/// does not say the topic was deleted.
+fn reject_reason(name: &str) -> RejectReason {
+    match name {
+        "TOPIC_CLOSED" => RejectReason::TopicClosed,
+        "TOPIC_DELETED" => RejectReason::TopicDeleted,
+        "CHANNEL_FORUM_MISSING" => RejectReason::NotForum,
+        _ => RejectReason::Other,
     }
 }
 
@@ -74,7 +89,7 @@ pub(crate) fn backend_error(kind: ErrorKind) -> BackendError {
         ErrorKind::Migrated => BackendError::Migrated,
         ErrorKind::Unauthorized => BackendError::Unauthorized,
         ErrorKind::DuplicateRandomId => BackendError::SentUnconfirmed,
-        ErrorKind::Rejected => BackendError::Rejected(RejectReason::Other),
+        ErrorKind::Rejected(reason) => BackendError::Rejected(reason),
         // Unknown outcome: core may retry (sends with the same `random_id`).
         ErrorKind::Io | ErrorKind::Dropped | ErrorKind::Server | ErrorKind::Local => {
             BackendError::Transient
@@ -87,7 +102,7 @@ pub(crate) fn backend_error(kind: ErrorKind) -> BackendError {
 /// keep their cause so core runs the local logout or the migration policy.
 pub(crate) fn stream_error(kind: ErrorKind) -> StreamError {
     match kind {
-        ErrorKind::Flood { .. } | ErrorKind::Io | ErrorKind::Server | ErrorKind::Rejected => {
+        ErrorKind::Flood { .. } | ErrorKind::Io | ErrorKind::Server | ErrorKind::Rejected(_) => {
             StreamError::Transient
         }
         ErrorKind::Migrated => StreamError::Migrated,

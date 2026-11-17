@@ -13,6 +13,7 @@ use grammers_client::tl;
 
 use crate::model::{ChatId, ChatKind, PeerKind};
 use crate::sanitize::{MAX_NAME_BYTES, clean, display_name};
+use crate::store::PostClosed;
 
 /// Entries kept from one response. Telegram sends at most a few hundred users
 /// and chats per response; anything beyond this is ignored.
@@ -124,6 +125,10 @@ pub(crate) struct PeerEntry {
     /// A broadcast channel: excluded from Stage 1 (plan section 7).
     pub(crate) broadcast: bool,
     pub(crate) can_send: bool,
+    /// Whether the user may post in a forum's closed topics: the channel's
+    /// creator, or an admin with `manage_topics` (plan section 4). Refused
+    /// for every other peer.
+    pub(crate) post_closed: PostClosed,
     /// For the session's peer cache. "Min" constructors carry `auth: None`,
     /// so they never overwrite a known hash (`extend_info`).
     pub(crate) info: PeerInfo,
@@ -246,6 +251,7 @@ fn user_entry(u: &tl::types::User) -> Option<(ChatId, PeerEntry)> {
         },
         broadcast: false,
         can_send: !u.deleted,
+        post_closed: PostClosed::Refused,
         info: PeerInfo::User {
             id: u.id,
             auth: u.access_hash.filter(|_| !u.min).map(PeerAuth::from_hash),
@@ -263,6 +269,10 @@ fn title(raw: &str) -> String {
 
 fn sends_banned(rights: Option<&tl::enums::ChatBannedRights>) -> bool {
     matches!(rights, Some(tl::enums::ChatBannedRights::Rights(r)) if r.send_messages || r.send_plain)
+}
+
+fn manages_topics(rights: Option<&tl::enums::ChatAdminRights>) -> bool {
+    matches!(rights, Some(tl::enums::ChatAdminRights::Rights(r)) if r.manage_topics)
 }
 
 fn chat_entry(chat: &tl::enums::Chat) -> Option<(ChatId, PeerEntry)> {
@@ -295,6 +305,7 @@ fn chat_entry(chat: &tl::enums::Chat) -> Option<(ChatId, PeerEntry)> {
                     },
                     broadcast: c.broadcast,
                     can_send: false,
+                    post_closed: PostClosed::Refused,
                     info: PeerInfo::Channel {
                         id: c.id,
                         auth: Some(PeerAuth::from_hash(c.access_hash)),
@@ -317,6 +328,7 @@ fn group_entry(id: i64, raw_title: &str) -> PeerEntry {
         kind: ChatKind::Group,
         broadcast: false,
         can_send: false,
+        post_closed: PostClosed::Refused,
         info: PeerInfo::Chat { id },
     }
 }
@@ -346,6 +358,11 @@ fn channel_entry(c: &tl::types::Channel) -> Option<(ChatId, PeerEntry)> {
         broadcast: c.broadcast,
         // Gigagroups are read-only for members (plan section 7).
         can_send: !c.left && !c.gigagroup && !c.broadcast && !banned,
+        post_closed: if c.creator || manages_topics(c.admin_rights.as_ref()) {
+            PostClosed::Allowed
+        } else {
+            PostClosed::Refused
+        },
         info: PeerInfo::Channel {
             id: c.id,
             auth: c.access_hash.filter(|_| !c.min).map(PeerAuth::from_hash),

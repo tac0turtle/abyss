@@ -7,8 +7,10 @@ use grammers_client::tl;
 
 use super::message::{message, raw_date, raw_key};
 use super::peers::{Directory, MAX_DIRECTORY, channel_chat, chat_id};
+use super::topics::{forum_update, topic_of};
 use crate::backend::{DialogsCursor, HistoryPage, HistoryQuery, Update};
-use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview, ThreadKey};
+use crate::store::{ForumStatus, Route, route};
 
 /// Ids accepted from one deletion update. Telegram batches at most 100 per
 /// request; the bound only guards against a malformed update.
@@ -29,7 +31,7 @@ pub(crate) const MAX_RESPONSE_PEERS: usize = MAX_DIRECTORY;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Oversized;
 
-fn at_most(n: usize, max: usize) -> Result<(), Oversized> {
+pub(super) fn at_most(n: usize, max: usize) -> Result<(), Oversized> {
     if n <= max { Ok(()) } else { Err(Oversized) }
 }
 
@@ -63,7 +65,14 @@ pub(crate) fn dialogs_parts(
     resp: &tl::enums::messages::Dialogs,
     limit: usize,
 ) -> Result<DialogsParts<'_>, Oversized> {
-    let parts = raw_dialogs_parts(resp);
+    checked_dialogs(raw_dialogs_parts(resp), limit)
+}
+
+/// `parts` if they fit a request for `limit` dialogs.
+pub(super) fn checked_dialogs(
+    parts: DialogsParts<'_>,
+    limit: usize,
+) -> Result<DialogsParts<'_>, Oversized> {
     let items = limit.saturating_add(RESPONSE_SLACK);
     at_most(parts.dialogs.len(), items)?;
     // One top message per dialog; forum dialogs may add a topic's top.
@@ -203,7 +212,7 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
     }
 }
 
-fn count(n: i32) -> u32 {
+pub(super) fn count(n: i32) -> u32 {
     u32::try_from(n).unwrap_or(0)
 }
 
@@ -273,12 +282,23 @@ fn raw_messages_parts(resp: &tl::enums::messages::Messages) -> MessagesParts<'_>
     }
 }
 
-/// Maps a history page of `chat` requested with `limit`: only messages of that
-/// chat on the requested side of the anchor, ascending, without duplicates.
+/// Whether `m` belongs to `thread`. A whole-chat key takes every message of
+/// the chat. A topic key takes the messages that normalize to it: in a forum
+/// a message without a topic header is General's (plan section 3). Messages
+/// keep the topic the server stated; core normalizes them.
+fn in_thread(m: &Message, thread: ThreadKey) -> bool {
+    m.thread.chat == thread.chat
+        && (thread.topic.is_none()
+            || route(m.thread.chat, m.thread.topic, ForumStatus::Forum) == Route::Thread(thread))
+}
+
+/// Maps a history page of `thread` requested with `limit`: only messages of
+/// that thread on the requested side of the anchor, ascending, without
+/// duplicates.
 pub(crate) fn history(
     parts: &MessagesParts<'_>,
     dir: &Directory,
-    chat: ChatId,
+    thread: ThreadKey,
     query: HistoryQuery,
     limit: usize,
 ) -> HistoryPage {
@@ -286,7 +306,7 @@ pub(crate) fn history(
         .messages
         .iter()
         .filter_map(|m| message(m, dir))
-        .filter(|m| m.thread.chat == chat && m.is_valid())
+        .filter(|m| in_thread(m, thread) && m.is_valid())
         .filter(|m| match query {
             HistoryQuery::Tail => true,
             HistoryQuery::Before(id) => m.id < id,
@@ -299,8 +319,13 @@ pub(crate) fn history(
     HistoryPage { messages, has_more }
 }
 
-/// Maps a live update. `None` for everything Stage 1 ignores (counted by the
-/// caller at debug level), and for broadcast-channel traffic.
+pub(super) fn is_broadcast(chat: ChatId, dir: &Directory) -> bool {
+    dir.get(chat).is_some_and(|e| e.broadcast)
+}
+
+/// Maps a live update. `None` for everything the client ignores (counted by
+/// the caller at debug level), for broadcast-channel traffic, and for topic
+/// updates naming a non-positive topic.
 pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update> {
     use tl::enums::Update as U;
     let live = |m: &tl::enums::Message| message(m, dir).filter(Message::is_valid);
@@ -315,7 +340,7 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
         }),
         U::DeleteChannelMessages(u) => {
             let chat = channel_chat(u.channel_id)?;
-            if dir.get(chat).is_some_and(|e| e.broadcast) {
+            if is_broadcast(chat, dir) {
                 return None;
             }
             Some(Update::Deleted {
@@ -323,10 +348,16 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
                 ids: deleted_ids(&u.messages),
             })
         }
-        // A per-topic read (`top_msg_id`) does not change the chat's count.
-        U::ReadHistoryInbox(u) if u.top_msg_id.is_none() => Some(Update::ReadInbox {
+        // grammers asserts that this update never names a channel
+        // (`message_box/adaptor.rs:520`, plan risk 2), so today only
+        // non-channel peers reach here. Channel peers are mapped the same
+        // way, for a grammers that stops asserting.
+        U::ReadHistoryInbox(u) => Some(Update::ReadInbox {
             chat: chat_id(&u.peer)?,
-            topic: None,
+            topic: match u.top_msg_id {
+                Some(top) => Some(topic_of(top)?),
+                None => None,
+            },
             still_unread: count(u.still_unread_count),
         }),
         U::ReadChannelInbox(u) => Some(Update::ReadInbox {
@@ -339,7 +370,7 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
             random_id: u.random_id,
             id: MsgId(u.id),
         }),
-        _ => None,
+        _ => forum_update(raw, dir),
     }
 }
 

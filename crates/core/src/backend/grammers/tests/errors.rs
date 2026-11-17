@@ -92,6 +92,27 @@ fn rpc_error_table() {
     }
 }
 
+/// The forum rejections core acts on (Stage 2 plan sections 5 and 6.7).
+#[test]
+fn forum_rpc_error_table() {
+    // `sendMessage` documents the topic errors as 406.
+    let table: &[(i32, &str, RejectReason)] = &[
+        (406, "TOPIC_CLOSED", RejectReason::TopicClosed),
+        (406, "TOPIC_DELETED", RejectReason::TopicDeleted),
+        (400, "TOPIC_CLOSED", RejectReason::TopicClosed),
+        (400, "CHANNEL_FORUM_MISSING", RejectReason::NotForum),
+        // Malformed or unknown ids say nothing about deletion.
+        (400, "TOPIC_ID_INVALID", RejectReason::Other),
+    ];
+    for &(code, name, reason) in table {
+        check(
+            &rpc(code, name, None),
+            BackendError::Rejected(reason),
+            StreamError::Transient,
+        );
+    }
+}
+
 /// Auth loss keeps its cause across the stream boundary, so core runs the
 /// local logout instead of rebuilding.
 #[test]

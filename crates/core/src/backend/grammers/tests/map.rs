@@ -14,7 +14,7 @@ use crate::backend::grammers::map::peers::{
 };
 use crate::backend::{HistoryQuery, Update};
 use crate::model::{
-    Body, ChatId, ChatKind, InvalidTopicId, MediaKind, MsgId, PeerKind, Preview, TopicId,
+    Body, ChatId, ChatKind, InvalidTopicId, MediaKind, MsgId, PeerKind, Preview, ThreadKey, TopicId,
 };
 use crate::rich_text::{LinkTarget, MAX_ENTITIES, MAX_TEXT_BYTES, MAX_URL_BYTES, Style};
 use crate::sanitize::MAX_SERVICE_BYTES;
@@ -869,7 +869,13 @@ fn a_service_message_adding_many_users_is_accepted() {
     let resp = history_with(vec![tl::enums::Message::Service(svc)], 201);
     let parts = lists::messages_parts(&resp, 1).expect("legitimate response accepted");
     let dir = Directory::from_lists(parts.users, parts.chats);
-    let page = lists::history(&parts, &dir, gid(3), HistoryQuery::Tail, 1);
+    let page = lists::history(
+        &parts,
+        &dir,
+        ThreadKey::whole(gid(3)),
+        HistoryQuery::Tail,
+        1,
+    );
     assert_eq!(page.messages.len(), 1);
     assert!(matches!(&page.messages[0].body, Body::Service(s) if s.starts_with("U added")));
 }
@@ -918,7 +924,13 @@ fn mentions_and_forwards_naming_many_peers_are_accepted() {
     let resp = history_with(messages, 155);
     let parts = lists::messages_parts(&resp, 5).expect("legitimate response accepted");
     let dir = Directory::from_lists(parts.users, parts.chats);
-    let page = lists::history(&parts, &dir, uid(7), HistoryQuery::Tail, 5);
+    let page = lists::history(
+        &parts,
+        &dir,
+        ThreadKey::whole(uid(7)),
+        HistoryQuery::Tail,
+        5,
+    );
     assert_eq!(page.messages.len(), 5);
 }
 
@@ -1005,7 +1017,7 @@ fn history_is_ascending_deduplicated_and_bounded_by_the_query() {
     };
     let dir = Directory::default();
     let ids = |q| {
-        lists::history(&parts, &dir, uid(7), q, 100)
+        lists::history(&parts, &dir, ThreadKey::whole(uid(7)), q, 100)
             .messages
             .iter()
             .map(|m| m.id.0)
@@ -1014,13 +1026,40 @@ fn history_is_ascending_deduplicated_and_bounded_by_the_query() {
     assert_eq!(ids(HistoryQuery::Tail), vec![1, 3, 4, 5]);
     assert_eq!(ids(HistoryQuery::Before(MsgId(4))), vec![1, 3]);
     assert_eq!(ids(HistoryQuery::After(MsgId(3))), vec![4, 5]);
-    assert!(!lists::history(&parts, &dir, uid(7), HistoryQuery::Tail, 100).has_more);
-    assert!(lists::history(&parts, &dir, uid(7), HistoryQuery::Tail, 7).has_more);
+    assert!(
+        !lists::history(
+            &parts,
+            &dir,
+            ThreadKey::whole(uid(7)),
+            HistoryQuery::Tail,
+            100
+        )
+        .has_more
+    );
+    assert!(
+        lists::history(
+            &parts,
+            &dir,
+            ThreadKey::whole(uid(7)),
+            HistoryQuery::Tail,
+            7
+        )
+        .has_more
+    );
     let complete = MessagesParts {
         complete: true,
         ..parts
     };
-    assert!(!lists::history(&complete, &dir, uid(7), HistoryQuery::Tail, 7).has_more);
+    assert!(
+        !lists::history(
+            &complete,
+            &dir,
+            ThreadKey::whole(uid(7)),
+            HistoryQuery::Tail,
+            7
+        )
+        .has_more
+    );
 }
 
 // --- live updates ---
@@ -1091,16 +1130,6 @@ fn live_updates_map_to_domain_updates() {
 #[test]
 fn ignored_and_excluded_updates_map_to_nothing() {
     use tl::enums::Update as U;
-    let topic_read = U::ReadHistoryInbox(tl::types::UpdateReadHistoryInbox {
-        folder_id: None,
-        peer: peer_channel(10),
-        top_msg_id: Some(3),
-        max_id: 9,
-        still_unread_count: 1,
-        pts: 1,
-        pts_count: 1,
-    });
-    assert!(lists::update(&topic_read, &Directory::default()).is_none());
     let bad_id = U::MessageId(tl::types::UpdateMessageId {
         id: 0,
         random_id: 2,
