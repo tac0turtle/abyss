@@ -16,6 +16,7 @@ pub(crate) mod messages;
 pub(crate) mod retry;
 pub(crate) mod rich;
 pub(crate) mod sends;
+pub(crate) mod sidebar_file;
 pub(crate) mod topics;
 pub(crate) mod viewport;
 

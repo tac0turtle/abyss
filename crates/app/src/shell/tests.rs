@@ -175,6 +175,7 @@ mod fake {
     mod folder_menu;
     mod forum;
     mod quit;
+    mod tabs;
 
     fn open(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {
         cx.update(|cx| cx.bind_keys(text_input::key_bindings()));

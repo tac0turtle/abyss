@@ -13,6 +13,7 @@ dependencies = [
  "gpui_platform",
  "jiff",
  "libc",
+ "proptest",
  "tempfile",
  "tracing",
  "tracing-subscriber",

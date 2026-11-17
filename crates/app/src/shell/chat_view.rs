@@ -17,7 +17,7 @@ use jiff::tz::TimeZone;
 use super::session::Session;
 use super::view::{centered, field, muted};
 use super::{Root, State};
-use crate::chat::list::{ArchiveEntry, Shown, SidebarRow};
+use crate::chat::list::{ArchiveEntry, ChatList, Shown, SidebarRow, Tab, View};
 use crate::chat::messages::MessageWindow;
 use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
@@ -78,19 +78,16 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
     let shown = list.shown();
     let body = if rows.is_empty() {
         let empty = match shown {
-            Shown::Main => copy::NO_CHATS,
+            Shown::Tab(Tab::All) => copy::NO_CHATS,
+            Shown::Tab(Tab::Private) => copy::NO_PRIVATE_CHATS,
+            Shown::Tab(Tab::Groups) => copy::NO_GROUPS,
+            Shown::Tab(Tab::Forums) => copy::NO_FORUMS,
+            Shown::Tab(Tab::Folder(_)) => copy::NO_FOLDER_CHATS,
             Shown::Archive => copy::NO_ARCHIVED,
-            Shown::Folder(_) => copy::NO_FOLDER_CHATS,
         };
         centered().child(muted(empty)).into_any_element()
     } else {
-        // Each view keeps its own scroll position.
-        let id: ElementId = match shown {
-            Shown::Main => "chats-main".into(),
-            Shown::Archive => "chats-archive".into(),
-            Shown::Folder(f) => ("chats-folder", u64::from(f.cast_unsigned())).into(),
-        };
-        uniform_list(id, rows.len(), cx.processor(chat_rows))
+        uniform_list(list_id(list.view()), rows.len(), cx.processor(chat_rows))
             .flex_1()
             .into_any_element()
     };
@@ -131,17 +128,39 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
                         .child(appearance_button(cx)),
                 ),
         )
-        .children(folder_tabs(session, theme, cx))
+        .children(tab_strip(session, theme, cx))
         .child(body)
         // Last, so it paints over the rows and takes their clicks.
         .children(retry)
+}
+
+/// The sidebar list's id: each view, with the unread filter on or off,
+/// keeps its own scroll position.
+fn list_id(view: View) -> ElementId {
+    let (name, folder) = match view.shown {
+        Shown::Tab(Tab::All) => ("chats-all", None),
+        Shown::Tab(Tab::Private) => ("chats-private", None),
+        Shown::Tab(Tab::Groups) => ("chats-groups", None),
+        Shown::Tab(Tab::Forums) => ("chats-forums", None),
+        Shown::Tab(Tab::Folder(id)) => ("chats-folder", Some(u64::from(id.cast_unsigned()))),
+        Shown::Archive => ("chats-archive", None),
+    };
+    let name = if view.unread_only {
+        SharedString::from(format!("{name}-unread"))
+    } else {
+        name.into()
+    };
+    match folder {
+        Some(folder) => ElementId::NamedInteger(name, folder),
+        None => name.into(),
+    }
 }
 
 /// The sidebar's heading: the wordmark, or the archive's title, which also
 /// leads back.
 fn sidebar_title(shown: Shown, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     match shown {
-        Shown::Main | Shown::Folder(_) => div()
+        Shown::Tab(_) => div()
             .flex()
             .items_center()
             .gap_2()
@@ -157,32 +176,24 @@ fn sidebar_title(shown: Shown, theme: &Theme, cx: &mut Context<'_, Root>) -> Any
     }
 }
 
-/// The chat folder tabs ("All", then each folder in server order), when the
-/// account has folders and the archive is not shown.
-fn folder_tabs(
-    session: &Session,
-    theme: &Theme,
-    cx: &mut Context<'_, Root>,
-) -> Option<Stateful<Div>> {
+/// The strip under the heading: All, Private, Groups and Forums, then each
+/// chat folder in server order (plan section 17.2). The archive has no tabs.
+/// The tabs scroll sideways; the unread toggle (task 15) goes at the
+/// strip's right end, outside the scroll.
+fn tab_strip(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Option<Div> {
     let list = &session.shell.list;
-    let shown = list.shown();
-    if list.folders().is_empty() || shown == Shown::Archive {
+    let Shown::Tab(shown) = list.shown() else {
         return None;
-    }
-    let all = std::iter::once((Shown::Main, SharedString::from(copy::ALL_CHATS)));
-    let folders = list
-        .folders()
-        .iter()
-        .map(|f| (Shown::Folder(f.id), SharedString::from(f.title.clone())));
-    let tabs = all.chain(folders).enumerate().map(|(ix, (target, title))| {
-        let selected = target == shown;
+    };
+    let tabs = list.tabs().map(|tab| {
+        let selected = tab == shown;
         let mark: Hsla = if selected {
             theme.text.into()
         } else {
             transparent_black()
         };
         div()
-            .id(("folder-tab", ix))
+            .id(tab_id(tab))
             .flex_none()
             .px_2()
             .pb_1()
@@ -190,12 +201,13 @@ fn folder_tabs(
             .border_color(mark)
             .text_sm()
             .cursor_pointer()
-            .child(title)
+            .child(tab_title(tab, list))
             .when(!selected, |d| d.text_color(theme::quiet(theme.text)))
             .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
-                root.with_session(|s, cx| s.show_chats(target, window, cx), cx);
+                root.with_session(|s, cx| s.show_chats(Shown::Tab(tab), window, cx), cx);
             }))
-            .when_some(folder_id(target), |d, folder| {
+            // Folder tabs keep their menu; built-in tabs have none.
+            .when_some(folder_id(tab), |d, folder| {
                 d.on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |root, ev: &MouseDownEvent, window, cx| {
@@ -207,30 +219,61 @@ fn folder_tabs(
                 )
             })
     });
+    let scroll = div()
+        .id("tabs")
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .gap_1()
+        .px_1()
+        .pt_1()
+        .overflow_x_scroll()
+        .children(tabs);
     Some(
         div()
-            .id("folder-tabs")
             .flex()
             .flex_none()
-            .gap_1()
-            .px_1()
-            .pt_1()
-            .overflow_x_scroll()
             .bg(theme.surface(Depth::NOW))
             .text_color(theme.text)
-            .children(tabs),
+            .child(scroll),
     )
 }
 
-/// The chat folder a tab shows, if it is one.
-fn folder_id(shown: Shown) -> Option<i32> {
-    match shown {
-        Shown::Folder(id) => Some(id),
-        Shown::Main | Shown::Archive => None,
+/// A tab's stable element id: built-in tabs by name, folders by id.
+fn tab_id(tab: Tab) -> ElementId {
+    match tab {
+        Tab::All => "tab-all".into(),
+        Tab::Private => "tab-private".into(),
+        Tab::Groups => "tab-groups".into(),
+        Tab::Forums => "tab-forums".into(),
+        Tab::Folder(id) => ("tab-folder", u64::from(id.cast_unsigned())).into(),
     }
 }
 
-/// Leaves the archive for the main list.
+fn tab_title(tab: Tab, list: &ChatList) -> SharedString {
+    match tab {
+        Tab::All => copy::ALL_CHATS.into(),
+        Tab::Private => copy::PRIVATE_TAB.into(),
+        Tab::Groups => copy::GROUPS_TAB.into(),
+        Tab::Forums => copy::FORUMS_TAB.into(),
+        Tab::Folder(id) => list
+            .folders()
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| SharedString::from(f.title.clone()))
+            .unwrap_or_default(),
+    }
+}
+
+/// The chat folder a tab shows, if it is one.
+fn folder_id(tab: Tab) -> Option<i32> {
+    match tab {
+        Tab::Folder(id) => Some(id),
+        Tab::All | Tab::Private | Tab::Groups | Tab::Forums => None,
+    }
+}
+
+/// Leaves the archive for All.
 fn back_button(cx: &mut Context<'_, Root>) -> Stateful<Div> {
     div()
         .id("archive-back")
@@ -239,7 +282,7 @@ fn back_button(cx: &mut Context<'_, Root>) -> Stateful<Div> {
         .cursor_pointer()
         .child(copy::ARCHIVE_BACK)
         .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
-            root.with_session(|s, cx| s.show_chats(Shown::Main, window, cx), cx);
+            root.with_session(|s, cx| s.show_chats(Shown::default(), window, cx), cx);
         }))
 }
 

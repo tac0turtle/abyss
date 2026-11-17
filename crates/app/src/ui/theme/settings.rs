@@ -1,16 +1,16 @@
 //! The user's theme choice and the small file that keeps it.
 //!
 //! The file is not secret and not precious: three lines of text in
-//! Application Support, readable only by the user. Anything unexpected in it
-//! (wrong header, a value that is not on offer, extra bytes) means the
-//! defaults, never an error the user has to deal with.
+//! Application Support, readable only by the user (`ui::small_file`).
+//! Anything unexpected in it (wrong header, a value that is not on offer,
+//! extra bytes) means the defaults, never an error the user has to deal
+//! with.
 
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use super::Mode;
+use crate::ui::small_file;
 
 const HUE_STEP: u16 = 15;
 /// Offsets the grid so both default hues (200 and 215) are on it.
@@ -19,9 +19,6 @@ const HUE_COUNT: u16 = 24;
 const TINT_PERCENTS: [u16; 5] = [0, 50, 100, 150, 200];
 
 const HEADER: &str = "abyss-theme 1";
-/// A valid file is under 50 bytes; nothing longer is read.
-const MAX_FILE_BYTES: u64 = 128;
-const DIR: &str = "Library/Application Support/dev.abyss";
 const FILE: &str = "theme";
 
 /// A hue on offer, in degrees: 24 steps around the wheel.
@@ -150,12 +147,12 @@ fn parse_choice(line: &str, name: &str) -> Option<Choice> {
 
 /// Where the choice is kept, if the home directory is known.
 pub(crate) fn default_path() -> Option<PathBuf> {
-    Some(std::env::home_dir()?.join(DIR).join(FILE))
+    small_file::path(FILE)
 }
 
 /// The saved choice, or the defaults if there is none or it is not valid.
 pub(crate) fn load(path: &Path) -> Settings {
-    match read(path) {
+    match small_file::read(path) {
         Ok(text) => parse(&text).unwrap_or_else(|| {
             tracing::warn!("the saved theme choice is not valid; using the defaults");
             Settings::default()
@@ -170,34 +167,14 @@ pub(crate) fn load(path: &Path) -> Settings {
     }
 }
 
-fn read(path: &Path) -> io::Result<String> {
-    let mut text = String::new();
-    File::open(path)?
-        .take(MAX_FILE_BYTES)
-        .read_to_string(&mut text)?;
-    Ok(text)
-}
-
-/// Writes the choice beside its final place, then renames it in, so a reader
-/// never sees half a file.
+/// Saves the choice (see [`small_file::write`]).
 pub(crate) fn save(path: &Path, settings: Settings) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    }
-    let staging = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&staging)?;
-    file.write_all(format(settings).as_bytes())?;
-    file.sync_all()?;
-    fs::rename(&staging, path)
+    small_file::write(path, &format(settings))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;

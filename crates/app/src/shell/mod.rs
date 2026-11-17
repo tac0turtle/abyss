@@ -35,7 +35,15 @@ actions!(
         /// Back from a forum topic to its topic list, and from a topic list
         /// to no chat (Cmd+[). Not Escape: that cancels IME composition in
         /// the composer.
-        ForumBack
+        ForumBack,
+        /// The sidebar's next tab, wrapping (Ctrl+Tab).
+        NextTab,
+        /// The sidebar's previous tab, wrapping (Ctrl+Shift+Tab).
+        PreviousTab,
+        /// Turns the sidebar's unread filter on or off (Cmd+Shift+U). Bound
+        /// now so the chord is reserved; the filter handles it (plan
+        /// section 17.4, task 15).
+        ToggleUnread
     ]
 );
 
@@ -46,6 +54,11 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-w", Quit, None),
         KeyBinding::new("cmd-,", Appearance, None),
         KeyBinding::new("cmd-[", ForumBack, None),
+        // Bound by no text input, and none of them is part of IME
+        // composition (plan section 17.2, "Keyboard").
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+        KeyBinding::new("cmd-shift-u", ToggleUnread, None),
     ]
 }
 
@@ -193,6 +206,7 @@ pub(crate) fn open(launch: Result<Launch, LaunchError>, cx: &mut App) -> gpui::R
     };
     crate::ui::theme::Themes::init(cx);
     crate::preferences::Preferences::init(cx);
+    crate::chat::sidebar_file::SidebarFile::init(cx);
     let handle = cx.open_window(options, |window, cx| {
         cx.new(|cx| Root::new(launch, window, cx))
     })?;

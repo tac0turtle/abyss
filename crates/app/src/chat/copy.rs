@@ -15,6 +15,9 @@ pub(crate) const SELECT_CHAT: &str = "Select a chat";
 pub(crate) const NO_CHATS: &str = "No chats yet";
 pub(crate) const NO_ARCHIVED: &str = "No archived chats";
 pub(crate) const NO_FOLDER_CHATS: &str = "No chats in this folder";
+pub(crate) const NO_PRIVATE_CHATS: &str = "No private chats";
+pub(crate) const NO_GROUPS: &str = "No groups";
+pub(crate) const NO_FORUMS: &str = "No forums";
 pub(crate) const ARCHIVE_CHAT: &str = "Archive";
 pub(crate) const UNARCHIVE_CHAT: &str = "Unarchive";
 pub(crate) const NEW_FOLDER: &str = "New folder with this chat…";
@@ -30,8 +33,12 @@ pub(crate) fn confirm_delete_folder(title: &str) -> SharedString {
     format!("Click again to delete “{title}”").into()
 }
 
-/// The first folder tab: the main list, archive entry included.
+/// The first tab: the main list, archive entry included.
 pub(crate) const ALL_CHATS: &str = "All";
+/// The built-in tabs after All (plan section 17.2, D9).
+pub(crate) const PRIVATE_TAB: &str = "Private";
+pub(crate) const GROUPS_TAB: &str = "Groups";
+pub(crate) const FORUMS_TAB: &str = "Forums";
 pub(crate) const ARCHIVE: &str = "Archive";
 /// The archive view's title, which leads back to the main list.
 pub(crate) const ARCHIVE_BACK: &str = "‹ Archive";

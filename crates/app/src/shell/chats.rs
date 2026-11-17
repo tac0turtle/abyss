@@ -17,6 +17,8 @@ use super::bridge::SharedCore;
 use super::session::Session;
 use crate::chat::copy as chat_copy;
 use crate::chat::discarded::{Lost, Obsolete};
+use crate::chat::list::{Shown, Step, View};
+use crate::chat::sidebar_file::SidebarFile;
 use crate::chat::{Admit, ChatShell, Composer, Pane, Refused, Stale, format};
 use crate::ui::copy;
 
@@ -663,15 +665,43 @@ impl Session {
         cx.notify();
     }
 
-    /// Switches the sidebar between the main list and the archive. A view
-    /// with no row may want the next page at once.
+    /// Switches the sidebar to a tab or the archive (a click).
     pub(super) fn show_chats(
         &mut self,
-        shown: crate::chat::list::Shown,
+        shown: Shown,
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
+        // Signed out, the list is hidden and the file is the next
+        // account's: neither changes.
+        if self.auth != AuthView::SignedIn {
+            return;
+        }
+        let kept = self.shell.list.kept_view();
         self.shell.list.show(shown);
+        self.view_changed(kept, window, cx);
+    }
+
+    /// Ctrl+Tab and Ctrl+Shift+Tab: the next or previous tab, wrapping.
+    /// Nothing happens in the archive.
+    pub(super) fn step_tab(&mut self, step: Step, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if self.auth != AuthView::SignedIn {
+            return;
+        }
+        let kept = self.shell.list.kept_view();
+        if self.shell.list.step_tab(step) {
+            self.view_changed(kept, window, cx);
+        }
+    }
+
+    /// The signed-in user changed the sidebar's view (`kept` is what the
+    /// file held before): keeps the new choice, and asks for the next page if the
+    /// new view has no row.
+    fn view_changed(&mut self, kept: View, window: &mut Window, cx: &mut Context<'_, Root>) {
+        let view = self.shell.list.kept_view();
+        if view != kept {
+            SidebarFile::save(view, cx);
+        }
         let now = cx.background_executor().now();
         self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
             s.request_dialogs(now, admit)

@@ -383,6 +383,15 @@ impl AuthView {
         )
     }
 
+    /// A teardown that ends the account: a logout, not a startup block,
+    /// after which the same account may resume.
+    pub(crate) fn ends_account(&self) -> bool {
+        matches!(
+            self,
+            AuthView::LoggingOut | AuthView::LogoutIncomplete { .. }
+        )
+    }
+
     /// Whether the account's chat state (echoes, drafts) is kept behind
     /// this screen: signed in, a login's tips, or a logout overlay over a
     /// kept account. Torn-down and signed-out screens keep none (task 6m).

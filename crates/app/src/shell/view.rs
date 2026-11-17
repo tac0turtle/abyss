@@ -16,6 +16,7 @@ use super::session::Session;
 use super::shutdown::Closing;
 use super::{Failure, Root, State};
 use crate::chat::copy as chat_copy;
+use crate::chat::list::Step;
 use crate::ui::copy;
 use crate::ui::mark::mark;
 use crate::ui::theme::{self, Depth, Mode, Theme, Themes};
@@ -48,6 +49,12 @@ impl Render for Root {
             .text_size(px(14.))
             .on_action(cx.listener(|root, _: &super::ForumBack, window, cx| {
                 root.with_session(|s, cx| s.back_from_forum(window, cx), cx);
+            }))
+            .on_action(cx.listener(|root, _: &super::NextTab, window, cx| {
+                root.with_session(|s, cx| s.step_tab(Step::Next, window, cx), cx);
+            }))
+            .on_action(cx.listener(|root, _: &super::PreviousTab, window, cx| {
+                root.with_session(|s, cx| s.step_tab(Step::Previous, window, cx), cx);
             }))
             .child(body)
             .children(panel)

@@ -27,7 +27,7 @@ use gpui::{
 };
 
 use super::{Harness, link};
-use crate::chat::list::Shown;
+use crate::chat::list::{Shown, Tab};
 use crate::chat::{demo, format};
 use crate::shell::Root;
 use crate::shell::session::Started;
@@ -239,12 +239,30 @@ fn archive(dir: &Path) -> Result<()> {
     shot.save(Mode::Night, "archive-night.png")
 }
 
+/// A built-in tab selected in the strip (plan section 17.2): the forums.
+fn tabs(dir: &Path) -> Result<()> {
+    let mut shot = Shot::open(dir)?;
+    shot.sign_in()?;
+    shot.root.update(&mut shot.cx, |root, window, cx| {
+        root.with_session(
+            |s, cx| s.show_chats(Shown::Tab(Tab::Forums), window, cx),
+            cx,
+        );
+    })?;
+    shot.cx.run_until_parked();
+    shot.save(Mode::Day, "tabs-day.png")?;
+    shot.save(Mode::Night, "tabs-night.png")
+}
+
 /// A chat folder's tab selected: its pinned chat first, then its own.
 fn folder(dir: &Path) -> Result<()> {
     let mut shot = Shot::open(dir)?;
     shot.sign_in()?;
     shot.root.update(&mut shot.cx, |root, window, cx| {
-        root.with_session(|s, cx| s.show_chats(Shown::Folder(4), window, cx), cx);
+        root.with_session(
+            |s, cx| s.show_chats(Shown::Tab(Tab::Folder(4)), window, cx),
+            cx,
+        );
     })?;
     shot.cx.run_until_parked();
     shot.save(Mode::Day, "folder-day.png")?;
@@ -274,6 +292,7 @@ fn snapshots() -> Result<()> {
     signin(&dir)?;
     chat(&dir)?;
     archive(&dir)?;
+    tabs(&dir)?;
     folder(&dir)?;
     list_deep(&dir)
 }

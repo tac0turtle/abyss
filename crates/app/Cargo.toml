@@ -23,6 +23,7 @@ zeroize = "1"
 [dev-dependencies]
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 gpui = { workspace = true, features = ["test-support"] }
+proptest = "1"
 tempfile = "3"
 
 [features]

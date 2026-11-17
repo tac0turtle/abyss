@@ -18,6 +18,7 @@ use super::auth::{AuthView, project};
 use super::bridge::{CoreLink, EventSource, SharedCore, spawn_pump};
 use super::shutdown::{self, Closing, Next};
 use crate::chat::discarded::Discarded;
+use crate::chat::sidebar_file::SidebarFile;
 use crate::chat::{ChatShell, Refused};
 use crate::launch::Launch;
 use crate::ui::copy;
@@ -187,7 +188,8 @@ impl Session {
             folder_sub,
         ];
         let pump = spawn_pump(started.events, window, cx);
-        let shell = ChatShell::default();
+        let mut shell = ChatShell::default();
+        shell.list.restore(SidebarFile::load(cx));
         let chat_wiring = super::chats::wire(window, cx);
         let session = Self {
             core: shared,
@@ -296,7 +298,16 @@ impl Session {
         }
         let ticking = next.ticking_until().is_some() && self.auth.ticking_until().is_none();
         if next.tears_down() {
+            let kept = self.shell.list.kept_view();
             self.reset_account(window, cx);
+            if next.ends_account() {
+                // The next account starts on All.
+                SidebarFile::remove(cx);
+            } else {
+                // A startup block proves no logout: the same account may
+                // resume, on its kept tab (the file still holds it).
+                self.shell.list.restore(kept);
+            }
         } else if next.hides_account() {
             self.shell.hidden();
         }
@@ -352,6 +363,9 @@ impl Session {
             AuthView::Code { .. } => self.code.focus_handle(cx),
             AuthView::Password { .. } => self.password.focus_handle(cx),
             AuthView::SignedIn if self.shell.selected().is_some() => self.composer.focus_handle(cx),
+            // The shell's own focus, so its chords (Ctrl+Tab) work before
+            // any chat is open.
+            AuthView::SignedIn => self.pane_focus.clone(),
             _ => return,
         };
         window.focus(&handle, cx);

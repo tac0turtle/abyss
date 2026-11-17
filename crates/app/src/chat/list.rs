@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use abyss_core::api::{Event, UserError};
-use abyss_core::model::{ChatFolder, ChatId, ChatSummary, PeerFolder, Preview};
+use abyss_core::model::{ChatFolder, ChatId, ChatKind, ChatSummary, PeerFolder, Preview};
 use abyss_core::store::{MAX_DIALOGS, bump_moves};
 use gpui::SharedString;
 
@@ -39,17 +39,67 @@ struct Paging {
     retry: Backoff,
 }
 
+/// A tab of the sidebar's strip (plan section 17.2): a built-in rule over
+/// the main peer folder, or a chat folder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Tab {
+    /// Every chat of the main peer folder, led by the archive's entry.
+    #[default]
+    All,
+    /// One-to-one chats: people and bots (D9).
+    Private,
+    /// Basic groups and supergroups that aren't forums.
+    Groups,
+    Forums,
+    /// A chat folder, by id: its chats from both peer folders.
+    Folder(i32),
+}
+
+impl Tab {
+    /// The built-in tabs, in the strip's order; the folders follow them.
+    pub(crate) const BUILT_IN: [Self; 4] = [Self::All, Self::Private, Self::Groups, Self::Forums];
+
+    /// The one built-in tab besides All whose rule takes `chat` in (D9).
+    /// Every chat has exactly one, so Private, Groups and Forums partition
+    /// All.
+    pub(crate) fn of_kind(chat: &ChatSummary) -> Self {
+        match chat.kind {
+            ChatKind::Private { .. } | ChatKind::Bot => Self::Private,
+            ChatKind::Group | ChatKind::Supergroup { forum: false, .. } => Self::Groups,
+            ChatKind::Supergroup { forum: true, .. } => Self::Forums,
+        }
+    }
+}
+
 /// Which view of the chat list the sidebar shows. Core keeps one list
 /// holding both of Telegram's peer folders, in server order; every view is
 /// a filter over it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Shown {
-    /// The main list, led by an entry that opens the archive.
-    #[default]
-    Main,
+    Tab(Tab),
+    /// The archived chats; "‹ Archive" leads back to All.
     Archive,
-    /// A chat folder, by id: its chats from both peer folders.
-    Folder(i32),
+}
+
+impl Default for Shown {
+    fn default() -> Self {
+        Self::Tab(Tab::All)
+    }
+}
+
+/// The sidebar's view: what it shows, and whether only unread rows show
+/// (the filter of plan section 17.4, applied from task 15).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct View {
+    pub(crate) shown: Shown,
+    pub(crate) unread_only: bool,
+}
+
+/// Which way Ctrl+Tab moves along the strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Step {
+    Next,
+    Previous,
 }
 
 /// The main list's entry for the archive.
@@ -72,7 +122,10 @@ pub(crate) enum SidebarRow<'a> {
 pub(crate) struct ChatList {
     chats: Vec<ChatSummary>,
     paging: Paging,
-    shown: Shown,
+    view: View,
+    /// A folder tab restored from the sidebar file, shown once the
+    /// account's folders arrive if it is still among them.
+    restoring: Option<i32>,
     /// The account's chat folders, in server order.
     folders: Vec<ChatFolder>,
 }
@@ -99,29 +152,91 @@ impl ChatList {
     }
 
     pub(crate) fn shown(&self) -> Shown {
-        self.shown
+        self.view.shown
     }
 
-    /// Switches the sidebar between the main list and the archive. A view
-    /// with no row renders nothing that could ask for more, so it wants
-    /// the next page right away (the archive may lie further down).
+    pub(crate) fn view(&self) -> View {
+        self.view
+    }
+
+    /// The view as the sidebar file keeps it: never the archive, which
+    /// leads back to All, and a folder tab still being restored is still
+    /// the choice.
+    pub(crate) fn kept_view(&self) -> View {
+        let shown = match (self.restoring, self.view.shown) {
+            (Some(folder), _) => Shown::Tab(Tab::Folder(folder)),
+            (None, Shown::Archive) => Shown::default(),
+            (None, shown) => shown,
+        };
+        View { shown, ..self.view }
+    }
+
+    /// The view the sidebar file kept, before anything is listed (core
+    /// loads the first page itself). A folder tab waits for the account's
+    /// folders ([`Self::set_folders`]); All shows meanwhile.
+    pub(crate) fn restore(&mut self, view: View) {
+        self.view.unread_only = view.unread_only;
+        match view.shown {
+            Shown::Tab(Tab::Folder(folder)) => self.restoring = Some(folder),
+            shown => self.view.shown = shown,
+        }
+    }
+
+    /// Switches the sidebar to another view. The user's choice replaces a
+    /// folder tab still being restored. A view with no row renders nothing
+    /// that could ask for more, so it wants the next page right away (its
+    /// chats may lie further down).
     pub(crate) fn show(&mut self, shown: Shown) {
-        self.shown = shown;
+        self.restoring = None;
+        self.view.shown = shown;
         self.paging.wanted |= self.row_count() == 0;
+    }
+
+    /// The strip's tabs: the built-in ones, then the folders in server
+    /// order.
+    pub(crate) fn tabs(&self) -> impl Iterator<Item = Tab> + '_ {
+        let folders = self.folders.iter().map(|f| Tab::Folder(f.id));
+        Tab::BUILT_IN.into_iter().chain(folders)
+    }
+
+    /// Moves to the next or previous tab of the strip, wrapping. Nothing
+    /// changes in the archive, which has no tabs. Returns whether the view
+    /// changed.
+    pub(crate) fn step_tab(&mut self, step: Step) -> bool {
+        let Shown::Tab(current) = self.view.shown else {
+            return false;
+        };
+        let tabs: Vec<Tab> = self.tabs().collect();
+        let at = tabs.iter().position(|&t| t == current).unwrap_or(0);
+        let next = match step {
+            Step::Next => (at + 1) % tabs.len(),
+            Step::Previous => (at + tabs.len() - 1) % tabs.len(),
+        };
+        let Some(&tab) = tabs.get(next) else {
+            return false;
+        };
+        self.show(Shown::Tab(tab));
+        true
     }
 
     pub(crate) fn folders(&self) -> &[ChatFolder] {
         &self.folders
     }
 
-    /// Core's chat folders. A shown folder that is gone falls back to the
-    /// main list.
+    /// Core's chat folders. A folder tab being restored is shown if the
+    /// folder exists, and dropped either way. A shown folder that is gone
+    /// falls back to All.
     pub(crate) fn set_folders(&mut self, folders: Vec<ChatFolder>) {
         self.folders = folders;
-        if let Shown::Folder(id) = self.shown
+        if let Some(folder) = self.restoring.take()
+            && self.folders.iter().any(|f| f.id == folder)
+        {
+            self.show(Shown::Tab(Tab::Folder(folder)));
+        }
+        if let Shown::Tab(Tab::Folder(id)) = self.view.shown
             && !self.folders.iter().any(|f| f.id == id)
         {
-            self.show(Shown::Main);
+            self.show(Shown::default());
         }
     }
 
@@ -135,14 +250,19 @@ impl ChatList {
         (chats > 0).then_some(ArchiveEntry { chats, unread })
     }
 
-    /// The chats of the shown view: a peer folder in core's order, or a
-    /// chat folder's matching chats with its pinned ones first, in its order.
+    /// The chats of the shown view: a built-in tab's or the archive's in
+    /// core's order, or a chat folder's matching chats with its pinned ones
+    /// first, in its order.
     fn shown_chats(&self) -> Vec<&ChatSummary> {
-        let peer = |folder: PeerFolder| self.chats.iter().filter(move |c| c.folder == folder);
-        match self.shown {
-            Shown::Main => peer(PeerFolder::Main).collect(),
-            Shown::Archive => peer(PeerFolder::Archive).collect(),
-            Shown::Folder(id) => {
+        let main = |c: &&ChatSummary| c.folder == PeerFolder::Main;
+        match self.view.shown {
+            Shown::Archive => self
+                .chats
+                .iter()
+                .filter(|c| c.folder == PeerFolder::Archive)
+                .collect(),
+            Shown::Tab(Tab::All) => self.chats.iter().filter(main).collect(),
+            Shown::Tab(Tab::Folder(id)) => {
                 let Some(folder) = self.folders.iter().find(|f| f.id == id) else {
                     return Vec::new();
                 };
@@ -156,23 +276,35 @@ impl ChatList {
                     .filter(|c| !folder.pinned.contains(&c.id) && folder.contains(c, now));
                 pinned.chain(rest).collect()
             }
+            Shown::Tab(tab) => self
+                .chats
+                .iter()
+                .filter(main)
+                .filter(|c| Tab::of_kind(c) == tab)
+                .collect(),
         }
     }
 
-    /// The sidebar's rows: the main list starts with the archive's entry.
+    /// Whether the shown view is led by the archive's entry: All only.
+    fn leads_with_archive(&self) -> bool {
+        self.view.shown == Shown::Tab(Tab::All)
+    }
+
+    /// The sidebar's rows: All starts with the archive's entry.
     pub(crate) fn rows(&self) -> Vec<SidebarRow<'_>> {
-        let entry = match self.shown {
-            Shown::Main => self.archive_entry().map(SidebarRow::Archive),
-            Shown::Archive | Shown::Folder(_) => None,
-        };
+        let entry = self
+            .leads_with_archive()
+            .then(|| self.archive_entry())
+            .flatten();
         entry
+            .map(SidebarRow::Archive)
             .into_iter()
             .chain(self.shown_chats().into_iter().map(SidebarRow::Chat))
             .collect()
     }
 
     pub(crate) fn row_count(&self) -> usize {
-        let entry = self.shown == Shown::Main && self.archive_entry().is_some();
+        let entry = self.leads_with_archive() && self.archive_entry().is_some();
         usize::from(entry) + self.shown_chats().len()
     }
 
@@ -573,7 +705,7 @@ mod tests {
         // Unarchived elsewhere: the chat changes view in place.
         list.bump(chat(3));
         assert_eq!(row_ids(&list), [5]);
-        list.show(Shown::Main);
+        list.show(Shown::default());
         assert_eq!(row_ids(&list), [0, 1, 2, 3, 4]);
         let mut unread = archived(5);
         unread.unread = 2;
@@ -616,7 +748,7 @@ mod tests {
         groups.include = vec![id(3)];
         groups.exclude = vec![id(2)];
         list.set_folders(vec![groups]);
-        list.show(Shown::Folder(7));
+        list.show(Shown::Tab(Tab::Folder(7)));
         assert_eq!(
             row_ids(&list),
             [5, 3],
@@ -624,7 +756,7 @@ mod tests {
         );
         // The folder is deleted elsewhere: back to the main list.
         list.set_folders(Vec::new());
-        assert_eq!(list.shown(), Shown::Main);
+        assert_eq!(list.shown(), Shown::Tab(Tab::All));
     }
 
     #[test]
@@ -719,10 +851,137 @@ mod tests {
         named.pinned = vec![broadcast];
         named.include = vec![broadcast, id(3)];
         list.set_folders(vec![groups, named]);
-        list.show(Shown::Folder(7));
+        list.show(Shown::Tab(Tab::Folder(7)));
         assert_eq!(row_ids(&list), [1, 2]);
-        list.show(Shown::Folder(8));
+        list.show(Shown::Tab(Tab::Folder(8)));
         assert_eq!(row_ids(&list), [3], "the unlisted broadcast is not shown");
+    }
+
+    fn kind_of(n: u8) -> ChatKind {
+        match n % 6 {
+            0 => ChatKind::Private { contact: true },
+            1 => ChatKind::Private { contact: false },
+            2 => ChatKind::Bot,
+            3 => ChatKind::Group,
+            forum => ChatKind::Supergroup {
+                forum: forum == 5,
+                gigagroup: n >= 6,
+            },
+        }
+    }
+
+    proptest::proptest! {
+        /// D9: Private, Groups and Forums split All's chats exactly, each
+        /// in core's order, and leave the archive out.
+        #[test]
+        fn built_in_tabs_partition_all(
+            rows in proptest::collection::vec((0u8..12, proptest::bool::ANY, proptest::bool::ANY), 0..60),
+        ) {
+            let mut list = ChatList::default();
+            list.reset(
+                rows.iter()
+                    .zip(0..)
+                    .map(|(&(kind, archived, pinned), n)| ChatSummary {
+                        kind: kind_of(kind),
+                        pinned,
+                        folder: if archived { PeerFolder::Archive } else { PeerFolder::Main },
+                        ..chat(n)
+                    })
+                    .collect(),
+            );
+            let chats = |list: &ChatList| -> Vec<i64> {
+                list.rows()
+                    .iter()
+                    .filter_map(|r| match r {
+                        SidebarRow::Chat(c) => Some(c.id.id),
+                        SidebarRow::Archive(_) => None,
+                    })
+                    .collect()
+            };
+            let all = chats(&list);
+            let main: Vec<i64> = list
+                .as_slice()
+                .iter()
+                .filter(|c| c.folder == PeerFolder::Main)
+                .map(|c| c.id.id)
+                .collect();
+            proptest::prop_assert_eq!(&all, &main);
+            let mut seen = Vec::new();
+            for tab in [Tab::Private, Tab::Groups, Tab::Forums] {
+                list.show(Shown::Tab(tab));
+                let shown = chats(&list);
+                let in_order: Vec<i64> = all
+                    .iter()
+                    .copied()
+                    .filter(|id| shown.contains(id))
+                    .collect();
+                proptest::prop_assert_eq!(&shown, &in_order, "core's order");
+                proptest::prop_assert!(list.rows().iter().all(|r| matches!(r, SidebarRow::Chat(_))));
+                seen.extend(shown);
+            }
+            seen.sort_unstable();
+            let mut all = all;
+            all.sort_unstable();
+            proptest::prop_assert_eq!(seen, all, "each chat in exactly one tab");
+        }
+    }
+
+    #[test]
+    fn the_strip_lists_built_in_tabs_then_folders_and_wraps() {
+        let mut list = ChatList::default();
+        list.set_folders(vec![
+            folder(9, FolderRules::GROUPS),
+            folder(3, FolderRules::BOTS),
+        ]);
+        let strip = [
+            Tab::All,
+            Tab::Private,
+            Tab::Groups,
+            Tab::Forums,
+            Tab::Folder(9),
+            Tab::Folder(3),
+        ];
+        assert!(list.tabs().eq(strip), "server order after the built-ins");
+        for &tab in strip.iter().skip(1).chain([&Tab::All]) {
+            assert!(list.step_tab(Step::Next));
+            assert_eq!(list.shown(), Shown::Tab(tab));
+        }
+        assert!(list.step_tab(Step::Previous));
+        assert_eq!(list.shown(), Shown::Tab(Tab::Folder(3)), "wraps back");
+        list.show(Shown::Archive);
+        assert!(!list.step_tab(Step::Next), "the archive has no tabs");
+        assert_eq!(list.shown(), Shown::Archive);
+        assert_eq!(
+            list.kept_view(),
+            View::default(),
+            "the archive is never kept"
+        );
+    }
+
+    #[test]
+    fn a_kept_folder_tab_waits_for_the_folders() {
+        let kept = |folder| View {
+            shown: Shown::Tab(Tab::Folder(folder)),
+            unread_only: true,
+        };
+        let mut list = ChatList::default();
+        list.restore(kept(4));
+        assert_eq!(list.shown(), Shown::Tab(Tab::All), "All until folders load");
+        assert_eq!(list.kept_view(), kept(4), "still the choice");
+        list.set_folders(vec![folder(4, FolderRules::GROUPS)]);
+        assert_eq!(list.view(), kept(4));
+        // Restored once: a later folder list doesn't bring it back.
+        list.show(Shown::Tab(Tab::Groups));
+        list.set_folders(vec![folder(4, FolderRules::GROUPS)]);
+        assert_eq!(list.shown(), Shown::Tab(Tab::Groups));
+
+        let mut list = ChatList::default();
+        list.restore(kept(5));
+        list.set_folders(vec![folder(4, FolderRules::GROUPS)]);
+        assert_eq!(list.shown(), Shown::Tab(Tab::All), "gone: All");
+        assert_eq!(list.kept_view().shown, Shown::Tab(Tab::All), "and dropped");
+        list.set_folders(vec![folder(5, FolderRules::GROUPS)]);
+        assert_eq!(list.shown(), Shown::Tab(Tab::All));
     }
 
     #[test]

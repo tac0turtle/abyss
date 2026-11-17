@@ -1773,3 +1773,10 @@ Notes accepted from the review: the overlay can make a count jump (0, then the c
 #### Round 4 (verdict: pass; no P0–P2)
 
 The round 3 overlay fix is closed; the install-site list was checked against main 86d5e06 (first-page merge, append, `peer_dialogs` refresh, cache reset, other emissions).
+
+#### Task 13: built-in tabs (2 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 | P2: tab actions ran while signed out and could rewrite the deleted sidebar file. P3: `StartupBlocked` deleted the preference; the tabs snapshot was missing | Both tab entry points require `SignedIn`; only `LoggingOut`/`LogoutIncomplete` delete the file, and a startup block keeps the in-memory choice; `tabs()` snapshot added (macOS-only, unverified here) |
+| 2 | Pass | — |
