@@ -306,7 +306,7 @@ fn corrupt_rows_are_deleted_not_returned() {
     for (id, body) in [(2, &garbage), (3, &oversized)] {
         db.conn()
             .execute(
-                "INSERT INTO messages (kind, chat, id, size, body) VALUES (0, 1, ?1, 1, ?2)",
+                "INSERT INTO messages (kind, chat, id, topic, size, body) VALUES (0, 1, ?1, 0, 1, ?2)",
                 rusqlite::params![id, body],
             )
             .unwrap();
@@ -350,9 +350,11 @@ fn version_1_messages_are_dropped_on_upgrade() {
         .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
+/// Version 2 → 3 drops the chat list; the upgrade then continues to
+/// version 4, which drops messages (see `version_3_messages_are_dropped_and_chats_kept`).
 #[test]
 fn version_2_chat_list_is_dropped_on_upgrade() {
     let (_t, dir, key) = setup();
@@ -360,13 +362,13 @@ fn version_2_chat_list_is_dropped_on_upgrade() {
     {
         let mut db = Cache::open(&dir, &key).unwrap();
         db.put_chats(&[summary(c, "c")]).unwrap();
-        db.put_messages(ThreadKey::whole(c), &[msg(c, 1, "kept")])
+        db.put_messages(ThreadKey::whole(c), &[msg(c, 1, "dropped by 3 to 4")])
             .unwrap();
         db.conn().execute_batch("PRAGMA user_version = 2").unwrap();
     }
     let mut db = Cache::open(&dir, &key).unwrap();
     assert!(db.chats().unwrap().is_empty());
-    assert_eq!(ids(&db.tail(ThreadKey::whole(c), 10).unwrap()), [1]);
+    assert!(db.tail(ThreadKey::whole(c), 10).unwrap().is_empty());
 }
 
 #[test]
@@ -508,7 +510,8 @@ fn oversized_rows_are_never_materialized_or_stored() {
     // An oversized blob injected directly comes back as NULL, not as 8 MiB.
     sql(
         &db,
-        "INSERT INTO messages (kind, chat, id, size, body) VALUES (0, 1, 7, 1, zeroblob(8388608))",
+        "INSERT INTO messages (kind, chat, id, topic, size, body)
+         VALUES (0, 1, 7, 0, 1, zeroblob(8388608))",
     );
     assert!(db.tail(ThreadKey::whole(user(1)), 10).unwrap().is_empty());
 }
@@ -529,7 +532,7 @@ fn rows_with_mismatched_identity_or_unclean_fields_are_rejected() {
     for (id, body) in [(1, &wrong_id), (3, &wrong_chat), (999, &bidi)] {
         db.conn()
             .execute(
-                "INSERT INTO messages (kind, chat, id, size, body) VALUES (0, 1, ?1, 1, ?2)",
+                "INSERT INTO messages (kind, chat, id, topic, size, body) VALUES (0, 1, ?1, 0, 1, ?2)",
                 rusqlite::params![id, body],
             )
             .unwrap();
@@ -621,3 +624,5 @@ fn unowned_rows_are_foreign() {
     assert_eq!(db.bind(Some(7)).unwrap(), Binding::Foreign);
     assert_eq!(db.bind(None).unwrap(), Binding::Foreign);
 }
+
+mod threads;

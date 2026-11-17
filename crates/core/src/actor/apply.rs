@@ -45,8 +45,10 @@ fn call_error(outcome: &Outcome) -> Option<CallError> {
 /// `topic: None` while `m.thread.topic` keeps the raw topic the server
 /// stated. A message's `thread` therefore need not equal its window's key
 /// yet. Task 7 replaces this with `route`, which normalizes the message's
-/// thread and enforces that equality for windows and events; task 5
-/// enforces it for cache rows.
+/// thread and enforces that equality for windows and events. The cache
+/// (task 5) stores each row under its message's own topic and checks rows
+/// against their body; meanwhile a whole-chat cache key spans all of its
+/// chat's topics, so the forum stream this files keeps its cache.
 pub(super) fn shown_in(m: &Message) -> ThreadKey {
     ThreadKey::whole(m.thread.chat)
 }

@@ -7,14 +7,18 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, ffi, params};
+use rusqlite::{
+    Connection, OptionalExtension, ParamsFromIter, Transaction, ffi, params, params_from_iter,
+};
 
 use super::census::{self, Open};
 use super::{CacheError, CacheKey, MAX_CACHE_BYTES, MAX_CACHED_PER_CHAT, MAX_ROW_BYTES};
-use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerKind, ThreadKey, group_by_chat};
+use crate::model::{
+    ChatId, ChatSummary, Message, MsgId, PeerKind, ThreadKey, TopicId, group_by_chat,
+};
 use crate::store::MAX_DIALOGS;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 /// Version 2 replaced `Message::edited` with `edit_date`; version 1 message rows
 /// cannot be decoded, so they are dropped (the cache is disposable).
 const MIGRATE_1_TO_2: &str =
@@ -22,6 +26,16 @@ const MIGRATE_1_TO_2: &str =
 /// Version 3 added `ChatSummary::last_id`; version 2 chat rows cannot be
 /// decoded, so the cached chat list is dropped (messages are unchanged).
 const MIGRATE_2_TO_3: &str = "BEGIN; DELETE FROM chats; PRAGMA user_version = 3; COMMIT;";
+/// Version 4 added `messages.topic` (plan stage 2, section 10). Version 3
+/// rows were filed before threads were normalized, so every message and its
+/// LRU row is dropped and the table recreated (the cache is disposable).
+/// The chat list is kept.
+fn migrate_3_to_4() -> String {
+    format!(
+        "BEGIN; DROP TABLE messages; DELETE FROM cached_chats; {MESSAGES} \
+         PRAGMA user_version = 4; COMMIT;"
+    )
+}
 /// Messages deleted per eviction step.
 const EVICT_BATCH: i64 = 1000;
 /// Upper bound on eviction steps per call; exceeding it is reported, not hidden.
@@ -32,11 +46,6 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE chats (
     kind INTEGER NOT NULL, id INTEGER NOT NULL, ord INTEGER NOT NULL, body BLOB NOT NULL,
     PRIMARY KEY (kind, id)) WITHOUT ROWID;
-CREATE TABLE messages (
-    kind INTEGER NOT NULL, chat INTEGER NOT NULL, id INTEGER NOT NULL,
-    size INTEGER NOT NULL, body BLOB NOT NULL,
-    PRIMARY KEY (kind, chat, id)) WITHOUT ROWID;
-CREATE INDEX messages_account_id ON messages (id) WHERE kind IN (0, 1);
 -- One row per chat that has (or had) cached messages; drives LRU eviction
 -- without scanning `messages`. last_access 0 = never opened.
 CREATE TABLE cached_chats (
@@ -44,6 +53,18 @@ CREATE TABLE cached_chats (
     PRIMARY KEY (kind, chat)) WITHOUT ROWID;
 CREATE INDEX cached_chats_lru ON cached_chats (last_access);
 INSERT INTO meta (key, value) VALUES ('clock', 0);
+";
+
+/// The `messages` table and its indexes. Ids are unique per chat, so the key
+/// stays `(kind, chat, id)`; `topic` is the row's thread within its chat (see
+/// [`topic_code`]), and `messages_thread` serves one topic's pages.
+const MESSAGES: &str = "
+CREATE TABLE messages (
+    kind INTEGER NOT NULL, chat INTEGER NOT NULL, id INTEGER NOT NULL,
+    topic INTEGER NOT NULL, size INTEGER NOT NULL, body BLOB NOT NULL,
+    PRIMARY KEY (kind, chat, id)) WITHOUT ROWID;
+CREATE INDEX messages_account_id ON messages (id) WHERE kind IN (0, 1);
+CREATE INDEX messages_thread ON messages (kind, chat, topic, id);
 ";
 
 /// SQL expression selecting `body` only if it is a blob within the row limit, so
@@ -98,9 +119,119 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<Option<Vec<u8>>, CacheError>
     Ok((body.len() <= MAX_ROW_BYTES).then_some(body))
 }
 
-fn decode_message(chat: ChatId, id: i32, body: Option<Vec<u8>>) -> Option<Message> {
+/// The stored `topic` of a message's thread: 0 for a whole chat, otherwise
+/// the topic id. A `TopicId` is at least 1, so the two never collide, and a
+/// negative column matches no thread.
+fn topic_code(topic: Option<TopicId>) -> i64 {
+    topic.map_or(0, |t| i64::from(t.get()))
+}
+
+/// Whether `thread` addresses `m`'s row. A topic key addresses that topic.
+/// A whole-chat key addresses every row of its chat, topics included: until
+/// core normalizes threads (stage 2 task 7), the actor files a forum's
+/// messages, which carry their topic, under `ThreadKey::whole`, so a
+/// whole-chat page, reconcile or replace must keep covering them. In a
+/// non-forum chat every row has topic 0, so the two readings agree.
+fn addresses(thread: ThreadKey, m: &Message) -> bool {
+    m.thread.chat == thread.chat && (thread.topic.is_none() || m.thread.topic == thread.topic)
+}
+
+/// The SQL form of [`addresses`]: rows of `thread.chat` (parameters `?1`
+/// kind and `?2` chat), narrowed to the topic for a topic key.
+#[derive(Clone, Copy, Debug)]
+struct Rows {
+    kind: i64,
+    chat: i64,
+    topic: Option<i64>,
+}
+
+impl Rows {
+    fn of(thread: ThreadKey) -> Self {
+        Self {
+            kind: kind_code(thread.chat.kind),
+            chat: thread.chat.id,
+            topic: thread.topic.map(|t| i64::from(t.get())),
+        }
+    }
+
+    /// The table to select from. A topic key names `messages_thread`:
+    /// without statistics, SQLite otherwise prefers the primary key for any
+    /// query that reads `body`, and filters the chat's rows by topic one by
+    /// one (`topic_pages_use_the_thread_index`).
+    fn table(self) -> &'static str {
+        match self.topic {
+            Some(_) => "messages INDEXED BY messages_thread",
+            None => "messages",
+        }
+    }
+
+    /// `AND topic = ?{param}` for a topic key, nothing for a whole chat.
+    /// `param` must be the statement's highest parameter, so a whole-chat
+    /// statement simply has one parameter fewer.
+    fn topic_clause(self, param: u8) -> String {
+        match self.topic {
+            Some(_) => format!(" AND topic = ?{param}"),
+            None => String::new(),
+        }
+    }
+
+    /// Kind, chat, then `rest`, then the topic when [`Self::topic_clause`]
+    /// binds one.
+    fn params(self, rest: &[i64]) -> ParamsFromIter<Vec<i64>> {
+        let head = [self.kind, self.chat].into_iter();
+        params_from_iter(head.chain(rest.iter().copied()).chain(self.topic).collect())
+    }
+}
+
+/// Which page of a thread [`Cache::page`] reads, relative to a bound id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Page {
+    /// The newest messages at or below the bound.
+    Tail,
+    /// The newest messages below the bound.
+    Before,
+    /// The oldest messages above the bound.
+    After,
+}
+
+impl Page {
+    /// The condition and order on `id`; the bound is `?3`.
+    fn clause(self) -> &'static str {
+        match self {
+            Self::Tail => "id <= ?3 ORDER BY id DESC",
+            Self::Before => "id < ?3 ORDER BY id DESC",
+            Self::After => "id > ?3 ORDER BY id ASC",
+        }
+    }
+}
+
+/// The SQL and parameters of a page of `thread` (see [`addresses`]):
+/// `id`, `topic` and the bounded `body` of up to `limit` rows.
+fn page_query(
+    thread: ThreadKey,
+    page: Page,
+    bound: i64,
+    limit: u32,
+) -> (String, ParamsFromIter<Vec<i64>>) {
+    let rows = Rows::of(thread);
+    let sql = format!(
+        "SELECT id, topic, {} FROM {} WHERE kind = ?1 AND chat = ?2{} AND {} LIMIT ?4",
+        bounded_body(5),
+        rows.table(),
+        rows.topic_clause(6),
+        page.clause(),
+    );
+    (sql, rows.params(&[bound, i64::from(limit), row_limit()]))
+}
+
+/// Decodes a message row. A bad row gives `None`: an undecodable or invalid
+/// body (a non-positive `TopicId` inside it included), or a key that
+/// disagrees with the decoded message: its `id`, its chat, or its `topic`
+/// column against the decoded thread (a negative column never agrees).
+fn decode_message(chat: ChatId, id: i32, topic: i64, body: Option<Vec<u8>>) -> Option<Message> {
     let m: Message = postcard::from_bytes(&body?).ok()?;
-    (m.id == MsgId(id) && m.thread.chat == chat && m.is_valid()).then_some(m)
+    let keyed = m.id == MsgId(id) && m.thread.chat == chat && topic_code(m.thread.topic) == topic;
+    (keyed && m.is_valid()).then_some(m)
 }
 
 /// The chat a raw `(kind, id)` SQL key names, if `kind` is a known code.
@@ -203,17 +334,23 @@ impl Cache {
         match version {
             0 => {
                 conn.execute_batch(&format!(
-                    "BEGIN; {SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+                    "BEGIN; {SCHEMA} {MESSAGES} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
                 ))?;
                 Ok(())
             }
             1 => {
                 conn.execute_batch(MIGRATE_1_TO_2)?;
                 conn.execute_batch(MIGRATE_2_TO_3)?;
+                conn.execute_batch(&migrate_3_to_4())?;
                 Ok(())
             }
             2 => {
                 conn.execute_batch(MIGRATE_2_TO_3)?;
+                conn.execute_batch(&migrate_3_to_4())?;
+                Ok(())
+            }
+            3 => {
+                conn.execute_batch(&migrate_3_to_4())?;
                 Ok(())
             }
             SCHEMA_VERSION => Ok(()),
@@ -250,6 +387,18 @@ impl Cache {
     #[cfg(test)]
     pub(super) fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// SQLite's plan for the production query of `page` in `thread`, its
+    /// steps joined by `"; "`.
+    #[cfg(test)]
+    pub(super) fn page_plan(&self, thread: ThreadKey, page: Page) -> Result<String, CacheError> {
+        let (sql, args) = page_query(thread, page, 100, 10);
+        let mut stmt = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let steps = stmt
+            .query_map(args, |r| r.get::<_, String>(3))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(steps.join("; "))
     }
 }
 
@@ -397,13 +546,13 @@ impl Cache {
     }
 
     /// Inserts or replaces messages of one thread, then enforces the bounds.
-    /// Messages of other chats, invalid or oversized messages are skipped.
-    /// The topic is not stored yet: rows are per chat (schema version 3).
+    /// Messages `thread` does not address (see [`addresses`]), invalid or
+    /// oversized messages are skipped.
     pub fn put_messages(&mut self, thread: ThreadKey, msgs: &[Message]) -> Result<(), CacheError> {
         let chat = thread.chat;
         self.write(|tx, mut bytes| {
             register_chat(tx, chat)?;
-            for m in msgs.iter().filter(|m| m.thread.chat == chat) {
+            for m in msgs.iter().filter(|m| addresses(thread, m)) {
                 bytes = upsert(tx, chat, m, bytes)?;
             }
             Ok(((), trim_chat(tx, chat, bytes)?))
@@ -411,9 +560,10 @@ impl Cache {
         self.enforce_budget()
     }
 
-    /// Makes the cache agree with a server page covering ids `lo..=hi`: cached
-    /// messages in that range that the server did not return are deleted.
-    /// Returns the deleted ids.
+    /// Makes the cache agree with a server page covering ids `lo..=hi` of
+    /// `thread`: its cached messages in that range that the server did not
+    /// return are deleted. Other topics' rows interleave by id and are never
+    /// touched. Returns the deleted ids.
     pub fn reconcile_range(
         &mut self,
         thread: ThreadKey,
@@ -424,12 +574,12 @@ impl Cache {
         let chat = thread.chat;
         let page: Vec<&Message> = server
             .iter()
-            .filter(|m| m.thread.chat == chat && (lo..=hi).contains(&m.id))
+            .filter(|m| addresses(thread, m) && (lo..=hi).contains(&m.id))
             .collect();
         let present: HashSet<MsgId> = page.iter().map(|m| m.id).collect();
         let gone = self.write(|tx, bytes| {
             register_chat(tx, chat)?;
-            let gone: Vec<MsgId> = ids_in_range(tx, chat, lo, hi)?
+            let gone: Vec<MsgId> = ids_in_range(tx, thread, lo, hi)?
                 .into_iter()
                 .filter(|id| !present.contains(id))
                 .collect();
@@ -475,12 +625,7 @@ impl Cache {
 
     /// Newest `limit` messages, ascending.
     pub fn tail(&mut self, thread: ThreadKey, limit: u32) -> Result<Vec<Message>, CacheError> {
-        let mut v = self.page(
-            thread,
-            "id <= ?3 ORDER BY id DESC",
-            i64::from(i32::MAX),
-            limit,
-        )?;
+        let mut v = self.page(thread, Page::Tail, i64::from(i32::MAX), limit)?;
         v.reverse();
         Ok(v)
     }
@@ -492,12 +637,7 @@ impl Cache {
         before: MsgId,
         limit: u32,
     ) -> Result<Vec<Message>, CacheError> {
-        let mut v = self.page(
-            thread,
-            "id < ?3 ORDER BY id DESC",
-            i64::from(before.0),
-            limit,
-        )?;
+        let mut v = self.page(thread, Page::Before, i64::from(before.0), limit)?;
         v.reverse();
         Ok(v)
     }
@@ -509,32 +649,28 @@ impl Cache {
         after: MsgId,
         limit: u32,
     ) -> Result<Vec<Message>, CacheError> {
-        self.page(thread, "id > ?3 ORDER BY id ASC", i64::from(after.0), limit)
+        self.page(thread, Page::After, i64::from(after.0), limit)
     }
 
-    /// A page of `thread`'s chat: the topic is not stored yet (schema
-    /// version 3), so rows are selected per chat.
+    /// A page of `thread` (see [`addresses`]). Bad rows are deleted and
+    /// skipped (see [`decode_message`]).
     fn page(
         &mut self,
         thread: ThreadKey,
-        clause: &str,
+        page: Page,
         bound: i64,
         limit: u32,
     ) -> Result<Vec<Message>, CacheError> {
         let chat = thread.chat;
-        let sql = format!(
-            "SELECT id, {} FROM messages WHERE kind = ?1 AND chat = ?2 AND {clause} LIMIT ?4",
-            bounded_body(5)
-        );
+        let (sql, args) = page_query(thread, page, bound, limit);
         let mut out = Vec::new();
         let mut bad = Vec::new();
         {
             let mut stmt = self.conn.prepare_cached(&sql)?;
-            let args = params![kind_code(chat.kind), chat.id, bound, limit, row_limit()];
             let mut rows = stmt.query(args)?;
             while let Some(row) = rows.next()? {
                 let id: i32 = row.get(0)?;
-                match decode_message(chat, id, row.get(1)?) {
+                match decode_message(chat, id, row.get(1)?, row.get(2)?) {
                     Some(m) => out.push(m),
                     None => bad.push(MsgId(id)),
                 }
@@ -607,6 +743,7 @@ fn upsert(tx: &Transaction<'_>, chat: ChatId, m: &Message, bytes: u64) -> Result
         return Ok(bytes); // never store what we would refuse to load
     };
     let kind = kind_code(chat.kind);
+    let topic = topic_code(m.thread.topic);
     let old: Option<i64> = tx
         .query_row(
             "SELECT size FROM messages WHERE kind = ?1 AND chat = ?2 AND id = ?3",
@@ -616,8 +753,9 @@ fn upsert(tx: &Transaction<'_>, chat: ChatId, m: &Message, bytes: u64) -> Result
         .optional()?;
     let size = i64::try_from(body.len()).unwrap_or(i64::MAX);
     tx.execute(
-        "INSERT OR REPLACE INTO messages (kind, chat, id, size, body) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![kind, chat.id, m.id.0, size, body],
+        "INSERT OR REPLACE INTO messages (kind, chat, id, topic, size, body)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![kind, chat.id, m.id.0, topic, size, body],
     )?;
     Ok(bytes
         .saturating_sub(to_u64(old.unwrap_or(0)))
@@ -668,17 +806,22 @@ fn delete_oldest(
     Ok((count, freed))
 }
 
+/// The cached ids of `thread` (see [`addresses`]) in `lo..=hi`, by row key.
 fn ids_in_range(
     tx: &Transaction<'_>,
-    chat: ChatId,
+    thread: ThreadKey,
     lo: MsgId,
     hi: MsgId,
 ) -> Result<Vec<MsgId>, CacheError> {
-    let mut stmt = tx.prepare_cached(
-        "SELECT id FROM messages WHERE kind = ?1 AND chat = ?2 AND id BETWEEN ?3 AND ?4",
-    )?;
+    let rows = Rows::of(thread);
+    let sql = format!(
+        "SELECT id FROM {} WHERE kind = ?1 AND chat = ?2 AND id BETWEEN ?3 AND ?4{}",
+        rows.table(),
+        rows.topic_clause(5)
+    );
+    let mut stmt = tx.prepare_cached(&sql)?;
     let ids = stmt
-        .query_map(params![kind_code(chat.kind), chat.id, lo.0, hi.0], |r| {
+        .query_map(rows.params(&[lo.0.into(), hi.0.into()]), |r| {
             Ok(MsgId(r.get(0)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;

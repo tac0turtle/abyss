@@ -299,15 +299,18 @@ fn run(mut cache: Cache, dir: &Path, mut rx: mpsc::Receiver<CacheCmd>) {
     // Every handle is gone; the cache closes as it drops.
 }
 
-/// Applies a server tail. If it overlaps the cached history (or reaches the
-/// start of the thread), only the range it covers is reconciled. Otherwise there
-/// may be a gap between the cache and the tail, so the thread's cache is
-/// replaced. The topic is not stored yet (schema version 3), so the thread's
-/// cache is its chat's.
+/// Applies a server tail of `thread`. If it overlaps the thread's cached
+/// history (its newest cached message is at or above the tail's first id),
+/// or reaches the start of the thread, only the range it covers is
+/// reconciled. Otherwise there may be a gap between the cache and the tail,
+/// so the thread's rows are replaced. Both the overlap query and the
+/// replacement are scoped to `thread`, so a sibling topic's rows, which
+/// interleave by id, are never consulted or touched (plan stage 2,
+/// section 10).
 /// Decided here, against what the cache holds, because the actor's window may
 /// have been invalidated by a rebuild. `older` is the tail's first id when older
 /// history exists beyond it.
-fn reconcile_tail(
+pub(super) fn reconcile_tail(
     cache: &mut Cache,
     thread: ThreadKey,
     messages: &[Message],

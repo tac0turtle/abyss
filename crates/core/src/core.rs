@@ -250,6 +250,13 @@ impl CoreHandle {
 }
 
 /// Starts core on its own thread.
+#[cfg_attr(
+    not(any(target_os = "macos", feature = "fake")),
+    expect(
+        clippy::needless_pass_by_value,
+        reason = "off macOS without the fake, every arm refuses and consumes nothing"
+    )
+)]
 pub fn start(config: CoreConfig, backend: BackendChoice) -> Result<CoreHandle, StartError> {
     match backend {
         #[cfg(not(target_os = "macos"))]
