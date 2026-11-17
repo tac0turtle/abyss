@@ -30,6 +30,7 @@ use abyss_core::store::{ForumStatus, ViewGen};
 use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, Task, px};
 
 pub(crate) use self::commands::{Admit, Refused};
+use self::discarded::Obsolete;
 use self::list::ChatList;
 use self::messages::{Applied, Batch, MessageWindow, RowOp};
 use self::retry::{Backoff, earliest};
@@ -68,6 +69,18 @@ pub(crate) enum Pane {
     Thread(ThreadKey),
     /// A forum: its topic list, or one of its topics (`open`).
     Forum { chat: ChatId, open: Option<TopicId> },
+}
+
+/// What the open thread's composer area shows (plan section 8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Composer {
+    /// The message box.
+    Open,
+    /// The chat takes no messages from the user (Stage 1).
+    ReadOnly,
+    /// The open topic is closed, and the user may not post in closed
+    /// topics.
+    TopicClosed,
 }
 
 /// Why the pane must change on its own (`ChatShell::stale_pane`).
@@ -115,8 +128,9 @@ pub(crate) struct ChatShell {
     /// Core removed the open topic (`TopicRemoved`): the pane goes back to
     /// the list ([`Self::stale_pane`]).
     open_removed: Option<(TopicId, TopicGone)>,
-    /// The kind core last announced for the pane's chat (`KindChanged`),
-    /// for a chat the chat list may not hold.
+    /// The kind core last told for the pane's chat, by `KindChanged` or by
+    /// a summary, whichever came last: a summary sent before the change
+    /// may still be listed (task 11 review).
     shown_kind: Option<(ChatId, ForumStatus)>,
     /// Bringing the pane in line with core after a refusal.
     fix_retry: Backoff,
@@ -143,6 +157,9 @@ pub(crate) struct ChatShell {
     focus_sent: WindowState,
     /// Bringing core in line with `active` after a refusal.
     focus_retry: Backoff,
+    /// Discarding sends of threads that can no longer be sent to, after a
+    /// refusal.
+    obsolete_retry: Backoff,
     /// Frame-driven commands (loads, read marks, the live tail) core
     /// refused: the next frame retries, and a wake-up makes sure one comes.
     frame_retry: Backoff,
@@ -211,6 +228,7 @@ impl Default for ChatShell {
             active: WindowState::Active,
             focus_sent: WindowState::Active,
             focus_retry: Backoff::default(),
+            obsolete_retry: Backoff::default(),
             frame_retry: Backoff::default(),
             auto_restart: None,
             held_recovery: None,
@@ -265,6 +283,14 @@ impl ChatShell {
 #[cfg(test)]
 mod reset_tests;
 
+fn kind_of(chat: &ChatSummary) -> ForumStatus {
+    if is_forum(chat) {
+        ForumStatus::Forum
+    } else {
+        ForumStatus::NotForum
+    }
+}
+
 /// Whether `chat` is a forum, whose pane shows its topic list (owner
 /// decision D4: always, whatever the forum's default view).
 pub(crate) fn is_forum(chat: &ChatSummary) -> bool {
@@ -291,6 +317,35 @@ impl ChatShell {
         self.topics.as_ref()
     }
 
+    /// The open topic as the retained list holds it (none while the list
+    /// is loading or dropped), which every refresh re-reads.
+    pub(crate) fn shown_topic(&self) -> Option<&abyss_core::model::Topic> {
+        let Pane::Forum {
+            open: Some(topic), ..
+        } = self.pane
+        else {
+            return None;
+        };
+        self.topics.as_ref()?.get(topic)
+    }
+
+    /// What the composer area shows for the open thread. A closed topic
+    /// blocks it only while the retained list says so: it opens again as
+    /// soon as the topic reopens.
+    pub(crate) fn composer(&self) -> Composer {
+        let can_send = self.selected_chat().is_some_and(|c| c.can_send);
+        let closed = self
+            .topics
+            .as_ref()
+            .zip(self.shown_topic())
+            .is_some_and(|(list, topic)| list.blocks(topic));
+        match (can_send, closed) {
+            (false, _) => Composer::ReadOnly,
+            (true, true) => Composer::TopicClosed,
+            (true, false) => Composer::Open,
+        }
+    }
+
     /// How the pane no longer fits what core says, if it does not (see
     /// [`Stale`]).
     pub(crate) fn stale_pane(&self) -> Option<Stale> {
@@ -313,14 +368,28 @@ impl ChatShell {
         }
     }
 
-    /// What core says about `chat`'s kind: its summary in the chat list,
-    /// else the kind it announced while the pane showed it.
+    /// What core last said about `chat`'s kind: the kind it told while the
+    /// pane showed the chat, else its summary in the chat list.
     fn forum_status(&self, chat: ChatId) -> ForumStatus {
-        match (self.list.get(chat), self.shown_kind) {
-            (Some(summary), _) if is_forum(summary) => ForumStatus::Forum,
-            (Some(_), _) => ForumStatus::NotForum,
-            (None, Some((c, status))) if c == chat => status,
-            (None, _) => ForumStatus::Unknown,
+        match (self.shown_kind, self.list.get(chat)) {
+            (Some((c, status)), _) if c == chat => status,
+            (_, Some(summary)) => kind_of(summary),
+            (_, None) => ForumStatus::Unknown,
+        }
+    }
+
+    /// A list event that carries the pane's chat tells its kind as of now.
+    fn note_summary_kind(&mut self, event: &Event) {
+        let Some(chat) = self.pane.chat() else {
+            return;
+        };
+        let summaries: &[ChatSummary] = match event {
+            Event::DialogsReset(s) | Event::DialogsAppended(s) => s,
+            Event::ChatBumped(s) => std::slice::from_ref(s),
+            _ => return,
+        };
+        if let Some(summary) = summaries.iter().find(|s| s.id == chat) {
+            self.shown_kind = Some((chat, kind_of(summary)));
         }
     }
 
@@ -414,12 +483,20 @@ impl ChatShell {
         reason = "one arm per event; the thread key spreads two patterns over more lines"
     )]
     pub(crate) fn apply(&mut self, event: Event) {
+        if let Some(why) = Obsolete::of(&event)
+            && self.echoes.obsolete(why)
+        {
+            self.sync_echoes();
+        }
         match event {
             list @ (Event::DialogsReset(_)
             | Event::DialogsAppended(_)
             | Event::DialogsPaging { .. }
             | Event::ChatBumped(_)
-            | Event::ChatFolders(_)) => self.list.apply(list),
+            | Event::ChatFolders(_)) => {
+                self.note_summary_kind(&list);
+                self.list.apply(list);
+            }
             Event::History {
                 thread,
                 view,
@@ -551,12 +628,24 @@ impl ChatShell {
         let window = self.window.as_ref().and_then(|w| w.retry_due(now));
         let topics = self.topics.as_ref().and_then(|l| l.retry_due(now));
         let fix = self.stale_pane().and_then(|_| self.fix_retry.due(now));
+        // Ready (e.g. just reset by activation or Retry) wakes at once;
+        // delayed waits for its backoff; exhausted stays quiet. A stopped
+        // core never takes the discard, so it gets no wake-up.
+        let obsolete = (self.core != CoreState::Stopped && self.echoes.any_obsolete_to_discard())
+            .then(|| {
+                self.obsolete_retry
+                    .ready(now)
+                    .then_some(now)
+                    .or_else(|| self.obsolete_retry.due(now))
+            })
+            .flatten();
         let recovery = self.held_recovery.map(|at| at.max(now));
         [
             self.list.retry_due(now),
             window,
             topics,
             fix,
+            obsolete,
             self.frame_retry.due(now),
             recovery,
         ]
@@ -684,8 +773,15 @@ impl ChatShell {
         }
     }
 
-    /// Echoes changed: drop the ones whose server copy is shown, then
-    /// refresh the echo rows.
+    /// Takes out the sends of threads that can no longer be sent to whose
+    /// text core no longer holds (see [`Echoes::take_obsolete`]), for the
+    /// discarded-drafts notice.
+    pub(crate) fn take_lost_sends(
+        &mut self,
+    ) -> Vec<(Obsolete, discarded::Lost, ThreadKey, String)> {
+        self.echoes.take_obsolete()
+    }
+
     /// An echo of `changed`'s thread changed (`None`: nothing did).
     fn echo_changed(&mut self, changed: Option<ThreadKey>) {
         if changed.is_some() {
@@ -693,6 +789,8 @@ impl ChatShell {
         }
     }
 
+    /// Echoes changed: drop the ones whose server copy is shown, then
+    /// refresh the echo rows.
     fn after_echo_change(&mut self) {
         if let Some(w) = &self.window {
             self.echoes.resolve(w.thread(), |id| w.contains(id));

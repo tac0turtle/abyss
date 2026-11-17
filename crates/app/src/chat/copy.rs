@@ -99,6 +99,8 @@ pub(crate) const GENERAL_TOPIC: &str = "General";
 pub(crate) const UNTITLED_TOPIC: &str = "Topic";
 pub(crate) const PINNED_TOPIC: &str = "pinned";
 pub(crate) const CLOSED_TOPIC: &str = "closed";
+/// In place of the composer in a closed topic the user may not post in.
+pub(crate) const TOPIC_CLOSED: &str = "This topic is closed.";
 
 /// Where a discarded draft of `thread` was written: a topic of the chat
 /// (titled `chat`), or the chat.

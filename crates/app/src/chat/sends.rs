@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 use abyss_core::api::SendState;
 use abyss_core::model::{LocalId, MsgId, ThreadKey};
 
+use super::discarded::{Lost, Obsolete};
+
 /// Same bound as core's whole pending-send table (256 ordinary sends plus 32
 /// kept `Failed` for Retry, review rounds 31 to 33). No echo core keeps is
 /// ever dropped, and core keeps every send while its table has room, so a
@@ -53,6 +55,10 @@ pub(crate) struct Echo {
     pub(crate) phase: Phase,
     /// When core resends a flood-waiting send (`SendState::FloodWait`).
     resend_at: Option<Instant>,
+    /// Its thread can no longer be sent to, and why: it is never shown
+    /// again, and leaves as soon as core holds nothing for it
+    /// ([`Echoes::take_obsolete`]).
+    obsolete: Option<Obsolete>,
 }
 
 impl Echo {
@@ -65,6 +71,7 @@ impl Echo {
             date,
             phase: Phase::Submitted,
             resend_at: None,
+            obsolete: None,
         }
     }
 
@@ -144,8 +151,11 @@ impl Echoes {
         self.list.iter().find(|e| e.local_id == local_id)
     }
 
+    /// The echoes `thread` shows: an obsolete one is never shown.
     pub(crate) fn for_thread(&self, thread: ThreadKey) -> impl Iterator<Item = &Echo> {
-        self.list.iter().filter(move |e| e.thread == thread)
+        self.list
+            .iter()
+            .filter(move |e| e.thread == thread && e.obsolete.is_none())
     }
 
     pub(crate) fn count(&self, thread: ThreadKey) -> usize {
@@ -216,8 +226,8 @@ impl Echoes {
         }
         let thread = echo.thread;
         match echo.phase {
-            Phase::Discarding => drop(self.list.remove(at)),
-            Phase::Submitted | Phase::Kept | Phase::Returned => {
+            Phase::Discarding if echo.obsolete.is_none() => drop(self.list.remove(at)),
+            Phase::Submitted | Phase::Kept | Phase::Discarding | Phase::Returned => {
                 echo.phase = Phase::Returned;
                 echo.resend_at = None;
             }
@@ -265,12 +275,18 @@ impl Echoes {
     }
 
     /// Core discarded the send (`SendDiscarded`): the echo goes. Returns
-    /// its thread.
+    /// its thread. An obsolete echo's text now exists only here: it stays,
+    /// returned, for [`Self::take_obsolete`].
     pub(crate) fn discarded(&mut self, local_id: LocalId) -> Option<ThreadKey> {
         let at = self
             .list
             .iter()
             .position(|e| e.local_id == local_id && e.phase != Phase::Returned)?;
+        let echo = self.list.get_mut(at)?;
+        if echo.obsolete.is_some() {
+            echo.phase = Phase::Returned;
+            return Some(echo.thread);
+        }
         Some(self.list.remove(at).thread)
     }
 
@@ -293,6 +309,63 @@ impl Echoes {
             e.local_id == local_id && matches!(e.phase, Phase::Returned | Phase::Stranded)
         })?;
         Some(self.list.remove(at))
+    }
+
+    /// `why` made threads unsendable: their echoes are marked, so none is
+    /// shown again or offered for Retry, and each leaves once core holds
+    /// nothing for it. Returns whether any was marked.
+    pub(crate) fn obsolete(&mut self, why: Obsolete) -> bool {
+        let mut marked = false;
+        for echo in self.list.iter_mut().filter(|e| why.covers(e.thread)) {
+            echo.obsolete.get_or_insert(why);
+            marked = true;
+        }
+        marked
+    }
+
+    /// Obsolete sends core keeps and would discard: the UI discards them
+    /// itself, since nobody can see them any more.
+    pub(crate) fn obsolete_to_discard(&self) -> Vec<LocalId> {
+        self.discardable_obsolete().map(|e| e.local_id).collect()
+    }
+
+    /// Whether an obsolete send waits to be discarded.
+    pub(crate) fn any_obsolete_to_discard(&self) -> bool {
+        self.discardable_obsolete().next().is_some()
+    }
+
+    fn discardable_obsolete(&self) -> impl Iterator<Item = &Echo> {
+        self.list
+            .iter()
+            .filter(|e| e.obsolete.is_some() && e.can_discard())
+    }
+
+    /// Takes out the obsolete echoes core holds nothing for: a delivered
+    /// one goes quietly (the server has it), and the text of any other
+    /// (refused, discarded, stranded) is returned, oldest first, with why
+    /// its thread can't be sent to and whether it may have been sent, for
+    /// the discarded-drafts notice.
+    pub(crate) fn take_obsolete(&mut self) -> Vec<(Obsolete, Lost, ThreadKey, String)> {
+        let (gone, kept): (Vec<Echo>, Vec<Echo>) =
+            std::mem::take(&mut self.list).into_iter().partition(|e| {
+                e.obsolete.is_some()
+                    && (e.delivered() || matches!(e.phase, Phase::Returned | Phase::Stranded))
+            });
+        self.list = kept;
+        gone.into_iter()
+            .filter(|e| !e.delivered())
+            .filter_map(|e| {
+                // An unknown outcome, or a send in flight when core stopped.
+                let maybe_sent = matches!(e.state, SendState::Unknown { .. })
+                    || (e.phase == Phase::Stranded && e.state == SendState::Sending);
+                let lost = if maybe_sent {
+                    Lost::UnconfirmedSends
+                } else {
+                    Lost::Sends
+                };
+                Some((e.obsolete?, lost, e.thread, e.text))
+            })
+            .collect()
     }
 
     /// Drops sent echoes of `thread` whose server copy is now shown. Returns

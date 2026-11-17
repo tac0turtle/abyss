@@ -16,8 +16,8 @@ use super::auth::AuthView;
 use super::bridge::SharedCore;
 use super::session::Session;
 use crate::chat::copy as chat_copy;
-use crate::chat::discarded::Obsolete;
-use crate::chat::{Admit, ChatShell, Pane, Refused, Stale, format};
+use crate::chat::discarded::{Lost, Obsolete};
+use crate::chat::{Admit, ChatShell, Composer, Pane, Refused, Stale, format};
 use crate::ui::copy;
 
 /// How often a flood-wait countdown redraws.
@@ -214,6 +214,7 @@ impl Session {
             );
         let obsolete = Obsolete::of(&event);
         let now = cx.background_executor().now();
+        let composer = self.shell.composer();
         if let Event::LoadEnded { target, error } = event {
             self.shell.load_ended(target, error, now);
         } else {
@@ -222,6 +223,11 @@ impl Session {
         if let Some(why) = obsolete {
             self.discard_obsolete(why, window, cx);
         }
+        self.note_lost_sends(cx);
+        self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
+            s.discard_obsolete_sends(now, admit)
+        });
+        self.composer_changed(composer, window, cx);
         if folders {
             self.recheck_folder_menu(window, cx);
         }
@@ -364,11 +370,11 @@ impl Session {
         if self.drive(on_refusal, window, cx, f).is_none() {
             return false;
         }
-        let shown = self.shell.selected();
         if self.auth == AuthView::SignedIn {
-            let focus = match shown {
-                Some(_) => self.composer.focus_handle(cx),
-                None => self.pane_focus.clone(),
+            // A pane without a box keeps focus, so Cmd+[ still works.
+            let focus = match (self.shell.selected(), self.shell.composer()) {
+                (Some(_), Composer::Open) => self.composer.focus_handle(cx),
+                _ => self.pane_focus.clone(),
             };
             window.focus(&focus, cx);
         }
@@ -410,7 +416,7 @@ impl Session {
                     .map(|text| (Obsolete::HiddenNoRoom(key), text)),
             };
             if let Some((why, text)) = lost {
-                self.note_discarded(why, vec![(key, text)], cx);
+                self.note_discarded(why, Lost::Drafts, vec![(key, text)], cx);
             }
         }
         // The new thread's own draft comes back into the box, emptied
@@ -439,14 +445,47 @@ impl Session {
                 lost.push((open, typed));
             }
         }
-        self.note_discarded(why, lost, cx);
+        self.note_discarded(why, Lost::Drafts, lost, cx);
     }
 
-    /// Adds `lost` drafts (oldest first) to the discarded-drafts notice,
+    /// The open thread's box came or went with an event (its topic closed
+    /// or reopened): focus follows it, unless the user is elsewhere.
+    fn composer_changed(&self, before: Composer, window: &mut Window, cx: &mut Context<'_, Root>) {
+        let box_focus = self.composer.focus_handle(cx);
+        let now = self.shell.composer();
+        if before == Composer::Open && now != Composer::Open && box_focus.is_focused(window) {
+            window.focus(&self.pane_focus, cx);
+        } else if before != Composer::Open
+            && now == Composer::Open
+            && self.pane_focus.is_focused(window)
+        {
+            window.focus(&box_focus, cx);
+        }
+    }
+
+    /// Pending sends of threads that can no longer be sent to, whose text
+    /// core no longer holds, join the discarded-drafts notice: one batch
+    /// per reason and per kind of loss.
+    fn note_lost_sends(&mut self, cx: &mut Context<'_, Root>) {
+        let mut lost = self.shell.take_lost_sends();
+        while let Some(&(why, what, _, _)) = lost.first() {
+            let (batch, rest): (Vec<_>, Vec<_>) =
+                lost.into_iter().partition(|l| (l.0, l.1) == (why, what));
+            let texts = batch
+                .into_iter()
+                .map(|(_, _, key, text)| (key, text))
+                .collect();
+            self.note_discarded(why, what, texts, cx);
+            lost = rest;
+        }
+    }
+
+    /// Adds `lost` texts (oldest first) to the discarded-drafts notice,
     /// each labelled with where it was written.
     fn note_discarded(
         &mut self,
         why: Obsolete,
+        what: Lost,
         lost: Vec<(ThreadKey, String)>,
         cx: &mut Context<'_, Root>,
     ) {
@@ -460,7 +499,7 @@ impl Session {
                 (chat_copy::draft_place(title, key).into(), text)
             })
             .collect();
-        self.discarded.add(why, labelled);
+        self.discarded.add(why, what, labelled);
         cx.notify();
     }
 
@@ -607,6 +646,7 @@ impl Session {
     /// stranded with their text (task 6k).
     pub(super) fn core_stopped(&mut self, cx: &mut Context<'_, Root>) {
         self.shell.core_stopped();
+        self.note_lost_sends(cx);
         cx.notify();
     }
 

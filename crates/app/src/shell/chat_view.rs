@@ -21,7 +21,7 @@ use crate::chat::list::{ArchiveEntry, Shown, SidebarRow};
 use crate::chat::messages::MessageWindow;
 use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
-use crate::chat::{ChatShell, Pane, Row, copy, format, list as chat_list};
+use crate::chat::{ChatShell, Composer, Pane, Row, copy, format, list as chat_list};
 use crate::ui::mark::mark;
 use crate::ui::theme::{self, Depth, Theme, Themes};
 
@@ -515,7 +515,7 @@ fn chat_pane(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> An
                 )
                 .child(after_paint(cx)),
         )
-        .child(composer_area(session, chat, theme))
+        .child(composer_area(session, theme))
         .into_any_element()
 }
 
@@ -602,12 +602,14 @@ pub(super) fn pill(
         .child(label)
 }
 
-fn composer_area(session: &Session, chat: &ChatSummary, theme: &Theme) -> Div {
+/// The message box, or why there is none: a read-only chat, a closed
+/// topic. Echoes above it still show and can be discarded.
+fn composer_area(session: &Session, theme: &Theme) -> Div {
     let area = div().p_3();
-    if chat.can_send {
-        area.child(field(session.composer.clone().into_any_element(), theme))
-    } else {
-        area.child(muted(copy::READ_ONLY).text_sm())
+    match session.shell.composer() {
+        Composer::Open => area.child(field(session.composer.clone().into_any_element(), theme)),
+        Composer::ReadOnly => area.child(muted(copy::READ_ONLY).text_sm()),
+        Composer::TopicClosed => area.child(muted(copy::TOPIC_CLOSED).text_sm()),
     }
 }
 

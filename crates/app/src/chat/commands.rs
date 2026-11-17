@@ -15,7 +15,7 @@ use super::retry::AUTO_RESTART_GAP;
 use super::sends::Echo;
 use super::topics::{Intent, TopicList};
 use super::viewport::Seen;
-use super::{ChatShell, CoreState, Pane, Stale};
+use super::{ChatShell, Composer, CoreState, Pane, Stale};
 
 /// Core did not take a command: its queue is full, or it is gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,16 +224,18 @@ impl ChatShell {
         }
     }
 
-    /// Where a composer submission would go: `Ok(None)` when nothing is open
-    /// or the chat is read-only, `Busy` when the send table is full.
+    /// Where a composer submission would go: `Ok(None)` when nothing is open,
+    /// the composer is blocked (a read-only chat, a closed topic) or the
+    /// open thread can no longer be sent to (the pane waits to move), `Busy`
+    /// when the send table is full.
     pub(crate) fn send_target(&self) -> Result<Option<ThreadKey>, UserError> {
-        if self.core == CoreState::Stopped {
+        if self.core == CoreState::Stopped
+            || self.composer() != Composer::Open
+            || self.stale_pane().is_some()
+        {
             return Ok(None);
         }
-        let Some(thread) = self
-            .selected()
-            .filter(|_| self.selected_chat().is_some_and(|c| c.can_send))
-        else {
+        let Some(thread) = self.selected() else {
             return Ok(None);
         };
         if self.echoes.is_full() {
@@ -488,6 +490,31 @@ impl ChatShell {
         self.set_viewing((active && tail).then_some(thread), admit)
     }
 
+    /// Discards the sends core keeps for threads that can no longer be sent
+    /// to: nobody sees them to Retry or Discard, and a flood-waiting one
+    /// must not be resent. Their text reaches the discarded-drafts notice
+    /// once core confirms (`take_lost_sends`). Run after every chat event,
+    /// whatever the pane shows; a refusal waits out a backoff, and the
+    /// retry wake-up tries again.
+    pub(crate) fn discard_obsolete_sends(
+        &mut self,
+        now: Instant,
+        admit: Admit<'_>,
+    ) -> Result<(), Refused> {
+        if self.core == CoreState::Stopped || !self.obsolete_retry.ready(now) {
+            return Ok(());
+        }
+        for local_id in self.echoes.obsolete_to_discard() {
+            if let Err(refused) = admit(Command::DiscardSend(local_id)) {
+                self.obsolete_retry.failed(now);
+                return Err(refused);
+            }
+            self.echoes.discarding(local_id);
+        }
+        self.obsolete_retry.reset();
+        Ok(())
+    }
+
     /// Tells core which thread's live tail is on screen, when that changed.
     fn set_viewing(&mut self, thread: Option<ThreadKey>, admit: Admit<'_>) -> Result<(), Refused> {
         if self.viewing != thread {
@@ -534,6 +561,7 @@ impl ChatShell {
     fn auto_recover(&mut self, now: Instant) {
         let exhausted = self.focus_retry.gave_up()
             || self.frame_retry.gave_up()
+            || self.obsolete_retry.gave_up()
             || self.fix_retry.gave_up()
             || self.list.exhausted()
             || self.topics.as_ref().is_some_and(TopicList::exhausted)
@@ -551,6 +579,7 @@ impl ChatShell {
         self.held_recovery = None;
         self.focus_retry.restart_if_exhausted();
         self.frame_retry.restart_if_exhausted();
+        self.obsolete_retry.restart_if_exhausted();
         self.fix_retry.restart_if_exhausted();
         self.list.recover();
         if let Some(t) = self.topics.as_mut() {
@@ -569,6 +598,7 @@ impl ChatShell {
         self.held_recovery = None;
         self.focus_retry.reset();
         self.frame_retry.reset();
+        self.obsolete_retry.reset();
         self.fix_retry.reset();
         self.list.retry_now();
         if let Some(t) = self.topics.as_mut() {
@@ -609,8 +639,8 @@ impl ChatShell {
     /// The current retry wake-up fired ([`Self::retry_fired`]): runs a
     /// recovery the gap held back once it is due (while the window is still
     /// active), then resends what is due now, focus if its backoff allows,
-    /// a dialogs page and the topic list's load (a flood wait's kept load
-    /// once it ended); the caller then redraws, so the frame check retries
+    /// a dialogs page, the topic list's load (a flood wait's kept load
+    /// once it ended) and discards of obsolete sends; the caller then redraws, so the frame check retries
     /// the rest.
     pub(crate) fn retry_wakeup(&mut self, now: Instant, admit: Admit<'_>) -> Result<(), Refused> {
         if self.held_recovery.is_some_and(|at| at <= now) {
@@ -625,7 +655,9 @@ impl ChatShell {
             Ok(())
         };
         let dialogs = self.request_dialogs(now, admit);
-        focus.and(dialogs).and(self.request_topics(now, admit))
+        let topics = self.request_topics(now, admit);
+        let obsolete = self.discard_obsolete_sends(now, admit);
+        focus.and(dialogs).and(topics).and(obsolete)
     }
 
     /// Whether core's idea of the window (its state, the live tail) lags

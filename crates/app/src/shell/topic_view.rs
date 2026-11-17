@@ -97,18 +97,17 @@ pub(super) fn topic_pane(
 }
 
 /// An open topic's header: the way back to the list, then the chat's and
-/// the topic's titles.
+/// the topic's titles, and a mark while the topic is closed. The title
+/// falls back on "General" or "Topic" while the retained list lacks it.
 pub(super) fn topic_header(
     session: &Session,
     chat: &ChatSummary,
     topic: TopicId,
     cx: &mut Context<'_, Root>,
 ) -> Div {
-    let title = session
-        .shell
-        .topics()
-        .and_then(|l| l.get(topic))
-        .map_or_else(|| copy::UNTITLED_TOPIC.into(), topics::title);
+    let shown = session.shell.shown_topic();
+    let title = shown.map_or_else(|| topics::fallback_title(topic), topics::title);
+    let closed = shown.is_some_and(|t| t.closed);
     div()
         .p_3()
         .flex()
@@ -140,6 +139,7 @@ pub(super) fn topic_header(
                 .font_family(theme::NAME_FONT)
                 .child(title),
         )
+        .children(closed.then(|| muted(copy::CLOSED_TOPIC).text_xs().flex_none()))
 }
 
 fn topic_rows(

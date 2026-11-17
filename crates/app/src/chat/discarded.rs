@@ -1,6 +1,6 @@
-//! Drafts discarded because their thread can no longer be sent to (a removed
-//! topic, a chat whose forum flag changed), kept for one notice that can
-//! copy them all. Bounded: at most [`MAX_DISCARDED`] texts, the oldest
+//! Drafts and pending sends discarded because their thread can no longer be
+//! sent to (a removed topic, a chat whose forum flag changed), kept for one
+//! notice that can copy them all. Bounded: at most [`MAX_DISCARDED`] texts, the oldest
 //! dropped first; that and Dismiss are the only ways one is lost.
 
 use std::collections::VecDeque;
@@ -85,6 +85,45 @@ impl Obsolete {
     }
 }
 
+/// What a batch discarded, for the wording of its line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lost {
+    /// Composer text: stashed drafts, or the box's.
+    Drafts,
+    /// Sends core no longer holds (refused, failed and then discarded,
+    /// or left when core stopped), whose echoes nobody can see any more.
+    Sends,
+    /// Such sends whose outcome was unknown: they may have been delivered.
+    UnconfirmedSends,
+}
+
+impl Lost {
+    fn one(self) -> &'static str {
+        match self {
+            Self::Drafts => "draft",
+            Self::Sends | Self::UnconfirmedSends => "pending message",
+        }
+    }
+
+    fn many(self) -> &'static str {
+        match self {
+            Self::Drafts => "drafts",
+            Self::Sends | Self::UnconfirmedSends => "pending messages",
+        }
+    }
+
+    /// What the user should know before sending such a text again.
+    fn caveat(self, count: usize) -> &'static str {
+        match (self, count) {
+            (Self::Drafts | Self::Sends, _) => "",
+            (Self::UnconfirmedSends, 1) => " It may have been sent: check before sending it again.",
+            (Self::UnconfirmedSends, _) => {
+                " They may have been sent: check before sending them again."
+            }
+        }
+    }
+}
+
 /// The pending notice: discarded texts, each under the label of where it
 /// was written, and one line per batch.
 #[derive(Default)]
@@ -105,19 +144,23 @@ impl std::fmt::Debug for Discarded {
 }
 
 impl Discarded {
-    /// Adds a batch of `drafts` (label, text), all made unsendable by
+    /// Adds a batch of `lost` texts (label, text), all made unsendable by
     /// `why`, to the notice; past [`MAX_DISCARDED`] the oldest go.
-    pub(crate) fn add(&mut self, why: Obsolete, drafts: Vec<(SharedString, String)>) {
+    pub(crate) fn add(&mut self, why: Obsolete, what: Lost, drafts: Vec<(SharedString, String)>) {
         let line = match drafts.as_slice() {
             [] => return,
             [(label, _)] => format!(
-                "Your draft in {label} was discarded because {}.",
-                why.reason()
+                "Your {} in {label} was discarded because {}.{}",
+                what.one(),
+                why.reason(),
+                what.caveat(1)
             ),
             many => format!(
-                "{} drafts were discarded because {}.",
+                "{} {} were discarded because {}.{}",
                 many.len(),
-                why.reason()
+                what.many(),
+                why.reason(),
+                what.caveat(many.len())
             ),
         };
         self.lines.push_back(line.into());

@@ -1142,3 +1142,10 @@ Follow-ups (not Stage 2 tasks):
 | (lead) | Cap evictions were reported like deletions, discarding valid drafts | `TopicRemoved` carries `TopicGone { Deleted, Hidden, Evicted }`; only `Deleted` discards drafts |
 | 5 | P2: a deletion in the same response as its eviction surfaced only as `Evicted`; resets dropped `Hidden` | By-id deletions always emit `Deleted`; semantic removals precede resets; an open topic fetched hidden emits `Hidden` |
 | 6 | Pass | Note: re-discovering an already deleted id can emit `Deleted` again (bounded, idempotent cleanup) |
+
+### Task 11: topic thread (2 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 | P2: a send between `KindChanged` and its summary created an unmarked echo in an obsolete key. P3: obsolete-send cleanup waited for a painted pane | The latest kind core stated governs the pane and send admission; cleanup runs on events with its own backoff; discarded sends of unknown outcome say they may have been sent |
+| 2 | Pass. P3 applied by the lead: a reset cleanup backoff now wakes at once (not while core is stopped) | — |

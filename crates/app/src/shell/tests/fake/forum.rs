@@ -1,8 +1,10 @@
-//! Forums (Stage 2 task 10): the pane moves between the chat list, a
-//! forum's topic list and a topic only once core admitted the command, Back
-//! (the "‹ Topics" button and Cmd+[) shows the kept list at once, and a
+//! Forums (Stage 2 tasks 10 and 11): the pane moves between the chat list,
+//! a forum's topic list and a topic only once core admitted the command,
+//! Back (the "‹ Topics" button and Cmd+[) shows the kept list at once, and a
 //! flood wait on topics counts down and then sends the load it interrupted,
-//! once. The last test drives the real core over the `cargo dev` demo data.
+//! once. A topic's sends, reads and live tail stay in that topic, and the
+//! sends of a deleted one end in the discarded-drafts notice. The last two
+//! tests drive the real core over the `cargo dev` demo data.
 
 use std::time::{Duration, Instant};
 
@@ -354,13 +356,15 @@ fn a_changed_forum_flag_moves_the_pane(cx: &mut TestAppContext) {
         sent.iter().filter(|c| **c == open).count()
     };
 
-    // The forum stops being one while a topic is open (core invalidates
-    // the list, then sends the summary), with core's queue full: nothing
-    // spins, and the whole chat opens once the backoff ends.
+    // The forum stops being one while a topic is open (core announces the
+    // kind and invalidates the list, and only then sends the summary), with
+    // core's queue full: nothing spins. Text sent into the topic before the
+    // summary arrives is not taken: the announced kind already governs.
     harness.sent.borrow_mut().full = true;
     let refused = sent_by(&harness, || {
+        let forum = abyss_core::store::ForumStatus::NotForum;
+        core_sends(&harness, cx, Event::KindChanged { chat: FORUM, forum });
         core_sends(&harness, cx, Event::ForumInvalidated(FORUM));
-        core_sends(&harness, cx, Event::ChatBumped(forum_chat(NOT_FORUM)));
     });
     assert!(refused.is_empty());
     assert_eq!(
@@ -371,10 +375,19 @@ fn a_changed_forum_flag_moves_the_pane(cx: &mut TestAppContext) {
         }
     );
     harness.sent.borrow_mut().full = false;
+    let late = sent_by(&harness, || {
+        cx.simulate_input("late");
+        cx.simulate_keystrokes("enter");
+    });
+    assert!(late.is_empty(), "{late:?}");
+    // The whole chat opens once the backoff ends; the late text joins the
+    // discarded notice, and no echo is left behind.
+    core_sends(&harness, cx, Event::ChatBumped(forum_chat(NOT_FORUM)));
     let retried = sent_by(&harness, || wait(cx, 1));
     assert_eq!(opens(&retried), 1, "{retried:?}");
     assert_eq!(pane(&root, cx), Pane::Thread(whole));
-    let topic_text = "a topic of “Forum”\nin 5";
+    assert_eq!(read(&root, cx, |s| s.shell.row_count()), 0);
+    let topic_text = "a topic of “Forum”\nlate\n\na topic of “Forum”\nin 5";
     assert_eq!(lost(&root, cx), (true, topic_text.into()));
     assert_eq!(composer_text(&root, cx), "");
     cx.simulate_input("in whole");
@@ -438,6 +451,85 @@ fn a_forum_flag_change_off_screen_drops_its_drafts(cx: &mut TestAppContext) {
     });
     assert_eq!(changed, [debug(&Command::OpenThread(whole))]);
     assert_eq!(pane(&root, cx), Pane::Thread(whole));
+}
+
+/// Topic `n`'s tail, messages `ids`.
+fn topic_tail(n: i32, ids: std::ops::RangeInclusive<i32>) -> Event {
+    let messages = ids
+        .map(|id| abyss_core::model::Message {
+            thread: topic_key(n),
+            ..message(FORUM, id)
+        })
+        .collect();
+    Event::History {
+        thread: topic_key(n),
+        view: abyss_core::store::ViewGen(1),
+        dir: abyss_core::api::HistoryDir::Tail,
+        messages,
+        removed: Vec::new(),
+        has_more: false,
+    }
+}
+
+#[gpui::test]
+fn sends_reads_and_the_tail_stay_in_their_topic(cx: &mut TestAppContext) {
+    let (root, cx, harness) = forum_listed(cx);
+    cx.simulate_resize(gpui::size(gpui::px(800.), gpui::px(300.)));
+    select_forum(&root, cx);
+    topics_listed(&harness, cx, vec![topic(5), topic(6)], Pages::Done);
+    select_topic(&root, cx, 5);
+    let echoes =
+        |root: &Entity<Root>, cx: &mut VisualTestContext| read(root, cx, |s| s.shell.row_count());
+
+    // Two sends into topic 5: core fails one and refuses the other. Both
+    // show there, and nowhere else.
+    let failed = submit_text(cx, &harness, "failed in 5");
+    core_sends(&harness, cx, Event::SendAdmitted { local_id: failed });
+    let state = abyss_core::api::SendState::Failed;
+    let local_id = failed;
+    core_sends(&harness, cx, Event::SendState { local_id, state });
+    let refused = submit_text(cx, &harness, "refused in 5");
+    core_sends(&harness, cx, Event::SendRefused { local_id: refused });
+    assert_eq!(echoes(&root, cx), 2);
+    select_topic(&root, cx, 6);
+    assert_eq!(echoes(&root, cx), 0, "not in another topic");
+    act(&root, cx, crate::shell::session::Session::back_from_forum);
+    select_topic(&root, cx, 1);
+    assert_eq!(echoes(&root, cx), 0, "nor in General");
+
+    // Reads and the live tail name the topic shown.
+    select_topic(&root, cx, 6);
+    let sent = sent_by(&harness, || {
+        core_sends(&harness, cx, topic_tail(6, 10..=12));
+    });
+    let mark = Command::MarkRead {
+        thread: topic_key(6),
+        max_id: MsgId(12),
+    };
+    assert!(sent.contains(&debug(&mark)), "{sent:?}");
+    let tail = Command::ViewingTail(Some(topic_key(6)));
+    assert!(sent.contains(&debug(&tail)), "{sent:?}");
+
+    // Topic 5 is deleted while topic 6 shows: core keeps the failed send,
+    // which nobody can see any more, so the UI discards it. The refused
+    // text and, once core confirms the discard, the failed one join the
+    // notice.
+    let (chat, topic) = (FORUM, tid(5));
+    let removed = Event::TopicRemoved {
+        chat,
+        topic,
+        reason: TopicGone::Deleted,
+    };
+    let sent = sent_by(&harness, || core_sends(&harness, cx, removed));
+    assert_eq!(sent, [debug(&Command::DiscardSend(failed))]);
+    let line =
+        "Your pending message in a topic of “Forum” was discarded because the topic was deleted.";
+    let (shown, _) = discarded(&root, cx).unwrap();
+    assert_eq!(shown, line);
+    core_sends(&harness, cx, Event::SendDiscarded { local_id: failed });
+    let copied = "a topic of “Forum”\nfailed in 5\n\na topic of “Forum”\nrefused in 5";
+    assert_eq!(discarded(&root, cx), Some((line.into(), copied.into())));
+    assert!(read(&root, cx, |s| s.shell.echoes().get(failed).is_none()));
 }
 
 fn flood(seconds: u32) -> Event {
@@ -512,30 +604,8 @@ fn a_topics_flood_wait_counts_down_and_then_loads_once(cx: &mut TestAppContext) 
 /// nothing from core.
 #[test]
 fn the_demo_forums_list_page_and_keep_their_order() {
-    use abyss_core::api::AuthState;
-    use abyss_core::backend::fake::{FAKE_CODE, FakeBackend};
-    use abyss_core::{BackendChoice, CoreConfig};
-
     let script = crate::chat::demo::script(crate::chat::format::now());
-    let (backend, fake) = FakeBackend::new(script);
-    let core = abyss_core::start(CoreConfig::default(), BackendChoice::Fake(backend)).unwrap();
-    let (commands, events) = core.split();
-    let mut live = Live {
-        shell: crate::chat::ChatShell::default(),
-        events,
-        auth: None,
-    };
-    live.until(|_, auth| matches!(auth, Some(AuthState::Phone { .. })));
-    commands
-        .send(Command::SubmitPhone("+15550100".into()))
-        .unwrap();
-    live.until(|_, auth| matches!(auth, Some(AuthState::Code { .. })));
-    commands
-        .send(Command::SubmitCode(FAKE_CODE.into()))
-        .unwrap();
-    live.until(|shell, auth| {
-        matches!(auth, Some(AuthState::SignedIn { .. })) && shell.list.len() > 12
-    });
+    let (mut live, commands, fake) = Live::signed_in(script);
     let mut admit = |cmd| {
         commands.send(cmd).unwrap();
         Ok(())
@@ -545,6 +615,165 @@ fn the_demo_forums_list_page_and_keep_their_order() {
         .map(|(id, order)| live.forum(&fake, &mut admit, id, order));
     assert_ne!(orders[0], orders[1], "the two orders differ");
     commands.cancel();
+}
+
+/// The demo forum that lists topics by activity.
+const DEMO_FORUM: ChatId = ChatId {
+    kind: PeerKind::Channel,
+    id: 2,
+};
+
+fn demo_topic(n: i32) -> ThreadKey {
+    ThreadKey {
+        chat: DEMO_FORUM,
+        topic: Some(tid(n)),
+    }
+}
+
+/// The real core over the demo account, whose forum (chat 2) has one
+/// unread topic left: a closed topic blocks the composer until it reopens,
+/// a send into a topic shows only there, reading the last unread topic
+/// clears the forum's badge, and a new message into a read topic shows the
+/// dot, then the server's count.
+#[test]
+fn a_demo_topic_thread_keeps_to_itself() {
+    let mut script = crate::chat::demo::script(crate::chat::format::now());
+    // Every topic read to the newest message but 4.
+    let last = script.history[&DEMO_FORUM]
+        .iter()
+        .map(|m| m.id)
+        .max()
+        .unwrap();
+    for t in script.topics.get_mut(&DEMO_FORUM).unwrap() {
+        if t.topic.id != tid(4) {
+            t.topic.read_inbox_max = last;
+        }
+    }
+    let (mut live, commands, fake) = Live::signed_in(script);
+    let mut admit = |cmd| {
+        commands.send(cmd).unwrap();
+        Ok(())
+    };
+    assert_eq!(badge(&live.shell), Some(1));
+    live.shell.select(DEMO_FORUM, &mut admit).unwrap();
+    live.until(|shell, _| !ids(shell).is_empty());
+    live.shell.topics_seen(49, Instant::now());
+    live.shell
+        .request_topics(Instant::now(), &mut admit)
+        .unwrap();
+    live.until(|shell, _| ids(shell).len() == 61);
+    live.closed_then_sent(&fake, &mut admit);
+    live.read_then_new(&fake, &mut admit);
+    commands.cancel();
+}
+
+/// The demo forum's badge.
+fn badge(shell: &crate::chat::ChatShell) -> Option<u32> {
+    shell.list.get(DEMO_FORUM).map(|c| c.unread)
+}
+
+/// Whether the open thread's window loaded some messages.
+fn loaded(shell: &crate::chat::ChatShell) -> bool {
+    shell.window().is_some_and(|w| w.is_loaded() && w.len() > 0)
+}
+
+/// Echo rows the open thread shows.
+fn echo_rows(shell: &crate::chat::ChatShell) -> usize {
+    let messages = shell
+        .window()
+        .map_or(0, crate::chat::messages::MessageWindow::len);
+    shell.row_count() - messages
+}
+
+impl Live {
+    /// From the demo forum's list (or a topic), opens topic `n` and waits
+    /// for its messages.
+    fn reopen(&mut self, admit: crate::chat::Admit<'_>, n: i32) {
+        self.shell.back(admit).unwrap();
+        self.shell.open_topic(tid(n), admit).unwrap();
+        self.until(|shell, _| loaded(shell));
+    }
+
+    /// Topic 14 is closed: no box and nothing to send, until it reopens.
+    /// Then a send into it shows there once the server has it, and in no
+    /// other thread.
+    fn closed_then_sent(
+        &mut self,
+        fake: &abyss_core::backend::fake::FakeHandle,
+        admit: crate::chat::Admit<'_>,
+    ) {
+        use crate::chat::Composer;
+
+        self.shell.open_topic(tid(14), admit).unwrap();
+        assert!(self.shell.shown_topic().is_some_and(|t| t.closed));
+        assert_eq!(self.shell.composer(), Composer::TopicClosed);
+        assert_eq!(self.shell.send_target(), Ok(None));
+        futures::executor::block_on(fake.reopen_topic(DEMO_FORUM, tid(14))).unwrap();
+        self.until(|shell, _| shell.composer() == Composer::Open);
+        assert_eq!(self.shell.send_target(), Ok(Some(demo_topic(14))));
+
+        self.until(|shell, _| loaded(shell));
+        let now = crate::chat::format::now();
+        self.shell
+            .submit(demo_topic(14), "only here", now, admit)
+            .unwrap();
+        self.until(|_, _| !fake.sent().is_empty());
+        let (id, thread) = fake
+            .server_history(DEMO_FORUM)
+            .last()
+            .map(|m| (m.id, m.thread))
+            .unwrap();
+        assert_eq!(thread, demo_topic(14));
+        let shown = |shell: &crate::chat::ChatShell| shell.window().is_some_and(|w| w.contains(id));
+        for other in [2, 1] {
+            self.reopen(admit, other);
+            let (here, echoes) = (shown(&self.shell), echo_rows(&self.shell));
+            assert_eq!((here, echoes), (false, 0), "topic {other}");
+        }
+        self.reopen(admit, 14);
+        self.until(|shell, _| shown(shell) && echo_rows(shell) == 0);
+    }
+
+    /// Reading the last unread topic (4) marks that topic, and the forum's
+    /// badge follows the server's count. A message into read topic 2 then
+    /// shows the dot, then the server's count, and the badge again.
+    fn read_then_new(
+        &mut self,
+        fake: &abyss_core::backend::fake::FakeHandle,
+        admit: crate::chat::Admit<'_>,
+    ) {
+        use crate::chat::topics::UnreadMark;
+        use crate::chat::viewport::Seen;
+
+        self.reopen(admit, 4);
+        let newest = self.shell.window().unwrap().len() - 1;
+        let seen = Seen {
+            first_row: newest,
+            last_message: Some(newest),
+        };
+        self.shell
+            .frame_seen(Some(seen), Instant::now(), admit)
+            .unwrap();
+        self.until(|shell, _| badge(shell) == Some(0));
+        let reads = fake.read_calls();
+        assert!(reads.iter().any(|(t, _)| *t == demo_topic(4)), "{reads:?}");
+        assert!(reads.iter().all(|(t, _)| t.topic.is_some()), "{reads:?}");
+
+        self.shell.back(admit).unwrap();
+        let mark = |shell: &crate::chat::ChatShell| {
+            let topic = shell.topics().and_then(|l| l.get(tid(2)));
+            topic.map(UnreadMark::of)
+        };
+        assert_eq!(mark(&self.shell), Some(UnreadMark::None));
+        futures::executor::block_on(fake.incoming(demo_topic(2), "new")).unwrap();
+        self.until_each(|shell| mark(shell) == Some(UnreadMark::Dot));
+        let count = UnreadMark::Count {
+            unread: 1,
+            mentions: 0,
+        };
+        self.until(|shell, _| mark(shell) == Some(count));
+        self.until(|shell, _| badge(shell) == Some(1));
+    }
 }
 
 impl Live {
@@ -615,6 +844,15 @@ fn ids(shell: &crate::chat::ChatShell) -> Vec<i32> {
         })
 }
 
+/// When [`Live::wait`] checks its condition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// Once the events queued so far are applied.
+    Batch,
+    /// After every event.
+    Each,
+}
+
 /// The UI state fed by a real core's events.
 struct Live {
     shell: crate::chat::ChatShell,
@@ -624,16 +862,70 @@ struct Live {
 }
 
 impl Live {
+    /// The real core over `script`, signed in, with its chat list shown.
+    fn signed_in(
+        script: FakeScript,
+    ) -> (
+        Self,
+        abyss_core::CoreSender,
+        abyss_core::backend::fake::FakeHandle,
+    ) {
+        use abyss_core::api::AuthState;
+        use abyss_core::backend::fake::{FAKE_CODE, FakeBackend};
+        use abyss_core::{BackendChoice, CoreConfig};
+
+        let (backend, fake) = FakeBackend::new(script);
+        let core = abyss_core::start(CoreConfig::default(), BackendChoice::Fake(backend)).unwrap();
+        let (commands, events) = core.split();
+        let mut live = Self {
+            shell: crate::chat::ChatShell::default(),
+            events,
+            auth: None,
+        };
+        live.until(|_, auth| matches!(auth, Some(AuthState::Phone { .. })));
+        commands
+            .send(Command::SubmitPhone("+15550100".into()))
+            .unwrap();
+        live.until(|_, auth| matches!(auth, Some(AuthState::Code { .. })));
+        commands
+            .send(Command::SubmitCode(FAKE_CODE.into()))
+            .unwrap();
+        live.until(|shell, auth| {
+            matches!(auth, Some(AuthState::SignedIn { .. })) && shell.list.len() > 12
+        });
+        (live, commands, fake)
+    }
+
     /// Applies core's events until `done` holds, or fails after a generous
     /// deadline.
+    #[track_caller]
     fn until(
         &mut self,
+        done: impl Fn(&crate::chat::ChatShell, Option<&abyss_core::api::AuthState>) -> bool,
+    ) {
+        self.wait(Check::Batch, done);
+    }
+
+    /// Like [`Self::until`], checked after every event, so a state the next
+    /// event replaces is seen too.
+    #[track_caller]
+    fn until_each(&mut self, done: impl Fn(&crate::chat::ChatShell) -> bool) {
+        self.wait(Check::Each, |shell, _| done(shell));
+    }
+
+    #[track_caller]
+    fn wait(
+        &mut self,
+        check: Check,
         done: impl Fn(&crate::chat::ChatShell, Option<&abyss_core::api::AuthState>) -> bool,
     ) {
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             while let Some(event) = self.events.try_recv() {
                 self.on(event);
+                if check == Check::Each && done(&self.shell, self.auth.as_ref()) {
+                    return;
+                }
             }
             if done(&self.shell, self.auth.as_ref()) {
                 return;

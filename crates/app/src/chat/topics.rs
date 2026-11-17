@@ -76,9 +76,16 @@ impl UnreadMark {
 
 /// A topic's title, or the fixed fallback when it has none.
 pub(crate) fn title(topic: &Topic) -> SharedString {
-    if !topic.title.is_empty() {
+    if topic.title.is_empty() {
+        fallback_title(topic.id)
+    } else {
         topic.title.clone().into()
-    } else if topic.id == TopicId::GENERAL {
+    }
+}
+
+/// The title of a topic whose own is unknown or empty.
+pub(crate) fn fallback_title(id: TopicId) -> SharedString {
+    if id == TopicId::GENERAL {
         copy::GENERAL_TOPIC.into()
     } else {
         copy::UNTITLED_TOPIC.into()
@@ -145,6 +152,12 @@ impl TopicList {
 
     pub(crate) fn get(&self, id: TopicId) -> Option<&Topic> {
         self.topics.iter().find(|t| t.id == id)
+    }
+
+    /// Whether `topic` takes no message from the user: it is closed, and
+    /// the user may not post in closed topics (core refuses such a send).
+    pub(crate) fn blocks(&self, topic: &Topic) -> bool {
+        topic.closed && !self.can_post_closed
     }
 
     /// Whether core sent a copy to show (possibly empty).
