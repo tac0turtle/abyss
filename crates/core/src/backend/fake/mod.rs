@@ -5,6 +5,10 @@
 //! (failed build, missing baseline, runner exit or panic, a runner that is slow
 //! to quit or ignores `quit`), stream faults (recoverable or fatal error, panic),
 //! fixed latency, live updates pushed by the test, and counters.
+//!
+//! Forums (plan section 5, task 3): topic lists in either order, topic
+//! history, sends and reads per thread, peer dialogs, and controls that change
+//! topics on the server and emit the matching updates (see `topics`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,18 +20,25 @@ use tokio::sync::{Notify, mpsc};
 
 use super::{
     Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest, DialogsCursor,
-    DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl, PasswordChallenge, Seed,
-    SentCode, SessionSeed, SessionSnapshot, SignIn, StreamError, StreamItem, Update, UpdateStream,
+    DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl, PasswordChallenge,
+    RejectReason, Seed, SentCode, SessionSeed, SessionSnapshot, SignIn, StreamError, StreamItem,
+    TopicsById, TopicsCursor, TopicsPage, Update, UpdateStream,
 };
 use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
 use crate::credentials::{CredentialSlot, EnvResolution};
-use crate::model::{Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey};
+use crate::model::{
+    Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey, TopicId, TopicOrder,
+    TopicSnapshot,
+};
 use crate::rich_text::RichText;
 use crate::session::AbyssSession;
+use crate::store::PostClosed;
 
 mod auth;
+mod topics;
 
 pub use auth::{FAKE_SELF_HASH, FAKE_SELF_ID};
+pub use topics::{DEMO_FORUM_TOPICS, DemoForum, demo_forum};
 
 /// Maximum faults queued per operation.
 const MAX_FAULTS: usize = 1024;
@@ -51,6 +62,12 @@ pub enum Op {
     PasswordChallenge,
     FetchSelf,
     SignOut,
+    /// `messages.getForumTopics`.
+    Topics,
+    /// `messages.getForumTopicsByID`.
+    TopicsById,
+    /// `messages.getPeerDialogs`.
+    PeerDialogs,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -66,7 +83,9 @@ pub enum Fault {
     CompleteThenHang,
     /// Panics inside the call (a bug in the Telegram library).
     Panic,
-    /// Succeeds after the given extra delay.
+    /// Succeeds after the given extra delay. `Topics`, `TopicsById` and
+    /// `PeerDialogs` answer with the server state *at call time*, so changes
+    /// made during the delay cross the response as live updates.
     Delay(Duration),
     /// Login calls (`sign_in`, `check_password`): the request sits in the
     /// sender's queue and the server applies it after the delay, whether or
@@ -99,8 +118,22 @@ pub enum QuitBehavior {
 #[derive(Clone, Debug)]
 pub struct FakeScript {
     pub dialogs: Vec<ChatSummary>,
-    /// Per chat, ascending by id.
+    /// Per chat, ascending by id. Messages carry the topic the way the
+    /// server states it: `None` for General and non-forum chats, `Some(t)`
+    /// for every other topic (a topic's creation message included).
     pub history: HashMap<ChatId, Vec<Message>>,
+    /// Per forum, its topics (a forum is a chat whose dialog kind says so).
+    /// The fake serves each topic's activity (`last`, `last_date`,
+    /// `last_id`, `top_version`) and `unread` from `history` and
+    /// `read_inbox_max`, so the scripted values of those fields are ignored.
+    /// Hidden topics (General only) are listed with their visibility.
+    pub topics: HashMap<ChatId, Vec<TopicSnapshot>>,
+    /// Per forum, the order its topic list is served in (default
+    /// [`TopicOrder::LastActivity`]).
+    pub topic_order: HashMap<ChatId, TopicOrder>,
+    /// Per forum, whether the account may post in closed topics (default
+    /// [`PostClosed::Refused`]).
+    pub post_closed: HashMap<ChatId, PostClosed>,
     pub latency: Duration,
     pub login: FakeLogin,
     /// What the environment says about credentials. The default is a valid
@@ -114,6 +147,9 @@ impl Default for FakeScript {
         Self {
             dialogs: Vec::new(),
             history: HashMap::new(),
+            topics: HashMap::new(),
+            topic_order: HashMap::new(),
+            post_closed: HashMap::new(),
             latency: Duration::ZERO,
             login: FakeLogin::default(),
             env: EnvResolution::Pair(fake_credentials()),
@@ -271,14 +307,22 @@ struct State {
     leads: HashMap<Op, VecDeque<Duration>>,
     build_faults: VecDeque<BuildFault>,
     calls: HashMap<Op, usize>,
-    sent: Vec<(ChatId, i64)>,
+    sent: Vec<(ThreadKey, i64)>,
     /// Server-side dedup: every `random_id` the server accepted, with the
     /// message it created. Telegram deduplicates by `random_id` per sender.
     accepted: HashMap<i64, (ChatId, MsgId)>,
-    attempted: Vec<(ChatId, i64)>,
+    attempted: Vec<(ThreadKey, i64)>,
     /// The last `Client::retain_peers` set.
     retained: Option<Vec<ChatId>>,
-    read: Vec<(ChatId, MsgId)>,
+    read: Vec<(ThreadKey, MsgId)>,
+    topics: HashMap<ChatId, Vec<TopicSnapshot>>,
+    topic_order: HashMap<ChatId, TopicOrder>,
+    post_closed: HashMap<ChatId, PostClosed>,
+    /// Updates still to be dropped instead of delivered (`drop_next_update`).
+    drop_updates: usize,
+    /// Per chat, the newest message id and date ever held: new messages are
+    /// allocated above it, so deleted ids are never reused.
+    high_water: HashMap<ChatId, topics::HighWater>,
     seeds: Vec<Seed>,
     /// The most recently retired instance's session, for late-write tests.
     retired_session: Option<Arc<AbyssSession>>,
@@ -323,10 +367,23 @@ impl FakeBackend {
         if let EnvResolution::Pair(creds) = script.env {
             slot.set(Some(creds));
         }
+        let high_water = script
+            .history
+            .iter()
+            .map(|(chat, messages)| {
+                let mut mark = topics::HighWater::default();
+                mark.cover(messages);
+                (*chat, mark)
+            })
+            .collect();
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
+                high_water,
                 dialogs: script.dialogs,
                 history: script.history,
+                topics: script.topics,
+                topic_order: script.topic_order,
+                post_closed: script.post_closed,
                 auth: auth::ServerAuth::new(script.login),
                 ..State::default()
             }),
@@ -453,9 +510,25 @@ impl FakeHandle {
         }
     }
 
-    /// Delivers a live update on whichever stream is current (or the next one).
+    /// Delivers a live update on whichever stream is current (or the next
+    /// one), unless [`Self::drop_next_update`] asked for it to be lost.
     pub async fn push_update(&self, update: Update) {
-        let _ = self.stream.send(StreamCmd::Update(update)).await;
+        let lost = self.shared.with(|s| {
+            let lost = s.drop_updates > 0;
+            s.drop_updates = s.drop_updates.saturating_sub(1);
+            lost
+        });
+        if !lost {
+            let _ = self.stream.send(StreamCmd::Update(update)).await;
+        }
+    }
+
+    /// The next update pushed (by the test or by a server control such as
+    /// [`Self::close_topic`]) is lost: the server state still changes, but no
+    /// update arrives, as with a lost non-PTS update (plan section 2).
+    pub fn drop_next_update(&self) {
+        self.shared
+            .with(|s| s.drop_updates = s.drop_updates.saturating_add(1).min(MAX_FAULTS));
     }
 
     /// The current stream's next `next` call fails with `e`.
@@ -515,13 +588,13 @@ impl FakeHandle {
         self.shared.revoked.load(Ordering::SeqCst)
     }
 
-    /// `(chat, random_id)` of every send that reached the backend and succeeded.
-    pub fn sent(&self) -> Vec<(ChatId, i64)> {
+    /// `(thread, random_id)` of every send that reached the backend and succeeded.
+    pub fn sent(&self) -> Vec<(ThreadKey, i64)> {
         self.shared.with(|s| s.sent.clone())
     }
 
-    /// `(chat, random_id)` of every send call, including failed or hung ones.
-    pub fn send_attempts(&self) -> Vec<(ChatId, i64)> {
+    /// `(thread, random_id)` of every send call, including failed or hung ones.
+    pub fn send_attempts(&self) -> Vec<(ThreadKey, i64)> {
         self.shared.with(|s| s.attempted.clone())
     }
 
@@ -542,7 +615,8 @@ impl FakeHandle {
         self.shared.with(|s| s.retained.clone())
     }
 
-    pub fn read_calls(&self) -> Vec<(ChatId, MsgId)> {
+    /// `(thread, max_id)` of every successful read mark.
+    pub fn read_calls(&self) -> Vec<(ThreadKey, MsgId)> {
         self.shared.with(|s| s.read.clone())
     }
 
@@ -565,6 +639,7 @@ impl FakeHandle {
     /// Replaces a chat's server-side history (e.g. simulate deletions).
     pub fn set_history(&self, chat: ChatId, messages: Vec<Message>) {
         self.shared.with(|s| {
+            s.high_water.entry(chat).or_default().cover(&messages);
             s.history.insert(chat, messages);
         });
     }
@@ -774,7 +849,7 @@ impl FakeClient {
             None => {}
             Some(Fault::Delay(d) | Fault::Queued(d)) => tokio::time::sleep(d).await,
             Some(Fault::Error(e)) => return Err(e),
-            Some(Fault::Auth(_)) => return Err(BackendError::Rejected),
+            Some(Fault::Auth(_)) => return Err(BackendError::Rejected(RejectReason::Other)),
             Some(Fault::Hang | Fault::CompleteThenHang) => std::future::pending().await,
             Some(Fault::Panic) => injected_panic("call"),
         }
@@ -784,27 +859,76 @@ impl FakeClient {
             Err(BackendError::Unauthorized)
         }
     }
+
+    async fn after_latency(&self, e: BackendError) -> BackendError {
+        if !self.shared.latency.is_zero() {
+            tokio::time::sleep(self.shared.latency).await;
+        }
+        e
+    }
+
+    /// A read-only call answered with the server state at call time: faults
+    /// and leads apply as in [`Self::enter`], but latency and a `Delay` run
+    /// after the answer is taken (plan section 11, crossing responses).
+    async fn snapshot<T>(
+        &self,
+        op: Op,
+        answer: impl FnOnce(&State) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let fault = self.take_fault(op);
+        let lead = self
+            .shared
+            .with(|s| s.leads.get_mut(&op).and_then(VecDeque::pop_front));
+        if let Some(wait) = lead {
+            tokio::time::sleep(wait).await;
+        }
+        let _guard = InFlight::new(&self.shared);
+        let delay = match fault {
+            None => Duration::ZERO,
+            Some(Fault::Delay(d) | Fault::Queued(d)) => d,
+            Some(Fault::Error(e)) => return Err(self.after_latency(e).await),
+            Some(Fault::Auth(_)) => {
+                return Err(self
+                    .after_latency(BackendError::Rejected(RejectReason::Other))
+                    .await);
+            }
+            Some(Fault::Hang | Fault::CompleteThenHang) => std::future::pending().await,
+            Some(Fault::Panic) => injected_panic("call"),
+        };
+        let result = self.shared.with(|s| {
+            if s.auth.authorized {
+                answer(s)
+            } else {
+                Err(BackendError::Unauthorized)
+            }
+        });
+        let wait = self.shared.latency + delay;
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        result
+    }
 }
 
-fn page(all: &[Message], query: HistoryQuery, limit: usize) -> HistoryPage {
-    let (selected, has_more): (Vec<Message>, bool) = match query {
+fn page(all: &[&Message], query: HistoryQuery, limit: usize) -> HistoryPage {
+    let (selected, has_more): (Vec<&Message>, bool) = match query {
         HistoryQuery::Tail => {
             let start = all.len().saturating_sub(limit);
-            (all.iter().skip(start).cloned().collect(), start > 0)
+            (all.iter().skip(start).copied().collect(), start > 0)
         }
         HistoryQuery::Before(id) => {
-            let below: Vec<&Message> = all.iter().filter(|m| m.id < id).collect();
+            let below: Vec<&Message> = all.iter().copied().filter(|m| m.id < id).collect();
             let start = below.len().saturating_sub(limit);
-            (below.into_iter().skip(start).cloned().collect(), start > 0)
+            (below.into_iter().skip(start).collect(), start > 0)
         }
         HistoryQuery::After(id) => {
-            let above: Vec<&Message> = all.iter().filter(|m| m.id > id).collect();
+            let above: Vec<&Message> = all.iter().copied().filter(|m| m.id > id).collect();
             let more = above.len() > limit;
-            (above.into_iter().take(limit).cloned().collect(), more)
+            (above.into_iter().take(limit).collect(), more)
         }
     };
     HistoryPage {
-        messages: selected,
+        messages: selected.into_iter().cloned().collect(),
         has_more,
     }
 }
@@ -870,8 +994,13 @@ impl Client for FakeClient {
         let start = cursor.map_or(0, |c| to_usize(c.index));
         let limit = to_usize(limit);
         Ok(self.shared.with(|s| {
-            let chats: Vec<ChatSummary> =
-                s.dialogs.iter().skip(start).take(limit).cloned().collect();
+            let chats: Vec<ChatSummary> = s
+                .dialogs
+                .iter()
+                .skip(start)
+                .take(limit)
+                .map(|c| topics::current_summary(s, c))
+                .collect();
             let end = start + chats.len();
             let next = (end < s.dialogs.len()).then(|| DialogsCursor {
                 offset_date: 0,
@@ -890,14 +1019,9 @@ impl Client for FakeClient {
         limit: u32,
     ) -> Result<HistoryPage, BackendError> {
         let _g = self.enter(Op::History).await?;
-        Ok(self.shared.with(|s| {
-            let all = s
-                .history
-                .get(&thread.chat)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            page(all, query, to_usize(limit))
-        }))
+        Ok(self
+            .shared
+            .with(|s| page(&topics::thread_history(s, thread), query, to_usize(limit))))
     }
 
     async fn send_text(
@@ -906,9 +1030,8 @@ impl Client for FakeClient {
         text: String,
         random_id: i64,
     ) -> Result<MsgId, BackendError> {
-        let chat = thread.chat;
         self.shared
-            .with(|s| push_capped(&mut s.attempted, (chat, random_id)));
+            .with(|s| push_capped(&mut s.attempted, (thread, random_id)));
         let fault = self.take_fault(Op::Send);
         let lost = matches!(fault, Some(Fault::CompleteThenHang));
         let _g = self.enter_with(fault.filter(|_| !lost)).await?;
@@ -918,21 +1041,48 @@ impl Client for FakeClient {
         if self.shared.with(|s| s.accepted.contains_key(&random_id)) {
             return Err(BackendError::SentUnconfirmed);
         }
+        self.shared.with(|s| topics::check_send(s, thread))?;
         if lost {
             // Accepted, but the answer is lost: the server holds the message.
-            self.accept(chat, &text, random_id);
+            self.accept(thread, &text, random_id)?;
             return std::future::pending().await;
         }
         // The real server also echoes own sends as updates; the fake does not, so tests
         // control update ordering explicitly with `FakeHandle::push_update`.
-        Ok(self.accept(chat, &text, random_id))
+        self.accept(thread, &text, random_id)
     }
 
     async fn read_history(&self, thread: ThreadKey, max_id: MsgId) -> Result<(), BackendError> {
         let _g = self.enter(Op::Read).await?;
-        self.shared
-            .with(|s| push_capped(&mut s.read, (thread.chat, max_id)));
-        Ok(())
+        self.shared.with(|s| {
+            topics::mark_read(s, thread, max_id)?;
+            push_capped(&mut s.read, (thread, max_id));
+            Ok(())
+        })
+    }
+
+    async fn topics(
+        &self,
+        chat: ChatId,
+        cursor: Option<TopicsCursor>,
+        limit: u32,
+    ) -> Result<TopicsPage, BackendError> {
+        self.snapshot(Op::Topics, |s| topics::page(s, chat, cursor, limit))
+            .await
+    }
+
+    async fn topics_by_id(
+        &self,
+        chat: ChatId,
+        ids: &[TopicId],
+    ) -> Result<TopicsById, BackendError> {
+        self.snapshot(Op::TopicsById, |s| topics::by_id(s, chat, ids))
+            .await
+    }
+
+    async fn peer_dialogs(&self, chats: &[ChatId]) -> Result<Vec<ChatSummary>, BackendError> {
+        self.snapshot(Op::PeerDialogs, |s| topics::peer_dialogs(s, chats))
+            .await
     }
 
     fn retain_peers(&self, required: &[ChatId]) {
@@ -942,18 +1092,17 @@ impl Client for FakeClient {
 
 impl FakeClient {
     /// The server accepts a send: one new message, remembered by `random_id`.
-    fn accept(&self, chat: ChatId, text: &str, random_id: i64) -> MsgId {
+    fn accept(&self, thread: ThreadKey, text: &str, random_id: i64) -> Result<MsgId, BackendError> {
         self.shared.with(|s| {
-            push_capped(&mut s.sent, (chat, random_id));
-            let history = s.history.entry(chat).or_default();
-            let id = MsgId(history.last().map_or(1, |m| m.id.0.saturating_add(1)));
-            let mut msg = text_message(chat, id.0, text);
+            let mut msg = topics::next_message(s, topics::raw_thread(thread), text)?;
             msg.outgoing = true;
-            history.push(msg);
+            let id = msg.id;
+            push_capped(&mut s.sent, (thread, random_id));
+            s.history.entry(thread.chat).or_default().push(msg);
             if s.accepted.len() < MAX_LOG {
-                s.accepted.insert(random_id, (chat, id));
+                s.accepted.insert(random_id, (thread.chat, id));
             }
-            id
+            Ok(id)
         })
     }
 }

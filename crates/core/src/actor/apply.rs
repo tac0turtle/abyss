@@ -17,7 +17,7 @@ use crate::store::{Bump, Change, Last, Rest, Unread, ViewGen, Window};
 
 pub(super) fn user_error(e: CallError) -> UserError {
     match e {
-        CallError::Backend(BackendError::Rejected | BackendError::Unauthorized) => {
+        CallError::Backend(BackendError::Rejected(_) | BackendError::Unauthorized) => {
             UserError::Rejected
         }
         CallError::Backend(BackendError::FloodWait { seconds }) => UserError::FloodWait { seconds },
@@ -701,12 +701,24 @@ impl<B: Backend> Actor<B> {
                     self.emit(Event::Deleted { chat, ids }).await;
                 }
             }
-            Update::ReadInbox { chat, still_unread } => {
+            Update::ReadInbox {
+                chat,
+                topic: None,
+                still_unread,
+            } => {
                 if let Some(summary) = self.dialogs.set_unread(chat, still_unread).cloned() {
                     self.emit(Event::ChatBumped(summary)).await;
                 }
             }
             Update::MessageId { random_id, id } => self.on_message_id(random_id, id).await,
+            // Topic reads and topic metadata are triggers for the topic lists,
+            // the forum badge and the kind checks (plan tasks 8 and 9); until
+            // those exist nothing shows topics, so there is nothing to update.
+            Update::ReadInbox { topic: Some(_), .. }
+            | Update::ReadTopicMax { .. }
+            | Update::TopicEdited { .. }
+            | Update::TopicsPinned { .. }
+            | Update::ChatChanged { .. } => {}
         }
     }
 

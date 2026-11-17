@@ -27,7 +27,11 @@ pub use seed::{MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 
 use crate::api::{CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
 pub use crate::credentials::CredentialSlot;
-use crate::model::{ChatId, ChatSummary, Message, MsgId, ThreadKey};
+use crate::model::{
+    ChatId, ChatSummary, Message, MsgId, ThreadKey, Topic, TopicId, TopicOrder, TopicSnapshot,
+    Visibility,
+};
+use crate::store::PostClosed;
 
 /// Opaque position in the dialogs list, produced by the backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +48,65 @@ pub struct DialogsPage {
     pub chats: Vec<ChatSummary>,
     /// `None` when this was the last page.
     pub next: Option<DialogsCursor>,
+}
+
+/// Opaque position in a forum's topic list, built from the last topic of a
+/// page by the order *that page* reported (plan section 5). Core discards a
+/// later page whose order differs from its cursor's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopicsCursor {
+    pub(crate) order: TopicOrder,
+    pub(crate) offset_date: i32,
+    pub(crate) offset_id: i32,
+    pub(crate) offset_topic: i32,
+    /// Index for backends that page by position (the fake).
+    pub(crate) index: u32,
+}
+
+impl TopicsCursor {
+    /// The position after `last`, the final topic of a page in `order`:
+    /// - [`TopicOrder::LastActivity`]: the top message's date and id;
+    /// - [`TopicOrder::Created`]: the creation date (`forumTopic.date`) and
+    ///   the top message's id.
+    pub(crate) fn after(order: TopicOrder, last: &Topic, index: u32) -> Self {
+        let date = match order {
+            TopicOrder::LastActivity => last.last_date,
+            TopicOrder::Created => last.created,
+        };
+        Self {
+            order,
+            offset_date: i32::try_from(date.clamp(0, i64::from(i32::MAX))).unwrap_or(i32::MAX),
+            offset_id: last.last_id.map_or(0, |id| id.0),
+            offset_topic: last.id.get(),
+            index,
+        }
+    }
+
+    /// The order of the page this cursor continues.
+    pub fn order(&self) -> TopicOrder {
+        self.order
+    }
+}
+
+/// One page of a forum's topics, in the order the server reported.
+#[derive(Debug)]
+pub struct TopicsPage {
+    pub order: TopicOrder,
+    pub topics: Vec<TopicSnapshot>,
+    /// `None` when this was the last page.
+    pub next: Option<TopicsCursor>,
+    /// Whether the user may post in closed topics (`creator ||
+    /// admin_rights.manage_topics`).
+    pub post_closed: PostClosed,
+}
+
+/// Topics fetched by id.
+#[derive(Debug)]
+pub struct TopicsById {
+    pub found: Vec<TopicSnapshot>,
+    /// Requested ids the server reported deleted (`forumTopicDeleted`).
+    pub deleted: Vec<TopicId>,
+    pub post_closed: PostClosed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,10 +136,38 @@ pub enum Update {
         chat: Option<ChatId>,
         ids: Vec<MsgId>,
     },
-    /// Read on another device.
+    /// Read on another device: the whole chat (`topic: None`), or one topic
+    /// of a forum.
     ReadInbox {
         chat: ChatId,
+        topic: Option<TopicId>,
         still_unread: u32,
+    },
+    /// A topic read on another device, without a count
+    /// (`updateReadChannelDiscussionInbox`).
+    ReadTopicMax {
+        chat: ChatId,
+        topic: TopicId,
+        max_id: MsgId,
+    },
+    /// `updateEditForumTopic`. `None` leaves a field unchanged. The title is
+    /// sanitized; `visibility` comes from `hidden` (General only).
+    TopicEdited {
+        chat: ChatId,
+        topic: TopicId,
+        title: Option<String>,
+        closed: Option<bool>,
+        visibility: Option<Visibility>,
+    },
+    /// `updatePinnedForumTopic(s)`: the pinned topics changed; core refetches
+    /// the first page.
+    TopicsPinned {
+        chat: ChatId,
+    },
+    /// `updateChannel`: something about the chat changed, possibly the forum
+    /// flag; core re-checks its kind.
+    ChatChanged {
+        chat: ChatId,
     },
     /// `updateMessageID`: the server assigned `id` to the send carrying
     /// `random_id` (plan section 9). Correlated with the pending-send table.
@@ -86,10 +177,24 @@ pub enum Update {
     },
 }
 
+/// Why the server rejected a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectReason {
+    /// Any rejection core does not treat specially.
+    Other,
+    /// `TOPIC_CLOSED`: a send into a closed topic without the right to post there.
+    TopicClosed,
+    /// `TOPIC_DELETED`: the topic no longer exists.
+    TopicDeleted,
+    /// `CHANNEL_FORUM_MISSING`: a topics call for a chat that is not a forum
+    /// (a forum-flag trigger, plan section 6.6).
+    NotForum,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendError {
     /// The server rejected the request; retrying with the same input won't help.
-    Rejected,
+    Rejected(RejectReason),
     FloodWait {
         seconds: u32,
     },
@@ -306,6 +411,34 @@ pub trait Client: Send + Sync + 'static {
         thread: ThreadKey,
         max_id: MsgId,
     ) -> impl Future<Output = Result<(), BackendError>> + Send;
+
+    /// One page of a forum's topics (`messages.getForumTopics`): the first
+    /// page for `cursor: None`. Hidden topics are included, with their
+    /// [`Visibility`]. A chat that is not a forum is
+    /// `Rejected(RejectReason::NotForum)`.
+    fn topics(
+        &self,
+        chat: ChatId,
+        cursor: Option<TopicsCursor>,
+        limit: u32,
+    ) -> impl Future<Output = Result<TopicsPage, BackendError>> + Send;
+
+    /// The given topics of a forum (`messages.getForumTopicsByID`), at most
+    /// [`crate::store::MAX_TOPICS_BY_ID`] ids. Every requested id is either found or deleted.
+    fn topics_by_id(
+        &self,
+        chat: ChatId,
+        ids: &[TopicId],
+    ) -> impl Future<Output = Result<TopicsById, BackendError>> + Send;
+
+    /// The current summaries of the given chats (`messages.getPeerDialogs`),
+    /// at most [`crate::store::MAX_PEER_DIALOGS`], wherever they sit in the dialog list.
+    /// The authoritative refresh of a chat's kind and of a forum's badge.
+    /// Chats the server doesn't return (and broadcasts) are left out.
+    fn peer_dialogs(
+        &self,
+        chats: &[ChatId],
+    ) -> impl Future<Output = Result<Vec<ChatSummary>, BackendError>> + Send;
 
     /// The chats whose peer data (access hashes) core still needs: pending
     /// sends first, then open windows, then the retained dialogs in list

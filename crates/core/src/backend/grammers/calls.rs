@@ -16,7 +16,9 @@ use super::errors::{backend_error, kind};
 use super::invoke::{Invoke, RetryClass, call};
 use super::map::{self, Directory};
 use super::pins::Pins;
-use crate::backend::{BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery};
+use crate::backend::{
+    BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, RejectReason,
+};
 use crate::model::{ChatId, MsgId};
 use crate::session::{AbyssSession, PinRequest, Pinned};
 
@@ -35,7 +37,7 @@ fn fail(e: &InvocationError) -> BackendError {
 /// without any of its content.
 fn oversized() -> BackendError {
     tracing::warn!("oversized telegram response rejected");
-    BackendError::Rejected
+    BackendError::Rejected(RejectReason::Other)
 }
 
 /// Where a later dialogs page starts.
@@ -235,7 +237,7 @@ impl<I: Invoke> Calls<I> {
     /// cannot be addressed: that is a definite rejection.
     async fn resolve(&self, chat: ChatId) -> Result<tl::enums::InputPeer, BackendError> {
         let info = self.info(chat).await;
-        map::input_peer(chat, info.as_ref()).ok_or(BackendError::Rejected)
+        map::input_peer(chat, info.as_ref()).ok_or(BackendError::Rejected(RejectReason::Other))
     }
 
     /// Caches every addressable peer of a response (grammers' `auto_cache_peers`
@@ -263,7 +265,8 @@ impl<I: Invoke> Calls<I> {
         chat: ChatId,
     ) -> Result<(tl::enums::InputPeer, InFlight<'_, I>), BackendError> {
         let info = self.info(chat).await;
-        let peer = map::input_peer(chat, info.as_ref()).ok_or(BackendError::Rejected)?;
+        let peer = map::input_peer(chat, info.as_ref())
+            .ok_or(BackendError::Rejected(RejectReason::Other))?;
         Ok((peer, self.track(chat, info)))
     }
 

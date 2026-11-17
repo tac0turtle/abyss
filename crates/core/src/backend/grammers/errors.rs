@@ -7,7 +7,7 @@
 use grammers_client::InvocationError;
 use grammers_client::sender::RpcError;
 
-use crate::backend::{BackendError, StreamError};
+use crate::backend::{BackendError, RejectReason, StreamError};
 
 /// Flood waits without a value are treated as this many seconds.
 const DEFAULT_FLOOD_SECONDS: u32 = 1;
@@ -74,7 +74,7 @@ pub(crate) fn backend_error(kind: ErrorKind) -> BackendError {
         ErrorKind::Migrated => BackendError::Migrated,
         ErrorKind::Unauthorized => BackendError::Unauthorized,
         ErrorKind::DuplicateRandomId => BackendError::SentUnconfirmed,
-        ErrorKind::Rejected => BackendError::Rejected,
+        ErrorKind::Rejected => BackendError::Rejected(RejectReason::Other),
         // Unknown outcome: core may retry (sends with the same `random_id`).
         ErrorKind::Io | ErrorKind::Dropped | ErrorKind::Server | ErrorKind::Local => {
             BackendError::Transient

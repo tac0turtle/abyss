@@ -3,11 +3,15 @@
 //! every kind, and one 2,000-message chat with emoji, RTL, 4,096-character
 //! text, every entity kind, every media kind, service and unsupported
 //! messages, edits, outgoing messages, senders and over-budget formatting.
+//! Every forum (`n % 10 == 2`) serves General plus 60 topics, more than one
+//! topics page, with pinned, closed and unread topics; chat 12's list is in
+//! creation order, the others by activity (Stage 2 task 3; the app shows
+//! topics from task 10).
 
 use abyss_core::backend::fake::FakeScript;
 use abyss_core::model::{
     Body, ChatId, ChatKind, ChatSummary, MediaKind, Message, MsgId, PeerKind, Preview, Sender,
-    ThreadKey,
+    ThreadKey, TopicOrder,
 };
 use abyss_core::rich_text::{EntityKind, MAX_ENTITIES, RawEntity, RichText};
 use abyss_core::sanitize::display_name;
@@ -15,6 +19,8 @@ use abyss_core::sanitize::display_name;
 const CHATS: i64 = 1000;
 const SHOWCASE_MESSAGES: i32 = 2000;
 const MESSAGES: i32 = 30;
+/// The demo forum whose topics are listed by creation date.
+const CREATION_ORDERED_FORUM: i64 = 12;
 
 fn chat_id(n: i64) -> ChatId {
     let kind = match n % 5 {
@@ -209,7 +215,17 @@ pub(crate) fn script(now: i64) -> FakeScript {
     for n in 1..=CHATS {
         let summary = summary(n, now);
         let id = summary.id;
+        let forum = matches!(summary.kind, ChatKind::Supergroup { forum: true, .. });
         script.dialogs.push(summary);
+        if forum {
+            let order = if n == CREATION_ORDERED_FORUM {
+                TopicOrder::Created
+            } else {
+                TopicOrder::LastActivity
+            };
+            script.add_demo_forum(id, now, order);
+            continue;
+        }
         let history = if n == 1 {
             showcase(id, now)
         } else {
@@ -238,5 +254,31 @@ mod tests {
             _ => None,
         });
         assert!(long.max().unwrap() >= 4096);
+    }
+
+    #[test]
+    fn demo_forums_have_paging_sized_topic_lists() {
+        let script = script(1_794_837_900);
+        let forums: Vec<ChatId> = script
+            .dialogs
+            .iter()
+            .filter(|c| matches!(c.kind, ChatKind::Supergroup { forum: true, .. }))
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(forums.len(), 100);
+        for chat in &forums {
+            let topics = &script.topics[chat];
+            assert_eq!(topics.len(), 61, "General plus 60 topics");
+            assert!(topics.len() > usize::try_from(abyss_core::store::TOPICS_PAGE).unwrap());
+            assert_eq!(topics.iter().filter(|t| t.topic.pinned).count(), 2);
+            assert_eq!(topics.iter().filter(|t| t.topic.closed).count(), 1);
+            assert!(topics.iter().all(|t| t.topic.is_valid()));
+            assert!(script.history[chat].iter().all(Message::is_valid));
+        }
+        assert_eq!(
+            script.topic_order[&chat_id(CREATION_ORDERED_FORUM)],
+            TopicOrder::Created
+        );
+        assert_eq!(script.topic_order[&chat_id(2)], TopicOrder::LastActivity);
     }
 }

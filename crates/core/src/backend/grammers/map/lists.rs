@@ -326,10 +326,12 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
         // A per-topic read (`top_msg_id`) does not change the chat's count.
         U::ReadHistoryInbox(u) if u.top_msg_id.is_none() => Some(Update::ReadInbox {
             chat: chat_id(&u.peer)?,
+            topic: None,
             still_unread: count(u.still_unread_count),
         }),
         U::ReadChannelInbox(u) => Some(Update::ReadInbox {
             chat: channel_chat(u.channel_id)?,
+            topic: None,
             still_unread: count(u.still_unread_count),
         }),
         // Correlated with the pending-send table by core (plan section 9).

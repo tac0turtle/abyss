@@ -14,7 +14,8 @@ use crate::backend::fake::{
     BuildFault, FakeBackend, FakeScript, Fault, Op, QuitBehavior, text_message,
 };
 use crate::backend::{
-    BackendError, DialogsPage, HistoryPage, HistoryQuery, SessionSeed, StreamError, Update,
+    BackendError, DialogsPage, HistoryPage, HistoryQuery, RejectReason, SessionSeed, StreamError,
+    Update,
 };
 use crate::events;
 use crate::model::{LocalId, Message, MsgId, ThreadKey};
@@ -612,7 +613,7 @@ async fn pending_send_replays_with_the_same_random_id_across_a_rebuild() {
     ));
     let attempts = h.fake.send_attempts();
     assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0], attempts[1], "same chat and random_id");
+    assert_eq!(attempts[0], attempts[1], "same thread and random_id");
     assert_eq!(h.fake.sent(), vec![attempts[0]]);
     assert_eq!(h.fake.builds(), 2);
     h.stop().await;
@@ -622,8 +623,10 @@ async fn pending_send_replays_with_the_same_random_id_across_a_rebuild() {
 async fn discard_removes_failed_sends_but_not_in_flight_ones() {
     let mut h = harness(FakeScript::demo(1, 1), None).await;
     h.online().await;
-    h.fake
-        .inject(Op::Send, Fault::Error(BackendError::Rejected));
+    h.fake.inject(
+        Op::Send,
+        Fault::Error(BackendError::Rejected(RejectReason::Other)),
+    );
     h.send(Command::SendText {
         thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
@@ -670,6 +673,7 @@ async fn shutdown_completes_while_the_event_queue_is_full() {
             let still_unread = u32::try_from(i).unwrap();
             fake.push_update(Update::ReadInbox {
                 chat: chat(1),
+                topic: None,
                 still_unread,
             })
             .await;

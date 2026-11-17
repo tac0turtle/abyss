@@ -4,7 +4,7 @@ use grammers_client::InvocationError;
 use grammers_client::sender::RpcError;
 
 use crate::backend::grammers::errors::{backend_error, kind, loggable_name, stream_error};
-use crate::backend::{BackendError, StreamError};
+use crate::backend::{BackendError, RejectReason, StreamError};
 
 fn rpc(code: i32, name: &str, value: Option<u32>) -> InvocationError {
     InvocationError::Rpc(RpcError {
@@ -65,9 +65,27 @@ fn rpc_error_table() {
             B::SentUnconfirmed,
             S::Fatal,
         ),
-        (400, "PEER_ID_INVALID", None, B::Rejected, S::Transient),
-        (403, "CHAT_WRITE_FORBIDDEN", None, B::Rejected, S::Transient),
-        (400, "MESSAGE_TOO_LONG", None, B::Rejected, S::Transient),
+        (
+            400,
+            "PEER_ID_INVALID",
+            None,
+            B::Rejected(RejectReason::Other),
+            S::Transient,
+        ),
+        (
+            403,
+            "CHAT_WRITE_FORBIDDEN",
+            None,
+            B::Rejected(RejectReason::Other),
+            S::Transient,
+        ),
+        (
+            400,
+            "MESSAGE_TOO_LONG",
+            None,
+            B::Rejected(RejectReason::Other),
+            S::Transient,
+        ),
     ];
     for &(code, name, value, backend, stream) in table {
         check(&rpc(code, name, value), backend, stream);

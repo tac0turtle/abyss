@@ -30,8 +30,8 @@ use crate::api::{
     ApiCredentials, CodeDelivery, CredentialError, MAX_DELIVERY_TEXT, NextDelivery, PasswordBuf,
 };
 use crate::backend::{
-    Account, AuthError, BackendError, CheckPassword, CodeRequest, PasswordChallenge, SentCode,
-    SignIn,
+    Account, AuthError, BackendError, CheckPassword, CodeRequest, PasswordChallenge, RejectReason,
+    SentCode, SignIn,
 };
 use crate::session::AbyssSession;
 
@@ -349,12 +349,14 @@ pub(crate) async fn resend_code<I: Invoke>(
         call(inv, RetryClass::Never, &request)
             .await
             .map_err(|e| match sign_in_failure(&e) {
-                // An expired code request: ask for a new code from the phone step.
-                SignInFailure::InvalidCode => AuthError::Backend(BackendError::Rejected),
-                SignInFailure::Other(e) => e,
-                SignInFailure::PasswordNeeded | SignInFailure::SignUpRequired => {
-                    AuthError::Backend(BackendError::Rejected)
+                // `InvalidCode` is an expired code request: ask for a new
+                // code from the phone step.
+                SignInFailure::InvalidCode
+                | SignInFailure::PasswordNeeded
+                | SignInFailure::SignUpRequired => {
+                    AuthError::Backend(BackendError::Rejected(RejectReason::Other))
                 }
+                SignInFailure::Other(e) => e,
             })?;
     let mapped = map_sent_code(sent)?;
     Ok(CodeRequest {
@@ -446,10 +448,13 @@ async fn srp_check<I: Invoke>(
         info = password_challenge(inv).await?.token.0;
     }
     if !usable(&info) {
-        return Err(AuthError::Backend(BackendError::Rejected));
+        return Err(AuthError::Backend(BackendError::Rejected(
+            RejectReason::Other,
+        )));
     }
-    let (algo, srp_b, srp_id) =
-        srp_params(&info).ok_or(AuthError::Backend(BackendError::Rejected))?;
+    let (algo, srp_b, srp_id) = srp_params(&info).ok_or(AuthError::Backend(
+        BackendError::Rejected(RejectReason::Other),
+    ))?;
     let (m1, g_a) = calculate_2fa(
         &algo.salt1,
         &algo.salt2,
@@ -484,9 +489,9 @@ pub(crate) async fn check_password<I: Invoke>(
                 .await
                 .map(CheckPassword::Done)
         }
-        Ok(tl::enums::auth::Authorization::SignUpRequired(_)) => {
-            Err(AuthError::Backend(BackendError::Rejected))
-        }
+        Ok(tl::enums::auth::Authorization::SignUpRequired(_)) => Err(AuthError::Backend(
+            BackendError::Rejected(RejectReason::Other),
+        )),
         Err(e) if e.is("PASSWORD_HASH_INVALID") => password_challenge(inv)
             .await
             .map(CheckPassword::InvalidPassword),
@@ -550,7 +555,9 @@ async fn complete_login<I: Invoke>(
     let state =
         login_state(call(inv, RetryClass::Never, &tl::functions::updates::GetState {}).await)?;
     let tl::enums::User::User(user) = auth.user else {
-        return Err(AuthError::Backend(BackendError::Rejected));
+        return Err(AuthError::Backend(BackendError::Rejected(
+            RejectReason::Other,
+        )));
     };
     cache_self(session, &user).await?;
     if let Some(tl::enums::updates::State::State(s)) = state {
@@ -581,7 +588,7 @@ pub(crate) async fn fetch_self<I: Invoke>(
         .await
         .map_err(|e| backend_error(kind(&e)))?;
     let Some(tl::enums::User::User(user)) = users.into_iter().next() else {
-        return Err(BackendError::Rejected);
+        return Err(BackendError::Rejected(RejectReason::Other));
     };
     cache_self(session, &user).await?;
     Ok(Account {

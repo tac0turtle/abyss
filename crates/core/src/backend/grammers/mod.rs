@@ -33,6 +33,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -47,10 +48,11 @@ pub use stream::GrammersUpdates;
 use super::{
     Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest, CredentialSlot,
     DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl,
-    PasswordChallenge, Seed, SessionSeed, SessionSnapshot, SignIn,
+    PasswordChallenge, RejectReason, Seed, SessionSeed, SessionSnapshot, SignIn, TopicsById,
+    TopicsCursor, TopicsPage,
 };
 use crate::api::{ApiCredentials, PasswordBuf};
-use crate::model::{ChatId, MsgId, ThreadKey};
+use crate::model::{ChatId, ChatSummary, MsgId, ThreadKey, TopicId};
 use crate::session::{AbyssSession, PersistHandle};
 use calls::Calls;
 
@@ -292,9 +294,47 @@ impl Client for GrammersClient {
         self.calls.read_history(thread.chat, max_id).await
     }
 
+    fn topics(
+        &self,
+        chat: ChatId,
+        cursor: Option<TopicsCursor>,
+        limit: u32,
+    ) -> impl Future<Output = Result<TopicsPage, BackendError>> + Send {
+        let _ = (chat, cursor, limit);
+        std::future::ready(Err(not_yet_implemented("topics")))
+    }
+
+    fn topics_by_id(
+        &self,
+        chat: ChatId,
+        ids: &[TopicId],
+    ) -> impl Future<Output = Result<TopicsById, BackendError>> + Send {
+        let _ = (chat, ids);
+        std::future::ready(Err(not_yet_implemented("topics_by_id")))
+    }
+
+    fn peer_dialogs(
+        &self,
+        chats: &[ChatId],
+    ) -> impl Future<Output = Result<Vec<ChatSummary>, BackendError>> + Send {
+        let _ = chats;
+        std::future::ready(Err(not_yet_implemented("peer_dialogs")))
+    }
+
     fn retain_peers(&self, required: &[ChatId]) {
         self.calls.retain(required);
     }
+}
+
+/// The forum calls are not implemented over grammers yet (Stage 2 task 4).
+/// Nothing in core calls them before then; a call is a definite failure,
+/// never a panic.
+fn not_yet_implemented(call: &'static str) -> BackendError {
+    tracing::warn!(
+        call,
+        "forum call not yet implemented in the grammers backend"
+    );
+    BackendError::Rejected(RejectReason::Other)
 }
 
 /// Retirement hooks of one grammers instance.

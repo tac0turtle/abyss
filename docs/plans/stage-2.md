@@ -314,7 +314,8 @@ enum Update {
   - `set_topic_order(chat, order)`;
   - `set_forum(chat, bool)` (emits `ChatChanged`);
   - `drop_next_update()`, which models a lost non-PTS update.
-- `FakeScript::demo` gives every demo forum (`kind_of` already marks `n % 10 == 2`) a General topic plus 60 topics. One is closed, two are pinned, and one forum uses creation order.
+- The `cargo dev` data (`crates/app/src/chat/demo.rs`, whose `kind_of` already marks `n % 10 == 2` as forums) gives every demo forum a General topic plus 60 topics through `FakeScript::add_demo_forum` (`fake::demo_forum`). One is closed, two are pinned, and one forum (chat 12) uses creation order. Core's `FakeScript::demo` is unchanged and has no forums; tests opt in with `add_demo_forum`.
+- The fake allocates message ids (and so topic ids) above a per-chat high-water mark that deletions never lower, so a deleted topic's id is never reused.
 - The contract suite (`backend/contract.rs`) gains topic and peer-dialog cases that `GrammersBackend` must pass under `#[ignore]` once credentials exist.
 
 ## 6. Core
@@ -1065,3 +1066,10 @@ Follow-ups (not Stage 2 tasks):
 | 2 (ready after fixes) | P2: a refresh demoted omitted topics with newer live activity; replay divergence hidden by a `Reset` fallback. P3: budget was an estimate. Flaky closed-window test | Omitted topics keep earned rank; shown-only placement, `debug_assert` on replay, deliberate `ServerOrder` reset only for later pages; "retained payload capacity" budget with 17% margin, `MAX_TOPIC_LISTS` 6; command-ordering barrier in the test |
 | 3 (ready after fixes) | P2: omitted topics with a newer applied snapshot were demoted | `keep_rank` filters on `activity.judge(seq) != Apply`; cap-case regression |
 | 4 | Pass | — |
+
+### Task 3: backend trait and fake (2 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 (ready after fixes) | P2: the fake reused a deleted topic's id. P3: the delayed `peer_dialogs` test posted into an already-unread topic | Per-chat id high-water mark, never lowered, `checked_add` allocation; delayed test posts into a read topic (21 delayed, 22 next) |
+| 2 | Pass | — |

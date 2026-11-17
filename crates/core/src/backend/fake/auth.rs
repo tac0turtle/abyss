@@ -11,7 +11,8 @@ use std::time::Duration;
 use super::{
     Account, AuthError, BackendError, CheckPassword, CodeDelivery, CodeRequest,
     FAKE_INVALID_API_ID, FAKE_PUBLISHED_API_ID, FakeClient, FakeHandle, FakeLogin, Fault,
-    NextDelivery, Op, PasswordBuf, PasswordChallenge, SentCode, SignIn, injected_panic,
+    NextDelivery, Op, PasswordBuf, PasswordChallenge, RejectReason, SentCode, SignIn,
+    injected_panic,
 };
 use crate::api::CredentialError;
 
@@ -185,7 +186,7 @@ enum Answer {
 fn to_backend(e: AuthError) -> BackendError {
     match e {
         AuthError::Backend(e) => e,
-        _ => BackendError::Rejected,
+        _ => BackendError::Rejected(RejectReason::Other),
     }
 }
 
@@ -230,7 +231,7 @@ impl FakeClient {
         session
             .cache_peer(info)
             .await
-            .map_err(|_| AuthError::Backend(BackendError::Rejected))
+            .map_err(|_| AuthError::Backend(BackendError::Rejected(RejectReason::Other)))
     }
 
     async fn answer<T>(answer: Answer, value: T) -> T {
@@ -315,7 +316,9 @@ impl FakeClient {
                 .then(|| (s.auth.send_code(), s.auth.login.sent.clone()))
         });
         // A stale or expired code request: Telegram's PHONE_CODE_EXPIRED.
-        let (id, sent) = resent.ok_or(AuthError::Backend(BackendError::Rejected))?;
+        let (id, sent) = resent.ok_or(AuthError::Backend(BackendError::Rejected(
+            RejectReason::Other,
+        )))?;
         let delivery = delivery_of(sent.and_then(|s| s.next));
 
         let request = CodeRequest {
@@ -369,7 +372,11 @@ impl FakeClient {
             .await;
 
         let out = match verdict {
-            PasswordVerdict::Consumed => return Err(AuthError::Backend(BackendError::Rejected)),
+            PasswordVerdict::Consumed => {
+                return Err(AuthError::Backend(BackendError::Rejected(
+                    RejectReason::Other,
+                )));
+            }
             PasswordVerdict::Invalid(id, hint) => {
                 CheckPassword::InvalidPassword(PasswordChallenge {
                     token: FakePasswordToken(id),

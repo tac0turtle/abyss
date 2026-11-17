@@ -82,6 +82,7 @@ fn read(still_unread: u32) -> Update {
             kind: PeerKind::User,
             id: 7,
         },
+        topic: None,
         still_unread,
     }
 }

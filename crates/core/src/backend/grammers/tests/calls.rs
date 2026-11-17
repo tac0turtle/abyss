@@ -16,7 +16,7 @@ use super::{dialog, message, peer_user, user, users};
 use crate::backend::grammers::calls::{Calls, history_offsets};
 use crate::backend::grammers::invoke::Invoke;
 use crate::backend::grammers::{GrammersControl, connection_params};
-use crate::backend::{BackendError, HistoryQuery, InstanceControl, SessionSnapshot};
+use crate::backend::{BackendError, HistoryQuery, InstanceControl, RejectReason, SessionSnapshot};
 use crate::model::{ChatId, MsgId, PeerKind};
 use crate::session::{AbyssSession, MAX_PINNED_PEERS};
 
@@ -264,14 +264,14 @@ async fn unknown_peers_are_rejected_without_a_request() {
     };
     assert_eq!(
         calls.send_text(stranger, "x".into(), 1).await,
-        Err(BackendError::Rejected)
+        Err(BackendError::Rejected(RejectReason::Other))
     );
     assert_eq!(
         calls
             .history(stranger, HistoryQuery::Tail, 1)
             .await
             .unwrap_err(),
-        BackendError::Rejected
+        BackendError::Rejected(RejectReason::Other)
     );
     assert!(mock.requests().is_empty());
 }
@@ -582,7 +582,7 @@ async fn oversized_responses_are_backend_errors() {
             .history(ANN, HistoryQuery::Tail, 10)
             .await
             .unwrap_err(),
-        BackendError::Rejected
+        BackendError::Rejected(RejectReason::Other)
     );
 }
 

@@ -62,7 +62,7 @@ use crate::api::{
 };
 use crate::backend::{
     Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest,
-    PasswordChallenge, SentCode, SignIn,
+    PasswordChallenge, RejectReason, SentCode, SignIn,
 };
 use crate::session::SessionSnapshot;
 
@@ -754,10 +754,12 @@ impl<B: Backend> Actor<B> {
         self.launch(prep, kind, |ctx| async move {
             let resent = match &token {
                 Some(token) => ctx.call(ctx.client.resend_login_code(token)).await,
-                None => Err(AuthFail::Auth(AuthError::Backend(BackendError::Rejected))),
+                None => Err(AuthFail::Auth(AuthError::Backend(BackendError::Rejected(
+                    RejectReason::Other,
+                )))),
             };
             let res = match resent {
-                Err(AuthFail::Auth(AuthError::Backend(BackendError::Rejected))) => {
+                Err(AuthFail::Auth(AuthError::Backend(BackendError::Rejected(_)))) => {
                     ctx.call(ctx.client.request_login_code(&phone)).await
                 }
                 other => other,

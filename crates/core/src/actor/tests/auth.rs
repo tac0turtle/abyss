@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use super::{Harness, Setup, chat, harness_with, start};
 use crate::api::{AuthState, Command, ConnState, Event, PasswordBuf, UserError};
-use crate::backend::BackendError;
 use crate::backend::fake::{DEMO_PASSWORD, FAKE_CODE, FakeBackend, FakeScript, Fault, Op};
+use crate::backend::{BackendError, RejectReason};
 use crate::model::ThreadKey;
 use crate::secret::{SecretItem, StoreOp};
 
@@ -207,8 +207,10 @@ async fn other_error_on_check_password_needs_new_params() {
     h.phone_to_code().await;
     h.send(Command::SubmitCode(FAKE_CODE.into())).await;
     h.auth(|s| matches!(s, AuthState::Password { .. })).await;
-    h.fake
-        .inject(Op::CheckPassword, Fault::Error(BackendError::Rejected));
+    h.fake.inject(
+        Op::CheckPassword,
+        Fault::Error(BackendError::Rejected(RejectReason::Other)),
+    );
     h.send(password(DEMO_PASSWORD)).await;
     h.auth(|s| matches!(s, AuthState::PasswordTokenUnavailable { .. }))
         .await;

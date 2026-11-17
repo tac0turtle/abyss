@@ -17,7 +17,7 @@ use crate::backend::grammers::auth::{
     MappedCode, SignInFailure, auth_error, is_authorized, map_sent_code, send_code, sign_in_failure,
 };
 use crate::backend::grammers::invoke::Invoke;
-use crate::backend::{AuthError, BackendError, SentCode, SessionSnapshot};
+use crate::backend::{AuthError, BackendError, RejectReason, SentCode, SessionSnapshot};
 use crate::session::AbyssSession;
 
 use tl::enums::auth::SentCodeType as T;
@@ -284,7 +284,7 @@ fn auth_error_table() {
             400,
             "PASSWORD_HASH_INVALID",
             None,
-            AuthError::Backend(BackendError::Rejected),
+            AuthError::Backend(BackendError::Rejected(RejectReason::Other)),
         ),
         (
             500,

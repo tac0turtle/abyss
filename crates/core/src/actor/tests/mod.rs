@@ -28,7 +28,7 @@ use crate::api::{AuthState, Command, ConnState, Event, HistoryDir, SendState, Us
 use crate::backend::fake::{
     FAKE_SELF_HASH, FAKE_SELF_ID, FakeBackend, FakeHandle, FakeScript, Fault, Op, text_message,
 };
-use crate::backend::{BackendError, Update};
+use crate::backend::{BackendError, RejectReason, Update};
 use crate::cache::{CacheHandle, CacheKey};
 use crate::events::{self, EventReceiver};
 use crate::model::{ChatId, LocalId, MsgId, PeerKind, ThreadKey};
@@ -474,8 +474,10 @@ async fn send_unknown_after_retries_then_manual_retry() {
 #[tokio::test(start_paused = true)]
 async fn rejected_send_fails_and_empty_text_is_refused() {
     let mut h = harness(FakeScript::demo(1, 1), None).await;
-    h.fake
-        .inject(Op::Send, Fault::Error(BackendError::Rejected));
+    h.fake.inject(
+        Op::Send,
+        Fault::Error(BackendError::Rejected(RejectReason::Other)),
+    );
     h.send(Command::SendText {
         thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
@@ -550,7 +552,10 @@ async fn mark_read_coalesces_per_flush() {
         .await;
     }
     tokio::time::sleep(super::READ_FLUSH * 3).await;
-    assert_eq!(h.fake.read_calls(), vec![(chat(1), MsgId(7))]);
+    assert_eq!(
+        h.fake.read_calls(),
+        vec![(ThreadKey::whole(chat(1)), MsgId(7))]
+    );
     h.stop().await;
 }
 

@@ -7,6 +7,13 @@
 //! paging without overlap; history order and anchors; one `random_id` never
 //! producing two messages; read marks; `quit` stopping the runner; `retire`
 //! returning a usable snapshot. All values must pass the domain validators.
+//!
+//! Forums (Stage 2 task 3): topic pages in the reported order without
+//! overlap, pinned topics first, cursors carrying their page's order; by-id
+//! results that find or delete every requested id; topic and General history
+//! holding only their thread; a send into a topic landing only there; a topic
+//! read; `peer_dialogs` reporting the forum's kind; topics of a non-forum
+//! rejected.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -15,7 +22,10 @@ use super::{
     Backend, BackendError, Client, HistoryQuery, Instance, InstanceControl, Seed, SessionSeed,
     SessionSnapshot, StreamError, StreamItem, Update, UpdateStream,
 };
-use crate::model::{ChatId, Message, MsgId, ThreadKey};
+use crate::model::{
+    ChatId, ChatKind, Message, MsgId, ThreadKey, TopicId, TopicOrder, TopicSnapshot,
+};
+use crate::store::{ForumStatus, Route, route};
 
 /// Core's bootstrap waits this long for the baseline (plan section 2).
 const BASELINE_WAIT: Duration = Duration::from_secs(10);
@@ -28,6 +38,10 @@ const HISTORY: u32 = 10;
 const MIN_FIXTURE_MESSAGES: usize = 3;
 /// Errors the background consumer tolerates before it stops reading.
 const MAX_STREAM_ERRORS: usize = 3;
+/// Topics per page: small enough that a demo forum needs a second page.
+const TOPICS: u32 = 20;
+/// Topics asked for by id, besides one that doesn't exist.
+const BY_ID: usize = 3;
 
 /// Whether the suite may send a message to the target chat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +95,17 @@ async fn consume(mut updates: impl UpdateStream) {
     }
 }
 
-async fn check_dialogs(client: &impl Client) -> Vec<ChatId> {
+fn is_forum(kind: ChatKind) -> bool {
+    matches!(kind, ChatKind::Supergroup { forum: true, .. })
+}
+
+/// What the first dialogs page offers the suite.
+struct Targets {
+    sendable: Vec<ChatId>,
+    forums: Vec<ChatId>,
+}
+
+async fn check_dialogs(client: &impl Client) -> Targets {
     let first = client.dialogs(None, PAGE).await.expect("dialogs");
     assert!(first.chats.len() <= usize::try_from(PAGE).unwrap());
     assert!(first.chats.iter().all(crate::model::ChatSummary::is_valid));
@@ -95,12 +119,194 @@ async fn check_dialogs(client: &impl Client) -> Vec<ChatId> {
             "pages do not overlap"
         );
     }
-    first
+    let sendable = first
         .chats
         .iter()
-        .filter(|c| c.can_send)
+        .filter(|c| c.can_send && !is_forum(c.kind))
         .map(|c| c.id)
-        .collect()
+        .collect();
+    let forums = first
+        .chats
+        .iter()
+        .filter(|c| is_forum(c.kind))
+        .map(|c| c.id)
+        .collect();
+    Targets { sendable, forums }
+}
+
+/// Valid topics, at most `max`, without duplicates.
+fn assert_topics(topics: &[TopicSnapshot], max: u32) {
+    assert!(topics.len() <= usize::try_from(max).unwrap());
+    assert!(topics.iter().all(|t| t.topic.is_valid()));
+    let ids: HashSet<TopicId> = topics.iter().map(|t| t.topic.id).collect();
+    assert_eq!(ids.len(), topics.len(), "no duplicate topics");
+}
+
+/// Pinned topics lead, and the rest follow the reported order, newest first.
+fn assert_server_order(order: TopicOrder, topics: &[TopicSnapshot]) {
+    let pinned = topics.iter().take_while(|t| t.topic.pinned).count();
+    let rest = topics.get(pinned..).unwrap_or_default();
+    assert!(rest.iter().all(|t| !t.topic.pinned), "pinned topics lead");
+    assert!(
+        rest.windows(2).all(|w| match order {
+            TopicOrder::LastActivity => w[0].topic.last_id >= w[1].topic.last_id,
+            TopicOrder::Created => w[0].topic.created >= w[1].topic.created,
+        }),
+        "topics follow the reported order"
+    );
+}
+
+/// Ascending, valid messages of `thread` once normalized.
+fn assert_thread(messages: &[Message], thread: ThreadKey, max: u32) {
+    assert_history(messages, thread.chat, max);
+    for m in messages {
+        assert_eq!(
+            route(m.thread.chat, m.thread.topic, ForumStatus::Forum),
+            Route::Thread(thread),
+            "only the requested thread"
+        );
+    }
+}
+
+async fn thread_tail(client: &impl Client, thread: ThreadKey) -> Vec<Message> {
+    let tail = client
+        .history(thread, HistoryQuery::Tail, HISTORY)
+        .await
+        .expect("thread tail");
+    assert_thread(&tail.messages, thread, HISTORY);
+    tail.messages
+}
+
+/// Both pages of a forum's topics: valid, in order, without overlap.
+async fn check_topic_pages(client: &impl Client, forum: ChatId) -> Vec<TopicSnapshot> {
+    let first = client.topics(forum, None, TOPICS).await.expect("topics");
+    assert_topics(&first.topics, TOPICS);
+    assert_server_order(first.order, &first.topics);
+    let mut all = first.topics;
+    if let Some(next) = first.next {
+        assert_eq!(
+            next.order(),
+            first.order,
+            "a cursor carries its page's order"
+        );
+        let second = client
+            .topics(forum, Some(next), TOPICS)
+            .await
+            .expect("next topics page");
+        assert_topics(&second.topics, TOPICS);
+        // A page in another order is discarded by core (plan section 6.1).
+        if second.order == first.order {
+            assert_server_order(second.order, &second.topics);
+            assert!(
+                second.topics.iter().all(|t| !t.topic.pinned),
+                "pinned topics lead the first page only"
+            );
+            assert!(
+                second
+                    .topics
+                    .iter()
+                    .all(|t| all.iter().all(|a| a.topic.id != t.topic.id)),
+                "topic pages do not overlap"
+            );
+            all.extend(second.topics);
+        }
+    }
+    all
+}
+
+/// Known ids are found as listed; an id that names no topic is deleted.
+async fn check_topics_by_id(client: &impl Client, forum: ChatId, listed: &[TopicSnapshot]) {
+    let known: Vec<TopicId> = listed.iter().take(BY_ID).map(|t| t.topic.id).collect();
+    let missing = TopicId::try_from(i32::MAX).unwrap();
+    let mut ask = known.clone();
+    ask.push(missing);
+    let got = client
+        .topics_by_id(forum, &ask)
+        .await
+        .expect("topics by id");
+    assert_topics(&got.found, u32::try_from(ask.len()).unwrap());
+    let found: Vec<TopicId> = got.found.iter().map(|t| t.topic.id).collect();
+    assert_eq!(
+        found, known,
+        "every listed topic is found, in request order"
+    );
+    assert_eq!(got.deleted, vec![missing]);
+    for t in &got.found {
+        let page = listed.iter().find(|l| l.topic.id == t.topic.id).unwrap();
+        assert_eq!(t.topic.created, page.topic.created);
+    }
+}
+
+/// Topic and General history, a send into a topic, and a topic read.
+async fn check_topic_threads(
+    client: &impl Client,
+    forum: ChatId,
+    listed: &[TopicSnapshot],
+    sends: Sends,
+) {
+    let general = ThreadKey {
+        chat: forum,
+        topic: Some(TopicId::GENERAL),
+    };
+    thread_tail(client, general).await;
+    let open = listed
+        .iter()
+        .find(|t| t.topic.id != TopicId::GENERAL && !t.topic.closed && t.topic.last_id.is_some())
+        .expect("an open topic with messages");
+    let thread = ThreadKey {
+        chat: forum,
+        topic: Some(open.topic.id),
+    };
+    let tail = thread_tail(client, thread).await;
+    let newest = tail.last().map(|m| m.id).expect("the topic's messages");
+    assert!(
+        Some(newest) >= open.topic.last_id,
+        "the top message is in the thread"
+    );
+    let mut read = newest;
+    if sends == Sends::Check {
+        let id = client
+            .send_text(thread, "abyss contract topic check".into(), random_id())
+            .await
+            .expect("send into a topic");
+        let tail = thread_tail(client, thread).await;
+        assert!(tail.iter().any(|m| m.id == id && m.outgoing));
+        let in_general = thread_tail(client, general).await;
+        assert!(in_general.iter().all(|m| m.id != id), "only in its topic");
+        read = id;
+    }
+    client
+        .read_history(thread, read)
+        .await
+        .expect("topic read mark");
+}
+
+/// The forum's summary from `peer_dialogs`, with its kind; a non-forum's
+/// topics are rejected.
+async fn check_peer_dialogs(client: &impl Client, forum: ChatId, other: ChatId) {
+    let peers = client
+        .peer_dialogs(&[forum, other])
+        .await
+        .expect("peer dialogs");
+    assert!(peers.iter().all(crate::model::ChatSummary::is_valid));
+    let summary = peers
+        .iter()
+        .find(|c| c.id == forum)
+        .expect("the forum's summary");
+    assert!(is_forum(summary.kind));
+    assert!(peers.iter().all(|c| c.id == forum || c.id == other));
+    assert!(matches!(
+        client.topics(other, None, TOPICS).await,
+        Err(BackendError::Rejected(_))
+    ));
+}
+
+async fn check_forum(client: &impl Client, forum: ChatId, other: ChatId, sends: Sends) {
+    let listed = check_topic_pages(client, forum).await;
+    assert!(!listed.is_empty(), "a forum lists at least General");
+    check_topics_by_id(client, forum, &listed).await;
+    check_topic_threads(client, forum, &listed, sends).await;
+    check_peer_dialogs(client, forum, other).await;
 }
 
 async fn check_history(client: &impl Client, chat: ChatId) -> Option<MsgId> {
@@ -217,9 +423,23 @@ async fn check_send(client: &impl Client, chat: ChatId) -> MsgId {
     id
 }
 
+/// Which forum the suite checks, and whether it may post there.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForumTarget {
+    pub(crate) chat: Option<ChatId>,
+    pub(crate) sends: Sends,
+}
+
 /// Runs the suite. `target` is the chat to read (and, with `Sends::Check`,
 /// write); by default the first sendable chat of the first dialogs page.
-pub(crate) async fn run<B: Backend>(backend: &B, target: Option<ChatId>, sends: Sends) {
+/// `forum` likewise, defaulting to the first forum of that page; the forum
+/// checks are skipped when there is none.
+pub(crate) async fn run<B: Backend>(
+    backend: &B,
+    target: Option<ChatId>,
+    sends: Sends,
+    forum: ForumTarget,
+) {
     let seed = Seed {
         session: SessionSeed::Stored,
     };
@@ -240,10 +460,13 @@ pub(crate) async fn run<B: Backend>(backend: &B, target: Option<ChatId>, sends: 
     );
     let consumer = tokio::spawn(consume(updates));
 
-    let sendable = check_dialogs(&client).await;
+    let targets = check_dialogs(&client).await;
     let chat = target
-        .or_else(|| sendable.first().copied())
+        .or_else(|| targets.sendable.first().copied())
         .expect("a chat to check");
+    if let Some(f) = forum.chat.or_else(|| targets.forums.first().copied()) {
+        check_forum(&client, f, chat, forum.sends).await;
+    }
     // As core does once the window opens: the chat's peer must survive the
     // rebuild below.
     client.retain_peers(&[chat]);
@@ -277,10 +500,86 @@ pub(crate) async fn run<B: Backend>(backend: &B, target: Option<ChatId>, sends: 
 #[tokio::test(start_paused = true)]
 async fn fake_backend_passes_the_contract() {
     let (backend, fake) = super::fake::FakeBackend::new(super::fake::FakeScript::demo(25, 30));
-    run(&backend, None, Sends::Check).await;
+    run(&backend, None, Sends::Check, NO_FORUM).await;
     assert_eq!(fake.builds(), 2, "the suite rebuilds once");
     assert_eq!(fake.retired(), 2);
     assert_eq!(fake.runners_finished(), 2);
+}
+
+#[cfg(feature = "fake")]
+const NO_FORUM: ForumTarget = ForumTarget {
+    chat: None,
+    sends: Sends::Skip,
+};
+
+/// The demo script with a demo forum (General plus 60 topics) on the first
+/// dialogs page, served in `order`.
+#[cfg(feature = "fake")]
+fn forum_script(
+    order: TopicOrder,
+    general: crate::model::Visibility,
+) -> (super::fake::FakeScript, ChatId) {
+    use super::fake::{FakeScript, summary};
+    let mut script = FakeScript::demo(25, 30);
+    let forum = ChatId {
+        kind: crate::model::PeerKind::Channel,
+        id: 1_000,
+    };
+    let mut row = summary(forum, "Contract forum");
+    row.kind = ChatKind::Supergroup {
+        forum: true,
+        gigagroup: false,
+    };
+    script.dialogs.insert(1, row);
+    script.add_demo_forum(forum, 1_794_837_900, order);
+    for t in script.topics.get_mut(&forum).into_iter().flatten() {
+        if t.topic.id == TopicId::GENERAL {
+            t.visibility = general;
+        }
+    }
+    (script, forum)
+}
+
+#[cfg(feature = "fake")]
+#[tokio::test(start_paused = true)]
+async fn fake_forum_passes_the_contract_by_activity() {
+    let (script, forum) = forum_script(TopicOrder::LastActivity, crate::model::Visibility::Shown);
+    let (backend, fake) = super::fake::FakeBackend::new(script);
+    let target = ForumTarget {
+        chat: Some(forum),
+        sends: Sends::Check,
+    };
+    run(&backend, None, Sends::Check, target).await;
+    assert_eq!(
+        fake.calls(super::fake::Op::Topics),
+        3,
+        "two pages and the non-forum"
+    );
+    let topic_sends = fake
+        .sent()
+        .iter()
+        .filter(|(t, _)| t.topic.is_some())
+        .count();
+    assert_eq!(topic_sends, 1);
+}
+
+/// Creation order, with General hidden (it is still listed, with its
+/// visibility, and its history is still served).
+#[cfg(feature = "fake")]
+#[tokio::test(start_paused = true)]
+async fn fake_forum_passes_the_contract_by_creation() {
+    let (script, forum) = forum_script(TopicOrder::Created, crate::model::Visibility::Hidden);
+    let (backend, fake) = super::fake::FakeBackend::new(script);
+    let target = ForumTarget {
+        chat: Some(forum),
+        sends: Sends::Check,
+    };
+    run(&backend, None, Sends::Check, target).await;
+    assert_eq!(
+        fake.calls(super::fake::Op::Topics),
+        3,
+        "two pages and the non-forum"
+    );
 }
 
 /// Needs `ABYSS_API_ID`/`ABYSS_API_HASH` and a signed-in session in the Keychain. With
@@ -300,23 +599,41 @@ async fn grammers_backend_passes_the_contract() {
     let persist = crate::session::PersistHandle::spawn(crate::secret::KeychainStore::new())
         .expect("persistence worker");
     let backend = super::grammers::GrammersBackend::new(slot, persist);
-    let target = std::env::var("ABYSS_CONTRACT_CHAT").ok().map(|s| {
-        let (kind, id) = s.split_once(':').expect("kind:id");
-        let kind = match kind {
-            "user" => crate::model::PeerKind::User,
-            "chat" => crate::model::PeerKind::Chat,
-            "channel" => crate::model::PeerKind::Channel,
-            other => panic!("unknown chat kind {other}"),
-        };
-        ChatId {
-            kind,
-            id: id.parse().expect("numeric chat id"),
-        }
-    });
+    let target = std::env::var("ABYSS_CONTRACT_CHAT")
+        .ok()
+        .map(|s| parse_chat(&s));
     let sends = if target.is_some() {
         Sends::Check
     } else {
         Sends::Skip
     };
-    run(&backend, target, sends).await;
+    // `ABYSS_CONTRACT_FORUM=channel:<id>` also posts one message into a topic
+    // of that forum; otherwise the first forum of the first page is only read.
+    let forum = std::env::var("ABYSS_CONTRACT_FORUM")
+        .ok()
+        .map(|s| parse_chat(&s));
+    let forum = ForumTarget {
+        chat: forum,
+        sends: if forum.is_some() {
+            Sends::Check
+        } else {
+            Sends::Skip
+        },
+    };
+    run(&backend, target, sends, forum).await;
+}
+
+#[cfg(target_os = "macos")]
+fn parse_chat(s: &str) -> ChatId {
+    let (kind, id) = s.split_once(':').expect("kind:id");
+    let kind = match kind {
+        "user" => crate::model::PeerKind::User,
+        "chat" => crate::model::PeerKind::Chat,
+        "channel" => crate::model::PeerKind::Channel,
+        other => panic!("unknown chat kind {other}"),
+    };
+    ChatId {
+        kind,
+        id: id.parse().expect("numeric chat id"),
+    }
 }

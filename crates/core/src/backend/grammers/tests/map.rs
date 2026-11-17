@@ -1073,7 +1073,7 @@ fn live_updates_map_to_domain_updates() {
     });
     assert!(matches!(
         lists::update(&read, &dir),
-        Some(Update::ReadInbox { chat, still_unread: 2 }) if chat == cid(10)
+        Some(Update::ReadInbox { chat, topic: None, still_unread: 2 }) if chat == cid(10)
     ));
     let id_map = U::MessageId(tl::types::UpdateMessageId {
         id: 41,
