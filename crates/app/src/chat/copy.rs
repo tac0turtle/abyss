@@ -18,6 +18,12 @@ pub(crate) const NO_FOLDER_CHATS: &str = "No chats in this folder";
 pub(crate) const NO_PRIVATE_CHATS: &str = "No private chats";
 pub(crate) const NO_GROUPS: &str = "No groups";
 pub(crate) const NO_FORUMS: &str = "No forums";
+/// The unread filter's empty view while more dialogs pages exist (plan
+/// section 17.4), and once every page is loaded.
+pub(crate) const NO_UNREAD_LOADED: &str = "No unread chats among those loaded";
+pub(crate) const NO_UNREAD: &str = "No unread chats";
+/// The strip's toggle for the unread filter.
+pub(crate) const UNREAD_FILTER: &str = "Unread";
 pub(crate) const ARCHIVE_CHAT: &str = "Archive";
 pub(crate) const UNARCHIVE_CHAT: &str = "Unarchive";
 pub(crate) const NEW_FOLDER: &str = "New folder with this chat…";

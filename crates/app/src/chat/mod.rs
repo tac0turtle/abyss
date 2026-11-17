@@ -319,6 +319,26 @@ impl ChatShell {
         self.list.get(self.pane.chat()?)
     }
 
+    /// Switches the sidebar to a tab or the archive.
+    pub(crate) fn show_chats(&mut self, shown: list::Shown) {
+        self.list.show(shown);
+        self.sync_inline();
+    }
+
+    /// The strip's next or previous tab (see [`ChatList::step_tab`]).
+    pub(crate) fn step_tab(&mut self, step: list::Step) -> bool {
+        let stepped = self.list.step_tab(step);
+        self.sync_inline();
+        stepped
+    }
+
+    /// Turns the sidebar's unread filter on or off: the inline topics
+    /// follow it.
+    pub(crate) fn toggle_unread(&mut self) {
+        self.list.toggle_unread();
+        self.sync_inline();
+    }
+
     /// The shown forum's topic list.
     pub(crate) fn topics(&self) -> Option<&TopicList> {
         self.topics.as_ref()
@@ -503,6 +523,9 @@ impl ChatShell {
             | Event::ChatFolders(_)) => {
                 self.note_summary_kind(&list);
                 self.list.apply(list);
+                // The forum's badge decides More under the filter, and a
+                // removed folder changes the view.
+                self.sync_inline();
             }
             Event::History {
                 thread,
@@ -585,8 +608,17 @@ impl ChatShell {
                 {
                     self.open_removed = Some((topic, reason));
                 }
+                let drops = matches!(
+                    topics,
+                    Event::TopicsReset { .. }
+                        | Event::TopicRemoved { .. }
+                        | Event::ForumInvalidated(_)
+                );
                 if let Some(list) = self.topics.as_mut() {
                     list.apply(topics);
+                    if drops {
+                        self.retain_kept_topics();
+                    }
                     self.sync_inline();
                 }
             }

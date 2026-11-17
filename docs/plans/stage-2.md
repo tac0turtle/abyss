@@ -1786,3 +1786,10 @@ The round 3 overlay fix is closed; the install-site list was checked against mai
 | Round | Findings | Resolution |
 |---|---|---|
 | 1 | Pass. P3 follow-up: Option+Cmd+Up/Down selection doesn't scroll the marked sidebar row into view | Open follow-up (needs a per-view scroll handle). Also fixed in this task: a stale `Event::History { chat }` in the macOS-only snapshots.rs from task 1 |
+
+#### Task 15: the unread filter (2 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 | P2: archive count stale when the filter was off; the membership property re-used production logic; kept ids survived peer-folder moves and kind changes | `set_opened` always recomputes; property reworked around an independent model (reference `contains`, mutation-checked); every recompute prunes kept chats that are unlisted or fail their base rule with only reading waived. `read_waived` became `ReadRule { Applies, Waived }` (clippy forbids bool params) |
+| 2 | Pass | — |

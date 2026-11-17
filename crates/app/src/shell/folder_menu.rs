@@ -4,7 +4,7 @@
 //! (`ChatBumped`, `ChatFolders`), never ahead of it.
 
 use abyss_core::api::{Command, UserError};
-use abyss_core::model::{ChatFolder, ChatId, FolderEdit, FolderTag, PeerFolder};
+use abyss_core::model::{ChatFolder, ChatId, FolderEdit, FolderTag, PeerFolder, ReadRule};
 use gpui::{
     AnyElement, ClickEvent, Context, Div, Entity, Focusable, MouseButton, MouseDownEvent, Pixels,
     Point, SharedString, Size, Stateful, Subscription, Window, div, point, prelude::*, px,
@@ -366,7 +366,8 @@ fn chat_entries(
     ];
     for (ix, folder) in editable(session.shell.list.folders()).enumerate() {
         let (id, tag) = (folder.id, folder.tag());
-        let inside = folder.contains(summary, crate::chat::format::now());
+        // Folder editing sees Telegram's rule, nothing waived.
+        let inside = folder.contains(summary, crate::chat::format::now(), ReadRule::Applies);
         let label = div()
             .flex()
             .child(div().w(px(18.)).flex_none().children(inside.then_some("✓")))

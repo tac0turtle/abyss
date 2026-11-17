@@ -35,10 +35,13 @@ impl ChatShell {
     /// closes the previous thread and any forum view in core). Refused,
     /// the pane stays as it was. Selecting a forum whose topic is open
     /// goes back to its list. Selecting a forum expands its sidebar row
-    /// (plan section 17.3, decision D7).
+    /// (plan section 17.3, decision D7). Under the unread filter, the chat
+    /// stays in the view when it is read (plan section 17.4).
     pub(crate) fn select(&mut self, chat: ChatId, admit: Admit<'_>) -> Result<(), Refused> {
         if !self.list.get(chat).is_some_and(super::is_forum) {
-            return self.show_thread(ThreadKey::whole(chat), admit);
+            self.show_thread(ThreadKey::whole(chat), admit)?;
+            self.list.keep(chat);
+            return Ok(());
         }
         match self.pane {
             Pane::Forum {
@@ -48,6 +51,7 @@ impl ChatShell {
             Pane::Forum { chat: c, .. } if c == chat => self.back_to_topics(admit)?,
             _ => self.show_forum(chat, admit)?,
         }
+        self.list.keep(chat);
         self.set_inline(Inline::Expanded);
         Ok(())
     }
@@ -89,6 +93,8 @@ impl ChatShell {
     }
 
     /// Opens `topic` of the shown forum (`OpenThread` with the topic).
+    /// Under the unread filter, a topic the copy holds stays under the
+    /// forum's row when it is read (plan section 17.4).
     pub(crate) fn open_topic(&mut self, topic: TopicId, admit: Admit<'_>) -> Result<(), Refused> {
         let Pane::Forum { chat, open } = self.pane else {
             return Ok(());
@@ -102,6 +108,9 @@ impl ChatShell {
         };
         if self.core == CoreState::Running {
             admit(Command::OpenThread(thread))?;
+        }
+        if self.topics.as_ref().is_some_and(|l| l.get(topic).is_some()) {
+            self.list.keep_topic(topic);
         }
         self.set_pane(Pane::Forum {
             chat,
@@ -159,11 +168,19 @@ impl ChatShell {
 
     /// The pane becomes `pane` (its topic list already set). The kind core
     /// announced for the previous chat (`KindChanged`) and the expansion of
-    /// its sidebar row are forgotten with it.
+    /// its sidebar row are forgotten with it, and the filter's kept topics
+    /// with its forum.
     fn set_pane(&mut self, pane: Pane) {
         if pane.chat() != self.pane.chat() {
             self.shown_kind = None;
             self.inline = Inline::Expanded;
+        }
+        let forum = |pane| match pane {
+            Pane::Forum { chat, .. } => Some(chat),
+            Pane::Empty | Pane::Thread(_) => None,
+        };
+        if forum(pane) != forum(self.pane) {
+            self.list.retain_kept_topics(|_| false);
         }
         self.pane = pane;
         self.sync_inline();

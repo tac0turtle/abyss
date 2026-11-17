@@ -4,9 +4,11 @@
 //! forum expands (decision D7); its row's disclosure glyph or
 //! Option+Cmd+Right/Left expand and collapse it without changing the pane.
 
-use abyss_core::model::{ChatId, TopicId};
+use std::collections::HashSet;
 
-use super::list::{Beneath, SidebarRow, Step};
+use abyss_core::model::{ChatId, Topic, TopicId};
+
+use super::list::{Beneath, ChatList, Opened, SidebarRow, Step, topic_unread};
 use super::topics::TopicList;
 use super::{ChatShell, Pane};
 
@@ -35,19 +37,42 @@ impl Inline {
 /// The rows under `forum`'s row while it is expanded with `open` the open
 /// topic: its first [`INLINE_TOPICS`] topics in display order, the open one
 /// wherever it stands, then More when the copy or the server holds more.
-/// Before a copy exists, one pending row.
-fn rows(list: Option<&TopicList>, forum: ChatId, open: Option<TopicId>) -> Vec<SidebarRow> {
-    let Some(list) = list.filter(|l| l.chat() == forum && l.is_loaded()) else {
+/// Under the unread filter (plan section 17.4) the slots go to the unread
+/// and kept topics, and More also shows while the forum's badge counts
+/// more unread topics than are shown. Before a copy exists, one pending
+/// row.
+fn rows(
+    topics: Option<&TopicList>,
+    chats: &ChatList,
+    forum: ChatId,
+    open: Option<TopicId>,
+) -> Vec<SidebarRow> {
+    let Some(copy) = topics.filter(|l| l.chat() == forum && l.is_loaded()) else {
         return vec![SidebarRow::TopicsPending { forum }];
     };
-    let topics = list.topics();
-    let mut rows: Vec<SidebarRow> = topics
+    let filtered = chats.view().unread_only;
+    // The open topic counts as kept while it is open.
+    let candidates: Vec<&Topic> = copy
+        .topics()
+        .iter()
+        .filter(|t| !filtered || topic_unread(t) || chats.topic_kept(t.id) || open == Some(t.id))
+        .collect();
+    let shown: Vec<&Topic> = candidates
         .iter()
         .enumerate()
         .filter(|&(ix, t)| ix < INLINE_TOPICS || open == Some(t.id))
-        .map(|(_, t)| SidebarRow::Topic { forum, topic: t.id })
+        .map(|(_, &t)| t)
         .collect();
-    if topics.len() > rows.len() || list.has_more() {
+    let badge = chats.get(forum).map_or(0, |c| c.unread);
+    let unread_shown = shown.iter().filter(|t| topic_unread(t)).count();
+    let more = candidates.len() > shown.len()
+        || copy.has_more()
+        || (filtered && usize::try_from(badge).is_ok_and(|b| b > unread_shown));
+    let mut rows: Vec<SidebarRow> = shown
+        .iter()
+        .map(|t| SidebarRow::Topic { forum, topic: t.id })
+        .collect();
+    if more {
         rows.push(SidebarRow::MoreTopics { forum });
     }
     rows
@@ -55,16 +80,43 @@ fn rows(list: Option<&TopicList>, forum: ChatId, open: Option<TopicId>) -> Vec<S
 
 impl ChatShell {
     /// Brings the sidebar's inline rows in line with the pane, its forum's
-    /// topic list and the expansion.
+    /// topic list, the expansion and the unread filter, and tells the chat
+    /// list which chat the pane shows (the filter keeps it).
     pub(super) fn sync_inline(&mut self) {
+        let opened = self.pane.chat().map(|chat| Opened {
+            chat,
+            unread_topics: self
+                .forum_copy()
+                .is_some_and(|copy| copy.chat() == chat && copy.topics().iter().any(topic_unread)),
+        });
+        self.list.set_opened(opened);
         let beneath = match (self.pane, self.inline) {
             (Pane::Forum { chat, open }, Inline::Expanded) => Some(Beneath {
                 forum: chat,
-                rows: rows(self.topics.as_ref(), chat, open),
+                rows: rows(self.topics.as_ref(), &self.list, chat, open),
             }),
             _ => None,
         };
         self.list.set_beneath(beneath);
+    }
+
+    /// The pane's forum's topic copy, once core sent one.
+    fn forum_copy(&self) -> Option<&TopicList> {
+        match self.pane {
+            Pane::Forum { .. } => self.topics.as_ref().filter(|l| l.is_loaded()),
+            Pane::Empty | Pane::Thread(_) => None,
+        }
+    }
+
+    /// Topic events that can drop topics from the copy (a reset, a
+    /// removal, an invalidation) drop them from the filter's kept topics
+    /// too.
+    pub(super) fn retain_kept_topics(&mut self) {
+        let held: HashSet<TopicId> = self
+            .forum_copy()
+            .map(|copy| copy.topics().iter().map(|t| t.id).collect())
+            .unwrap_or_default();
+        self.list.retain_kept_topics(|t| held.contains(&t));
     }
 
     /// The expansion of `chat`'s row: only the pane's forum has one.

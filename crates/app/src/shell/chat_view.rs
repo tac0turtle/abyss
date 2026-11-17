@@ -84,6 +84,8 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
     let shown = list.shown();
     let body = if rows.is_empty() {
         let empty = match shown {
+            _ if list.view().unread_only && list.partly_loaded() => copy::NO_UNREAD_LOADED,
+            _ if list.view().unread_only => copy::NO_UNREAD,
             Shown::Tab(Tab::All) => copy::NO_CHATS,
             Shown::Tab(Tab::Private) => copy::NO_PRIVATE_CHATS,
             Shown::Tab(Tab::Groups) => copy::NO_GROUPS,
@@ -136,7 +138,7 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
                         .child(appearance_button(cx)),
                 ),
         )
-        .children(tab_strip(session, theme, cx))
+        .child(tab_strip(session, theme, cx))
         .child(body)
         // Last, so it paints over the rows and takes their clicks.
         .children(retry)
@@ -185,16 +187,17 @@ fn sidebar_title(shown: Shown, theme: &Theme, cx: &mut Context<'_, Root>) -> Any
 }
 
 /// The strip under the heading: All, Private, Groups and Forums, then each
-/// chat folder in server order (plan section 17.2). The archive has no tabs.
-/// The tabs scroll sideways; the unread toggle (task 15) goes at the
-/// strip's right end, outside the scroll.
-fn tab_strip(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Option<Div> {
+/// chat folder in server order (plan section 17.2). The tabs scroll
+/// sideways; the unread toggle sits at the strip's right end, outside the
+/// scroll. The archive has no tabs, only the toggle.
+fn tab_strip(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
     let list = &session.shell.list;
-    let Shown::Tab(shown) = list.shown() else {
-        return None;
+    let shown = match list.shown() {
+        Shown::Tab(tab) => Some(tab),
+        Shown::Archive => None,
     };
-    let tabs = list.tabs().map(|tab| {
-        let selected = tab == shown;
+    let tabs = list.tabs().filter(|_| shown.is_some()).map(|tab| {
+        let selected = Some(tab) == shown;
         let mark: Hsla = if selected {
             theme.text.into()
         } else {
@@ -237,14 +240,39 @@ fn tab_strip(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Op
         .pt_1()
         .overflow_x_scroll()
         .children(tabs);
-    Some(
-        div()
-            .flex()
-            .flex_none()
-            .bg(theme.surface(Depth::NOW))
-            .text_color(theme.text)
-            .child(scroll),
-    )
+    div()
+        .flex()
+        .flex_none()
+        .bg(theme.surface(Depth::NOW))
+        .text_color(theme.text)
+        .child(scroll)
+        .child(unread_toggle(list.view(), theme, cx))
+}
+
+/// The unread filter's toggle (plan section 17.4): on, it carries the ink
+/// rule and full ink like a selected tab; off, quiet ink. No hue.
+fn unread_toggle(view: View, theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
+    let on = view.unread_only;
+    let mark: Hsla = if on {
+        theme.text.into()
+    } else {
+        transparent_black()
+    };
+    div()
+        .id("unread-toggle")
+        .flex_none()
+        .mx_1()
+        .px_2()
+        .py_1()
+        .border_b_2()
+        .border_color(mark)
+        .text_sm()
+        .cursor_pointer()
+        .child(copy::UNREAD_FILTER)
+        .when(!on, |d| d.text_color(theme::quiet(theme.text)))
+        .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
+            root.with_session(|s, cx| s.toggle_unread(window, cx), cx);
+        }))
 }
 
 /// A tab's stable element id: built-in tabs by name, folders by id.

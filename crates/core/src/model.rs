@@ -307,6 +307,16 @@ impl ChatSummary {
     }
 }
 
+/// Whether [`ChatFolder::contains`] applies a folder's "exclude read" rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadRule {
+    /// As Telegram applies it: folder editing, and every chat the unread
+    /// filter doesn't keep.
+    Applies,
+    /// Waived: a chat the unread filter keeps stays when it is read.
+    Waived,
+}
+
 /// Which chat folder an edit was made for: its id, title, rules and shared
 /// flag as the UI last saw them, compared field by field (no hash, so no
 /// collisions). Best-effort detection of an observable identity change: a
@@ -353,8 +363,10 @@ impl ChatFolder {
     /// (`ChatFilter::contains`): excluded chats never are, named ones always
     /// are, and any other is when its kind matches and no exclusion applies.
     /// "Exclude muted" keeps a muted chat with an unread mention unless it
-    /// is archived.
-    pub fn contains(&self, chat: &ChatSummary, now: i64) -> bool {
+    /// is archived. `read` waives "exclude read" alone, for a chat the
+    /// unread filter keeps (stage 2 plan, section 17.4): every other step
+    /// applies as ever.
+    pub fn contains(&self, chat: &ChatSummary, now: i64, read: ReadRule) -> bool {
         if self.exclude.contains(&chat.id) {
             return false;
         }
@@ -370,7 +382,10 @@ impl ChatFolder {
         };
         let mentioned = chat.unread_mentions > 0 && chat.folder == PeerFolder::Main;
         kind && !(r.has(FolderRules::EXCLUDE_MUTED) && chat.muted_at(now) && !mentioned)
-            && !(r.has(FolderRules::EXCLUDE_READ) && chat.unread == 0 && chat.unread_mentions == 0)
+            && !(r.has(FolderRules::EXCLUDE_READ)
+                && read == ReadRule::Applies
+                && chat.unread == 0
+                && chat.unread_mentions == 0)
             && !(r.has(FolderRules::EXCLUDE_ARCHIVED) && chat.folder == PeerFolder::Archive)
     }
 

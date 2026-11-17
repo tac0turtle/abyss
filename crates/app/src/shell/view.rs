@@ -62,6 +62,9 @@ impl Render for Root {
             .on_action(cx.listener(|root, _: &super::PreviousTab, window, cx| {
                 root.with_session(|s, cx| s.step_tab(Step::Previous, window, cx), cx);
             }))
+            .on_action(cx.listener(|root, _: &super::ToggleUnread, window, cx| {
+                root.with_session(|s, cx| s.toggle_unread(window, cx), cx);
+            }))
             .on_action(cx.listener(|root, _: &super::NextRow, window, cx| {
                 root.with_session(|s, cx| s.step_row(Step::Next, window, cx), cx);
             }))

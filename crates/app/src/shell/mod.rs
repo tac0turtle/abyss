@@ -40,9 +40,8 @@ actions!(
         NextTab,
         /// The sidebar's previous tab, wrapping (Ctrl+Shift+Tab).
         PreviousTab,
-        /// Turns the sidebar's unread filter on or off (Cmd+Shift+U). Bound
-        /// now so the chord is reserved; the filter handles it (plan
-        /// section 17.4, task 15).
+        /// Turns the sidebar's unread filter on or off (Cmd+Shift+U; plan
+        /// section 17.4).
         ToggleUnread,
         /// Selects the sidebar's next chat or topic row (Option+Cmd+Down).
         NextRow,

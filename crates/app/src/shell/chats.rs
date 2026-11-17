@@ -708,7 +708,18 @@ impl Session {
             return;
         }
         let kept = self.shell.list.kept_view();
-        self.shell.list.show(shown);
+        self.shell.show_chats(shown);
+        self.view_changed(kept, window, cx);
+    }
+
+    /// The strip's toggle and Cmd+Shift+U: turns the unread filter on or
+    /// off, in any view, the archive's included.
+    pub(super) fn toggle_unread(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if self.auth != AuthView::SignedIn {
+            return;
+        }
+        let kept = self.shell.list.kept_view();
+        self.shell.toggle_unread();
         self.view_changed(kept, window, cx);
     }
 
@@ -719,7 +730,7 @@ impl Session {
             return;
         }
         let kept = self.shell.list.kept_view();
-        if self.shell.list.step_tab(step) {
+        if self.shell.step_tab(step) {
             self.view_changed(kept, window, cx);
         }
     }

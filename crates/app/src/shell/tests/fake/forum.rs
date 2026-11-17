@@ -17,6 +17,7 @@ use abyss_core::store::TopicsGen;
 use super::*;
 use crate::chat::Pane;
 use crate::chat::list::{Pages, SidebarRow};
+use crate::shell::session::Session;
 
 const FORUM: ChatId = ChatId {
     kind: PeerKind::Channel,
@@ -764,6 +765,84 @@ fn inline_topics_collapse_and_follow_the_forum_into_every_view(cx: &mut TestAppC
     let rows = read(&root, cx, |s| s.shell.list.rows().to_vec());
     assert_eq!(rows, [SidebarRow::Chat(FORUM)]);
     assert_eq!(expansion(&root, cx), None);
+}
+
+/// Plan section 17.4 under the inline rows: the unread filter shows the
+/// unread topics (a count or a dot) and the opened ones, which stay when
+/// read until a removal drops them or the filter changes; More shows while
+/// the badge counts more unread topics than are shown. The pane's forum
+/// with a dot topic counts as unread, so its archive entry shows.
+#[gpui::test]
+fn the_unread_filter_keeps_opened_topics_under_the_forum(cx: &mut TestAppContext) {
+    let (root, cx, harness) = forum_listed(cx);
+    act(&root, cx, Session::toggle_unread);
+    select_forum(&root, cx);
+    let unread = Topic {
+        unread: 2,
+        ..topic(1)
+    };
+    let dot = Topic {
+        freshness: Freshness::NewSince,
+        ..topic(2)
+    };
+    let topics = [unread.clone(), dot]
+        .into_iter()
+        .chain((3..=12).map(topic))
+        .collect();
+    topics_listed(&harness, cx, topics, Pages::Done);
+    assert_eq!(inline(&root, cx), topic_rows([1, 2]));
+    let badge = |unread| ChatSummary {
+        unread,
+        ..forum_chat(IS_FORUM)
+    };
+    core_sends(&harness, cx, Event::ChatBumped(badge(5)));
+    assert_eq!(inline(&root, cx), [topic_rows([1, 2]), vec![MORE]].concat());
+
+    // Opened topics stay, read or not; one read elsewhere leaves.
+    select_topic(&root, cx, 3);
+    select_topic(&root, cx, 4);
+    let read_here = Topic {
+        freshness: Freshness::ReadSince,
+        ..unread
+    };
+    let bumped = Event::TopicBumped {
+        chat: FORUM,
+        topic: read_here,
+    };
+    core_sends(&harness, cx, bumped);
+    assert_eq!(
+        inline(&root, cx),
+        [topic_rows([2, 3, 4]), vec![MORE]].concat()
+    );
+    let removed = Event::TopicRemoved {
+        chat: FORUM,
+        topic: tid(3),
+        reason: TopicGone::Deleted,
+    };
+    core_sends(&harness, cx, removed);
+    select_topic(&root, cx, 5);
+    assert_eq!(
+        inline(&root, cx),
+        [topic_rows([2, 4, 5]), vec![MORE]].concat()
+    );
+    act(&root, cx, Session::toggle_unread);
+    act(&root, cx, Session::toggle_unread);
+    assert_eq!(inline(&root, cx), [topic_rows([2, 5]), vec![MORE]].concat());
+
+    // No badge, a dot topic: the archived forum's entry counts it unread.
+    let archived = ChatSummary {
+        folder: abyss_core::model::PeerFolder::Archive,
+        ..badge(0)
+    };
+    core_sends(&harness, cx, Event::ChatBumped(archived));
+    let first = read(&root, cx, |s| s.shell.list.rows().first().copied());
+    assert_eq!(
+        first,
+        Some(SidebarRow::Archive(crate::chat::list::ArchiveEntry {
+            chats: 1,
+            unread: 1
+        }))
+    );
 }
 
 /// The real core over the `cargo dev` demo account: a forum lists General
