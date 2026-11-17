@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use abyss_core::api::{ConnState, Event, LoadTarget, UserError, WindowState};
-use abyss_core::model::{ChatId, ChatSummary, Message, MsgId};
+use abyss_core::model::{ChatId, ChatSummary, Message, MsgId, ThreadKey};
 use abyss_core::store::ViewGen;
 use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, Task, px};
 
@@ -37,7 +37,7 @@ const OVERDRAW: f32 = 800.;
 /// Messages whose spoilers the user revealed, per open chat.
 const MAX_REVEALED: usize = 256;
 
-/// One row of the message list: the window's messages, then the open chat's
+/// One row of the message list: the window's messages, then the open thread's
 /// echoes (own sends without a server copy yet).
 #[derive(Debug)]
 pub(crate) enum Row<'a> {
@@ -56,19 +56,19 @@ impl Row<'_> {
 
 pub(crate) struct ChatShell {
     pub(crate) list: ChatList,
-    selected: Option<ChatId>,
+    selected: Option<ThreadKey>,
     window: Option<MessageWindow>,
     echoes: Echoes,
     /// The message list's GPUI state. Always `window.len() + shown_echoes` rows.
     rows: ListState,
     shown_echoes: usize,
     revealed: HashSet<MsgId>,
-    /// Highest id core admitted as read for the open chat.
+    /// Highest id core admitted as read for the open thread.
     read_sent: Option<MsgId>,
-    /// The chat core was last told shows its live tail (`ViewingTail`).
-    viewing: Option<ChatId>,
-    /// Composer text of chats not open (task 6k): the box belongs to the
-    /// open chat.
+    /// The thread core was last told shows its live tail (`ViewingTail`).
+    viewing: Option<ThreadKey>,
+    /// Composer text of threads not open (task 6k): the box belongs to the
+    /// open thread.
     drafts: drafts::Drafts,
     /// Whether core still runs; stopped, nothing is asked of it (task 6l).
     core: CoreState,
@@ -199,12 +199,12 @@ impl ChatShell {
 mod reset_tests;
 
 impl ChatShell {
-    pub(crate) fn selected(&self) -> Option<ChatId> {
+    pub(crate) fn selected(&self) -> Option<ThreadKey> {
         self.selected
     }
 
     pub(crate) fn selected_chat(&self) -> Option<&ChatSummary> {
-        self.list.get(self.selected?)
+        self.list.get(self.selected?.chat)
     }
 
     pub(crate) fn window(&self) -> Option<&MessageWindow> {
@@ -236,15 +236,15 @@ impl ChatShell {
             Some(m) => Some(Row::Message(m)),
             None => self
                 .echoes
-                .for_chat(w.chat())
+                .for_thread(w.thread())
                 .nth(ix.checked_sub(w.len())?)
                 .map(Row::Echo),
         }
     }
 
-    /// The chat core was last told shows its live tail.
+    /// The thread core was last told shows its live tail.
     #[cfg(test)]
-    pub(crate) fn viewing(&self) -> Option<ChatId> {
+    pub(crate) fn viewing(&self) -> Option<ThreadKey> {
         self.viewing
     }
 
@@ -293,6 +293,10 @@ impl ChatShell {
     }
 
     /// Applies a chat event from core. Other events are ignored.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per event; the thread key spreads two patterns over more lines"
+    )]
     pub(crate) fn apply(&mut self, event: Event) {
         match event {
             Event::DialogsReset(chats) => self.list.reset(chats),
@@ -303,14 +307,14 @@ impl ChatShell {
             }
             Event::ChatBumped(chat) => self.list.bump(chat),
             Event::History {
-                chat,
+                thread,
                 view,
                 dir,
                 messages,
                 removed,
                 has_more,
             } => self.on_history(
-                chat,
+                thread,
                 Batch {
                     view,
                     dir,
@@ -319,22 +323,26 @@ impl ChatShell {
                     has_more,
                 },
             ),
-            Event::Reconciled { chat, view, newest } => self.on_reconciled(chat, view, newest),
+            Event::Reconciled {
+                thread,
+                view,
+                newest,
+            } => self.on_reconciled(thread, view, newest),
             Event::SendsCovered { sends, .. } => {
                 if self.echoes.covered(&sends) {
                     self.sync_echoes();
                 }
             }
-            Event::ChatInvalidated(chat) => {
-                let applied = self.open_window(chat).map(MessageWindow::invalidate);
+            Event::ThreadInvalidated(thread) => {
+                let applied = self.open_window(thread).map(MessageWindow::invalidate);
                 self.sync_rows(applied);
             }
             Event::Edited(m) => {
-                let applied = self.open_window(m.thread.chat).map(|w| w.edit(m));
+                let applied = self.window_of_chat(m.thread.chat).map(|w| w.edit(m));
                 self.sync_rows(applied);
             }
             Event::Deleted { chat, ids } => {
-                let applied = self.open_window(chat).map(|w| w.delete(&ids));
+                let applied = self.window_of_chat(chat).map(|w| w.delete(&ids));
                 self.sync_rows(applied);
             }
             Event::SendState { local_id, state } => {
@@ -378,8 +386,8 @@ impl ChatShell {
     ) {
         match target {
             LoadTarget::Dialogs => self.list.load_ended(error, now),
-            LoadTarget::History { chat, dir } => {
-                if let Some(w) = self.open_window(chat) {
+            LoadTarget::History { thread, dir } => {
+                if let Some(w) = self.open_window(thread) {
                     w.load_ended(dir, error, now);
                 }
             }
@@ -451,11 +459,17 @@ impl ChatShell {
         }
     }
 
-    fn open_window(&mut self, chat: ChatId) -> Option<&mut MessageWindow> {
-        self.window.as_mut().filter(|w| w.chat() == chat)
+    fn open_window(&mut self, thread: ThreadKey) -> Option<&mut MessageWindow> {
+        self.window.as_mut().filter(|w| w.thread() == thread)
     }
 
-    /// A history event. A new view (a reopened chat's full `Tail`, a
+    /// The open window when it shows a thread of `chat`: message ids are
+    /// per chat, so edits and deletions apply to whichever thread shows them.
+    fn window_of_chat(&mut self, chat: ChatId) -> Option<&mut MessageWindow> {
+        self.window.as_mut().filter(|w| w.thread().chat == chat)
+    }
+
+    /// A history event. A new view (a reopened thread's full `Tail`, a
     /// reload) replaces the rows; echoes are reconciled only by
     /// `Reconciled`, never by a view change.
     ///
@@ -463,9 +477,9 @@ impl ChatShell {
     /// top of the viewport survives it (task 10e): a refresh that replaces
     /// the window keeps late live messages, and the user may be reading
     /// one. Following the tail, the list stays at the tail anyway.
-    fn on_history(&mut self, chat: ChatId, batch: Batch) {
+    fn on_history(&mut self, thread: ThreadKey, batch: Batch) {
         let anchor = self.scroll_anchor();
-        let Some(w) = self.open_window(chat) else {
+        let Some(w) = self.open_window(thread) else {
             return;
         };
         let applied = w.apply(batch);
@@ -499,20 +513,20 @@ impl ChatShell {
         }
     }
 
-    /// Core merged the server's tail of `chat` into `view`. It ends no
+    /// Core merged the server's tail of `thread` into `view`. It ends no
     /// history load: core answers each one itself (`History` in its
     /// direction or `LoadEnded`), also one asked while the tail loaded.
-    fn on_reconciled(&mut self, chat: ChatId, view: ViewGen, newest: Option<MsgId>) {
+    fn on_reconciled(&mut self, thread: ThreadKey, view: ViewGen, newest: Option<MsgId>) {
         let on_screen = self
             .window
             .as_ref()
-            .filter(|w| w.chat() == chat && w.view() == Some(view));
+            .filter(|w| w.thread() == thread && w.view() == Some(view));
         let changed = match on_screen {
             Some(w) => {
                 let shown = |id: MsgId| w.contains(id);
-                self.echoes.reconciled(chat, newest, Some(&shown))
+                self.echoes.reconciled(thread, newest, Some(&shown))
             }
-            None => self.echoes.reconciled(chat, newest, None),
+            None => self.echoes.reconciled(thread, newest, None),
         };
         if changed {
             self.sync_echoes();
@@ -521,8 +535,8 @@ impl ChatShell {
 
     /// Echoes changed: drop the ones whose server copy is shown, then
     /// refresh the echo rows.
-    /// An echo of `changed`'s chat changed (`None`: nothing did).
-    fn echo_changed(&mut self, changed: Option<ChatId>) {
+    /// An echo of `changed`'s thread changed (`None`: nothing did).
+    fn echo_changed(&mut self, changed: Option<ThreadKey>) {
         if changed.is_some() {
             self.after_echo_change();
         }
@@ -530,7 +544,7 @@ impl ChatShell {
 
     fn after_echo_change(&mut self) {
         if let Some(w) = &self.window {
-            self.echoes.resolve(w.chat(), |id| w.contains(id));
+            self.echoes.resolve(w.thread(), |id| w.contains(id));
         }
         self.sync_echoes();
     }
@@ -569,7 +583,7 @@ impl ChatShell {
     fn echo_count(&self) -> usize {
         self.window
             .as_ref()
-            .map_or(0, |w| self.echoes.count(w.chat()))
+            .map_or(0, |w| self.echoes.count(w.thread()))
     }
 
     /// Replaces the echo rows at the end of the list.

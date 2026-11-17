@@ -1,6 +1,6 @@
-//! Bounded, sliding message windows for recently opened chats.
+//! Bounded, sliding message windows for recently opened threads.
 //!
-//! A window holds a contiguous run of a chat's history. It slides: loading older
+//! A window holds a contiguous run of a thread's history. It slides: loading older
 //! history past the cap drops the newest messages (the window detaches from the
 //! live tail), and loading newer history drops the oldest. Dropped messages are
 //! re-read from the disk cache or the server when the user scrolls back.
@@ -8,16 +8,16 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::backend::HistoryPage;
-use crate::model::{ChatId, Message, MsgId, group_by_chat};
+use crate::model::{ChatId, Message, MsgId, ThreadKey, group_by_chat};
 
 /// Maximum messages retained per chat window.
 pub const MAX_MESSAGES_PER_CHAT: usize = 2000;
-/// Maximum number of chat windows retained (LRU).
+/// Maximum number of thread windows retained (LRU).
 pub const MAX_WINDOWS: usize = 8;
 /// Maximum retained bytes across all windows.
 pub const MAX_STORE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Identifies one incarnation of a chat window. Completions tagged with an older
+/// Identifies one incarnation of a thread window. Completions tagged with an older
 /// generation are stale and must be dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ViewGen(pub u64);
@@ -32,7 +32,7 @@ enum End {
     Newest,
 }
 
-/// Contiguous messages of one chat, ascending by id, without duplicates.
+/// Contiguous messages of one thread, ascending by id, without duplicates.
 #[derive(Debug)]
 pub struct Window {
     view_gen: ViewGen,
@@ -43,7 +43,7 @@ pub struct Window {
     /// Newer history exists outside the window: the window does not reach the
     /// live tail, so live messages are not appended to it.
     has_newer: bool,
-    /// The chat's disk cache is known to be contiguous with the live tail
+    /// The thread's disk cache is known to be contiguous with the live tail
     /// (set once a server tail was written through), so older and newer pages
     /// may be served from it. Lives and dies with the window, so it is bounded
     /// by [`MAX_WINDOWS`]; cleared on reopen and invalidation.
@@ -127,34 +127,34 @@ pub struct Change {
     pub removed: Vec<MsgId>,
 }
 
-/// LRU set of chat windows with a global byte budget and a message-id index for
-/// chats whose ids are account-unique (private chats and basic groups).
+/// LRU set of thread windows with a global byte budget and a message-id index
+/// for chats whose ids are account-unique (private chats and basic groups).
 #[derive(Debug, Default)]
 pub struct Windows {
-    by_chat: HashMap<ChatId, Window>,
-    /// Most recently used last. Always holds exactly the keys of `by_chat`.
-    lru: Vec<ChatId>,
+    by_thread: HashMap<ThreadKey, Window>,
+    /// Most recently used last. Always holds exactly the keys of `by_thread`.
+    lru: Vec<ThreadKey>,
     next_gen: u64,
     bytes: usize,
     account_index: HashMap<MsgId, ChatId>,
-    /// Bumped whenever the set or recency order of windowed chats changes.
+    /// Bumped whenever the set or recency order of windowed threads changes.
     rev: u64,
-    /// The chat whose view is open (set by [`Windows::open`], cleared by
+    /// The thread whose view is open (set by [`Windows::open`], cleared by
     /// [`Windows::close`]). The byte budget never evicts its window: the
     /// actor's open view, its loads and what they owe the UI all rely on
     /// it being retained (task 10g). Only its own growth trims it, within
     /// itself.
-    shown: Option<ChatId>,
+    shown: Option<ThreadKey>,
 }
 
 impl Windows {
-    /// Changes whenever [`Windows::chats`] may have changed.
+    /// Changes whenever [`Windows::threads`] may have changed.
     pub fn rev(&self) -> u64 {
         self.rev
     }
 
-    pub fn get(&self, chat: ChatId) -> Option<&Window> {
-        self.by_chat.get(&chat)
+    pub fn get(&self, thread: ThreadKey) -> Option<&Window> {
+        self.by_thread.get(&thread)
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -166,99 +166,99 @@ impl Windows {
         ViewGen(self.next_gen)
     }
 
-    /// Opens (or re-opens) a chat window, marking it most recently used. Returns the
-    /// generation that history completions for this view must carry.
-    pub fn open(&mut self, chat: ChatId) -> ViewGen {
+    /// Opens (or re-opens) a thread window, marking it most recently used.
+    /// Returns the generation that history completions for this view must carry.
+    pub fn open(&mut self, thread: ThreadKey) -> ViewGen {
         let view_gen = self.bump_gen();
         let w = self
-            .by_chat
-            .entry(chat)
+            .by_thread
+            .entry(thread)
             .or_insert_with(|| Window::new(view_gen));
         w.view_gen = view_gen;
         // Re-established by the tail this opening fetches.
         w.cache_contiguous = false;
-        self.shown = Some(chat);
-        self.lru.retain(|c| *c != chat);
-        self.lru.push(chat);
+        self.shown = Some(thread);
+        self.lru.retain(|t| *t != thread);
+        self.lru.push(thread);
         self.rev = self.rev.wrapping_add(1);
         while self.lru.len() > MAX_WINDOWS {
             let evicted = self.lru.remove(0);
             self.drop_window(evicted);
         }
-        debug_assert_eq!(self.lru.len(), self.by_chat.len());
+        debug_assert_eq!(self.lru.len(), self.by_thread.len());
         view_gen
     }
 
     /// Closes the view: pending completions become stale; messages stay cached.
-    pub fn close(&mut self, chat: ChatId) {
+    pub fn close(&mut self, thread: ThreadKey) {
         let view_gen = self.bump_gen();
-        if let Some(w) = self.by_chat.get_mut(&chat) {
+        if let Some(w) = self.by_thread.get_mut(&thread) {
             w.view_gen = view_gen;
             w.cache_contiguous = false;
         }
-        if self.shown == Some(chat) {
+        if self.shown == Some(thread) {
             self.shown = None;
         }
     }
 
-    /// The chat whose view is open, if any (see [`Windows::open`]).
-    pub fn shown(&self) -> Option<ChatId> {
+    /// The thread whose view is open, if any (see [`Windows::open`]).
+    pub fn shown(&self) -> Option<ThreadKey> {
         self.shown
     }
 
-    /// Marks `chat`'s disk cache as contiguous with the live tail (see
+    /// Marks `thread`'s disk cache as contiguous with the live tail (see
     /// [`Window::cache_contiguous`]). No-op without a window.
-    pub fn set_cache_contiguous(&mut self, chat: ChatId) {
-        if let Some(w) = self.by_chat.get_mut(&chat) {
+    pub fn set_cache_contiguous(&mut self, thread: ThreadKey) {
+        if let Some(w) = self.by_thread.get_mut(&thread) {
             w.cache_contiguous = true;
         }
     }
 
-    /// Whether `chat` has a window whose disk cache is contiguous.
-    pub fn is_cache_contiguous(&self, chat: ChatId) -> bool {
-        self.by_chat
-            .get(&chat)
+    /// Whether `thread` has a window whose disk cache is contiguous.
+    pub fn is_cache_contiguous(&self, thread: ThreadKey) -> bool {
+        self.by_thread
+            .get(&thread)
             .is_some_and(Window::cache_contiguous)
     }
 
-    /// Clears all messages of `chat` in place (keeping its LRU position) and
+    /// Clears all messages of `thread` in place (keeping its LRU position) and
     /// returns the new generation if it was cached.
-    pub fn invalidate(&mut self, chat: ChatId) -> Option<ViewGen> {
+    pub fn invalidate(&mut self, thread: ThreadKey) -> Option<ViewGen> {
         let view_gen = self.bump_gen();
-        let w = self.by_chat.get_mut(&chat)?;
+        let w = self.by_thread.get_mut(&thread)?;
         let old = std::mem::take(&mut w.messages);
         self.bytes = self.bytes.saturating_sub(w.bytes);
         w.reset(view_gen);
         for m in &old {
-            self.unindex(chat, m.id);
+            self.unindex(thread.chat, m.id);
         }
         Some(view_gen)
     }
 
-    /// Chats with a window, most recently used last.
-    pub fn chats(&self) -> impl Iterator<Item = ChatId> + '_ {
+    /// Threads with a window, most recently used last.
+    pub fn threads(&self) -> impl Iterator<Item = ThreadKey> + '_ {
         self.lru.iter().copied()
     }
 
     /// Clears every window (client rebuild), in recency order.
-    pub fn invalidate_all(&mut self) -> Vec<(ChatId, ViewGen)> {
-        let chats = self.lru.clone();
-        chats
+    pub fn invalidate_all(&mut self) -> Vec<(ThreadKey, ViewGen)> {
+        let threads = self.lru.clone();
+        threads
             .into_iter()
-            .filter_map(|c| self.invalidate(c).map(|g| (c, g)))
+            .filter_map(|t| self.invalidate(t).map(|g| (t, g)))
             .collect()
     }
 
-    fn drop_window(&mut self, chat: ChatId) {
-        debug_assert_ne!(self.shown, Some(chat), "the open window is never dropped");
+    fn drop_window(&mut self, thread: ThreadKey) {
+        debug_assert_ne!(self.shown, Some(thread), "the open window is never dropped");
         self.rev = self.rev.wrapping_add(1);
-        if let Some(w) = self.by_chat.remove(&chat) {
+        if let Some(w) = self.by_thread.remove(&thread) {
             self.bytes = self.bytes.saturating_sub(w.bytes);
             for m in &w.messages {
-                self.unindex(chat, m.id);
+                self.unindex(thread.chat, m.id);
             }
         }
-        self.lru.retain(|c| *c != chat);
+        self.lru.retain(|t| *t != thread);
     }
 
     fn index(&mut self, chat: ChatId, id: MsgId) {
@@ -279,34 +279,34 @@ impl Windows {
     }
 
     /// Inserts `msg` at its sorted position; caller guarantees it is absent.
-    fn insert_sorted(&mut self, chat: ChatId, pos: usize, msg: Message, change: &mut Change) {
-        let Some(w) = self.by_chat.get_mut(&chat) else {
+    fn insert_sorted(&mut self, thread: ThreadKey, pos: usize, msg: Message, change: &mut Change) {
+        let Some(w) = self.by_thread.get_mut(&thread) else {
             return;
         };
         let (id, added) = (msg.id, msg.retained_bytes());
         w.messages.insert(pos, msg);
         w.bytes += added;
         self.bytes += added;
-        self.index(chat, id);
+        self.index(thread.chat, id);
         change.inserted.push(id);
     }
 
-    /// Pops from `end` until the window is within the per-chat cap.
-    fn trim(&mut self, chat: ChatId, end: End, change: &mut Change) {
+    /// Pops from `end` until the window is within the per-window cap.
+    fn trim(&mut self, thread: ThreadKey, end: End, change: &mut Change) {
         while self
-            .by_chat
-            .get(&chat)
+            .by_thread
+            .get(&thread)
             .is_some_and(|w| w.messages.len() > MAX_MESSAGES_PER_CHAT)
-            && self.pop_one(chat, end, change)
+            && self.pop_one(thread, end, change)
         {}
     }
 
-    fn pop_one(&mut self, chat: ChatId, end: End, change: &mut Change) -> bool {
-        let Some(old) = self.by_chat.get_mut(&chat).and_then(|w| w.pop(end)) else {
+    fn pop_one(&mut self, thread: ThreadKey, end: End, change: &mut Change) -> bool {
+        let Some(old) = self.by_thread.get_mut(&thread).and_then(|w| w.pop(end)) else {
             return false;
         };
         self.bytes = self.bytes.saturating_sub(old.retained_bytes());
-        self.unindex(chat, old.id);
+        self.unindex(thread.chat, old.id);
         change.removed.push(old.id);
         true
     }
@@ -316,36 +316,36 @@ impl Windows {
     /// and the window detaches from the live tail.
     pub fn prepend(
         &mut self,
-        chat: ChatId,
+        thread: ThreadKey,
         view_gen: ViewGen,
         page: HistoryPage,
     ) -> Result<Change, Stale> {
-        let w = self.current(chat, view_gen)?;
+        let w = self.current(thread, view_gen)?;
         let bound = w.oldest();
         w.has_older = page.has_more;
         let older = sorted_unique(page.messages, |id| bound.is_none_or(|o| id < o));
         let mut change = Change::default();
         for m in older.into_iter().rev() {
-            self.insert_sorted(chat, 0, m, &mut change);
+            self.insert_sorted(thread, 0, m, &mut change);
         }
-        self.trim(chat, End::Newest, &mut change);
-        self.enforce_byte_budget(chat, End::Newest, &mut change);
+        self.trim(thread, End::Newest, &mut change);
+        self.enforce_byte_budget(thread, End::Newest, &mut change);
         Ok(change)
     }
 
     /// Adds a page of older history without ever dropping a message: of the
     /// page's messages older than the window, only the newest ones (adjacent
-    /// to the window, so it stays contiguous) that fit under the per-chat cap
+    /// to the window, so it stays contiguous) that fit under the per-window cap
     /// and the byte budget are inserted. For pages core fetches on its own,
     /// which must never move the end the user is looking at. When some did
     /// not fit, older history is still marked as existing.
     pub fn prepend_fitting(
         &mut self,
-        chat: ChatId,
+        thread: ThreadKey,
         view_gen: ViewGen,
         page: HistoryPage,
     ) -> Result<Change, Stale> {
-        let w = self.current(chat, view_gen)?;
+        let w = self.current(thread, view_gen)?;
         let bound = w.oldest();
         let room = MAX_MESSAGES_PER_CHAT.saturating_sub(w.messages.len());
         let more = page.has_more;
@@ -358,9 +358,9 @@ impl Windows {
                 fitted = false;
                 break;
             }
-            self.insert_sorted(chat, 0, m, &mut change);
+            self.insert_sorted(thread, 0, m, &mut change);
         }
-        if let Some(w) = self.by_chat.get_mut(&chat) {
+        if let Some(w) = self.by_thread.get_mut(&thread) {
             w.has_older = more || !fitted;
             debug_assert!(w.messages.len() <= MAX_MESSAGES_PER_CHAT);
         }
@@ -372,60 +372,60 @@ impl Windows {
     /// the window has reached the live tail again.
     pub fn append_newer(
         &mut self,
-        chat: ChatId,
+        thread: ThreadKey,
         view_gen: ViewGen,
         page: HistoryPage,
     ) -> Result<Change, Stale> {
-        let w = self.current(chat, view_gen)?;
+        let w = self.current(thread, view_gen)?;
         let bound = w.newest();
         w.has_newer = page.has_more;
         let newer = sorted_unique(page.messages, |id| bound.is_none_or(|n| id > n));
         let mut change = Change::default();
         for m in newer {
-            let pos = self.by_chat.get(&chat).map_or(0, |w| w.messages.len());
-            self.insert_sorted(chat, pos, m, &mut change);
+            let pos = self.by_thread.get(&thread).map_or(0, |w| w.messages.len());
+            self.insert_sorted(thread, pos, m, &mut change);
         }
-        self.trim(chat, End::Oldest, &mut change);
-        self.enforce_byte_budget(chat, End::Oldest, &mut change);
+        self.trim(thread, End::Oldest, &mut change);
+        self.enforce_byte_budget(thread, End::Oldest, &mut change);
         Ok(change)
     }
 
-    fn current(&mut self, chat: ChatId, view_gen: ViewGen) -> Result<&mut Window, Stale> {
-        self.by_chat
-            .get_mut(&chat)
+    fn current(&mut self, thread: ThreadKey, view_gen: ViewGen) -> Result<&mut Window, Stale> {
+        self.by_thread
+            .get_mut(&thread)
             .filter(|w| w.view_gen == view_gen)
             .ok_or(Stale)
     }
 
-    /// Applies a live message. Replaces it if cached. Otherwise inserts it only if
-    /// the window reaches the live tail and the message is not below loaded
-    /// history; past the cap, the oldest messages are dropped.
-    pub fn upsert(&mut self, msg: Message) -> Change {
-        let chat = msg.thread.chat;
+    /// Applies a live message to `thread`'s window. Replaces it if cached.
+    /// Otherwise inserts it only if the window reaches the live tail and the
+    /// message is not below loaded history; past the cap, the oldest
+    /// messages are dropped.
+    pub fn upsert(&mut self, thread: ThreadKey, msg: Message) -> Change {
         let mut change = Change::default();
-        let Some(w) = self.by_chat.get(&chat) else {
+        let Some(w) = self.by_thread.get(&thread) else {
             return change;
         };
         let pos = match w.find(msg.id) {
             Ok(_) => {
-                self.replace(msg);
+                self.replace(thread, msg);
                 return change;
             }
             Err(_) if w.has_newer => return change,
             Err(0) if !w.messages.is_empty() && w.has_older => return change,
             Err(pos) => pos,
         };
-        self.insert_sorted(chat, pos, msg, &mut change);
-        self.trim(chat, End::Oldest, &mut change);
-        self.enforce_byte_budget(chat, End::Oldest, &mut change);
+        self.insert_sorted(thread, pos, msg, &mut change);
+        self.trim(thread, End::Oldest, &mut change);
+        self.enforce_byte_budget(thread, End::Oldest, &mut change);
         change
     }
 
-    /// Replaces a cached message (edit). Never inserts: an edit of a message outside
-    /// the window must not create a hole in history. Returns whether it applied.
-    pub fn replace(&mut self, msg: Message) -> bool {
-        let chat = msg.thread.chat;
-        let Some(w) = self.by_chat.get_mut(&chat) else {
+    /// Replaces a message cached in `thread`'s window (edit). Never inserts:
+    /// an edit of a message outside the window must not create a hole in
+    /// history. Returns whether it applied.
+    pub fn replace(&mut self, thread: ThreadKey, msg: Message) -> bool {
+        let Some(w) = self.by_thread.get_mut(&thread) else {
             return false;
         };
         let Ok(pos) = w.find(msg.id) else {
@@ -438,23 +438,23 @@ impl Windows {
         let old = std::mem::replace(slot, msg).retained_bytes();
         w.bytes = w.bytes.saturating_sub(old) + added;
         self.bytes = self.bytes.saturating_sub(old) + added;
-        self.enforce_byte_budget(chat, End::Oldest, &mut Change::default());
+        self.enforce_byte_budget(thread, End::Oldest, &mut Change::default());
         true
     }
 
-    /// Removes messages from a chat window. Returns the ids actually removed.
+    /// Removes messages of `chat` (ids are per chat) from every window of
+    /// that chat. Returns the ids actually removed.
     pub fn delete(&mut self, chat: ChatId, ids: &[MsgId]) -> Vec<MsgId> {
-        let Some(w) = self.by_chat.get_mut(&chat) else {
-            return Vec::new();
-        };
         let mut removed = Vec::new();
-        for id in ids {
-            if let Ok(pos) = w.find(*id)
-                && let Some(m) = w.messages.remove(pos)
-            {
-                w.bytes = w.bytes.saturating_sub(m.retained_bytes());
-                self.bytes = self.bytes.saturating_sub(m.retained_bytes());
-                removed.push(m.id);
+        for (_, w) in self.by_thread.iter_mut().filter(|(t, _)| t.chat == chat) {
+            for id in ids {
+                if let Ok(pos) = w.find(*id)
+                    && let Some(m) = w.messages.remove(pos)
+                {
+                    w.bytes = w.bytes.saturating_sub(m.retained_bytes());
+                    self.bytes = self.bytes.saturating_sub(m.retained_bytes());
+                    removed.push(m.id);
+                }
             }
         }
         for id in &removed {
@@ -472,20 +472,20 @@ impl Windows {
             .collect()
     }
 
-    /// Evicts least recently used windows other than `keep` (the chat just
+    /// Evicts least recently used windows other than `keep` (the thread just
     /// mutated) and the open one, then trims `keep` from `end` (the side the
     /// user is not looking at). The open window is never evicted for another
-    /// chat's growth (task 10g). When it is `keep`, it is trimmed within
+    /// thread's growth (task 10g). When it is `keep`, it is trimmed within
     /// itself. Otherwise trimming `keep` always suffices: only `keep` grew,
     /// and the budget held before, so the open window alone fits.
-    fn enforce_byte_budget(&mut self, keep: ChatId, end: End, change: &mut Change) {
+    fn enforce_byte_budget(&mut self, keep: ThreadKey, end: End, change: &mut Change) {
         let shown = self.shown;
         while self.bytes > MAX_STORE_BYTES {
             let background = self
                 .lru
                 .iter()
                 .copied()
-                .find(|c| *c != keep && Some(*c) != shown);
+                .find(|t| *t != keep && Some(*t) != shown);
             if let Some(victim) = background {
                 self.drop_window(victim);
             } else if !self.pop_one(keep, end, change) {

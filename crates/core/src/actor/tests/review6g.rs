@@ -9,7 +9,7 @@ use super::{Harness, chat, harness};
 use crate::api::{AuthState, Command, Event, SendState, UserError};
 use crate::backend::Update;
 use crate::backend::fake::{FakeScript, Op, text_message};
-use crate::model::LocalId;
+use crate::model::{LocalId, ThreadKey};
 use crate::secret::SecretItem;
 
 /// The next `SendState` of `id` other than `Sending`, or its
@@ -49,7 +49,7 @@ async fn a_send_refused_behind_a_logout_is_retryable_after_stay_signed_in() {
     h.online().await;
     logout_stalled(&mut h).await;
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "later".into(),
         local_id: LocalId(5),
     })
@@ -143,19 +143,22 @@ async fn unread_after(h: &mut Harness, id: i32) -> u32 {
 async fn a_logout_overlay_makes_the_tail_unseen() {
     let mut h = harness(FakeScript::demo(1, 10), None).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(|e| matches!(e, Event::History { .. })).await;
-    h.send(Command::ViewingTail(Some(chat(1)))).await;
+    h.send(Command::ViewingTail(Some(ThreadKey::whole(chat(1)))))
+        .await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(unread_after(&mut h, 11).await, 0, "tail on screen");
     logout_stalled(&mut h).await;
     assert_eq!(unread_after(&mut h, 12).await, 1, "behind the overlay");
     // Queued by the UI before it saw the overlay.
-    h.send(Command::ViewingTail(Some(chat(1)))).await;
+    h.send(Command::ViewingTail(Some(ThreadKey::whole(chat(1)))))
+        .await;
     assert_eq!(unread_after(&mut h, 13).await, 2, "a stale report");
     stay_signed_in(&mut h).await;
     assert_eq!(unread_after(&mut h, 14).await, 3, "not painted yet");
-    h.send(Command::ViewingTail(Some(chat(1)))).await;
+    h.send(Command::ViewingTail(Some(ThreadKey::whole(chat(1)))))
+        .await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(unread_after(&mut h, 15).await, 3, "shown again");
     h.stop().await;

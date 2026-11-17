@@ -14,7 +14,7 @@ use crate::backend::BackendError;
 use crate::backend::fake::{
     FAKE_CODE, FAKE_SELF_HASH, FAKE_SELF_ID, FakeBackend, FakeScript, Fault, Op,
 };
-use crate::model::LocalId;
+use crate::model::{LocalId, ThreadKey};
 use crate::secret::{MemoryStore, SecretItem, SecretStore};
 use crate::session::{PersistHandle, signed_in_blob_with_key};
 
@@ -114,7 +114,7 @@ pub(super) async fn cache_the_demo_account(dir: &Path) -> MemoryStore {
     };
     let mut h = start(backend, fake, setup).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.history(chat(1), HistoryDir::Tail).await;
     let store = h.store.clone();
     h.stop().await;
@@ -135,7 +135,7 @@ async fn restart(store: &MemoryStore, dir: &Path, session: StoredSession) -> Har
 
 /// The first tail shown for chat 1 after opening it.
 pub(super) async fn first_tail(h: &mut Harness) -> Vec<i32> {
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     match h.history(chat(1), HistoryDir::Tail).await {
         Event::History { messages, .. } => messages.iter().map(|m| m.id.0).collect(),
         _ => unreachable!(),
@@ -156,7 +156,7 @@ async fn retained_cache_after_key_delete_failure_is_not_shown_to_another_account
     };
     let mut h = start(backend, fake, setup).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.history(chat(1), HistoryDir::Tail).await;
     h.faults.fail_delete_of(SecretItem::CacheKey);
     h.send(Command::Logout).await;
@@ -243,7 +243,7 @@ async fn second_migration_relogin_starts_a_fresh_account() {
         h.fake.inject(Op::Send, Fault::Hang);
     }
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "old account".into(),
         local_id: LocalId(1),
     })
@@ -251,7 +251,7 @@ async fn second_migration_relogin_starts_a_fresh_account() {
     for first in [true, false] {
         h.fake
             .inject(Op::History, Fault::Error(BackendError::Migrated));
-        h.send(Command::OpenChat(chat(1))).await;
+        h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
         h.until(|e| matches!(e, Event::Error(UserError::AccountMigrated)))
             .await;
         if first {

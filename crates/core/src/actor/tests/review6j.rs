@@ -10,7 +10,7 @@ use crate::actor::sends::{MAX_KEPT_SENDS, MAX_PENDING_SENDS};
 use crate::api::{Command, Event, SendState, UserError};
 use crate::backend::BackendError;
 use crate::backend::fake::{FakeScript, Fault, Op};
-use crate::model::LocalId;
+use crate::model::{LocalId, ThreadKey};
 
 /// How core answered a `SendText`.
 #[derive(Debug, PartialEq, Eq)]
@@ -25,7 +25,7 @@ enum Answer {
 async fn submit(h: &mut Harness, id: u64) -> Answer {
     let local = LocalId(id);
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: format!("m{id}"),
         local_id: local,
     })

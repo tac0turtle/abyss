@@ -5,7 +5,9 @@
 use grammers_client::tl;
 
 use super::peers::{Directory, chat_id};
-use crate::model::{Body, ChatId, MediaKind, Message, MsgId, Sender, ThreadKey};
+use crate::model::{
+    Body, ChatId, InvalidTopicId, MediaKind, Message, MsgId, Sender, ThreadKey, TopicId,
+};
 use crate::rich_text::{
     EntityKind, MAX_ENTITIES, MAX_TEXT_BYTES, MAX_URL_BYTES, RawEntity, RichText,
 };
@@ -17,8 +19,9 @@ const FILE: &str = "file";
 /// Names listed in a service message before "and N others".
 const MAX_LISTED_NAMES: usize = 3;
 
-/// Maps a TL message. `None` for empty messages, out-of-range peers and
-/// broadcast-channel posts (excluded in Stage 1).
+/// Maps a TL message. `None` for empty messages, out-of-range peers,
+/// broadcast-channel posts (excluded in Stage 1) and forum headers naming a
+/// non-positive topic (filing those under another topic would misfile them).
 pub(crate) fn message(raw: &tl::enums::Message, dir: &Directory) -> Option<Message> {
     match raw {
         tl::enums::Message::Empty(_) => None,
@@ -61,7 +64,7 @@ fn regular(m: &tl::types::Message, dir: &Directory) -> Option<Message> {
         },
         None => Body::Text(text),
     };
-    let (reply_to, topic) = reply_and_topic(m.reply_to.as_ref());
+    let (reply_to, topic) = kept(reply_and_topic(m.reply_to.as_ref()))?;
     Some(Message {
         id: MsgId(m.id),
         thread: ThreadKey { chat, topic },
@@ -83,9 +86,9 @@ fn service(m: &tl::types::MessageService, dir: &Directory) -> Option<Message> {
     let actor = m.from_id.as_ref().and_then(chat_id);
     let who = name_of(dir, actor);
     let text = describe(&m.action, &who, actor, dir);
-    let (reply_to, mut topic) = reply_and_topic(m.reply_to.as_ref());
+    let (reply_to, mut topic) = kept(reply_and_topic(m.reply_to.as_ref()))?;
     if matches!(m.action, tl::enums::MessageAction::TopicCreate(_)) {
-        topic = Some(m.id);
+        topic = Some(kept(TopicId::try_from(m.id))?);
     }
     Some(Message {
         id: MsgId(m.id),
@@ -114,25 +117,35 @@ fn sender(
     Some(Sender { id, name })
 }
 
+/// `None` for a malformed topic id, which drops the message; counted at
+/// debug. The id is not logged: it is server data with no use in a report.
+fn kept<T>(checked: Result<T, InvalidTopicId>) -> Option<T> {
+    if checked.is_err() {
+        tracing::debug!("message with a non-positive topic id dropped");
+    }
+    checked.ok()
+}
+
 /// `(reply_to, topic)`. In a forum every message of a topic replies to the
 /// topic root: that is its topic, not a reply. Replies to other chats are
-/// dropped (Stage 1 only quotes messages of the same chat).
+/// dropped (Stage 1 only quotes messages of the same chat). A forum header
+/// naming a non-positive topic is an error: the caller drops the message.
 pub(crate) fn reply_and_topic(
     header: Option<&tl::enums::MessageReplyHeader>,
-) -> (Option<MsgId>, Option<i32>) {
+) -> Result<(Option<MsgId>, Option<TopicId>), InvalidTopicId> {
     let Some(tl::enums::MessageReplyHeader::Header(h)) = header else {
-        return (None, None);
+        return Ok((None, None));
     };
     let reply = h
         .reply_to_msg_id
         .filter(|_| h.reply_to_peer_id.is_none())
         .map(MsgId);
     if !h.forum_topic {
-        return (reply, None);
+        return Ok((reply, None));
     }
     match h.reply_to_top_id {
-        Some(top) => (reply, Some(top)),
-        None => (None, h.reply_to_msg_id),
+        Some(top) => Ok((reply, Some(TopicId::try_from(top)?))),
+        None => Ok((None, h.reply_to_msg_id.map(TopicId::try_from).transpose()?)),
     }
 }
 

@@ -11,7 +11,7 @@ use crate::api::{
 use crate::backend::BackendError;
 use crate::backend::fake::{FAKE_SELF_HASH, FAKE_SELF_ID, FakeBackend, FakeScript, Fault, Op};
 use crate::credentials::EnvResolution;
-use crate::model::LocalId;
+use crate::model::{LocalId, ThreadKey};
 use crate::secret::{MemoryStore, SecretItem, SecretStore};
 
 /// Online with chat 1 open (older history exists), and `LocalId(1)`
@@ -19,7 +19,7 @@ use crate::secret::{MemoryStore, SecretItem, SecretStore};
 pub(super) async fn flooded(seconds: u32) -> Harness {
     let mut h = super::harness(FakeScript::demo(1, 120), None).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(|e| {
         matches!(
             e,
@@ -33,7 +33,7 @@ pub(super) async fn flooded(seconds: u32) -> Harness {
     h.fake
         .inject(Op::Send, Fault::Error(BackendError::FloodWait { seconds }));
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -97,8 +97,8 @@ async fn discard_while_the_marker_is_written_stops_the_automatic_retry() {
     // The first load is in flight when the second arrives (deferred).
     h.fake
         .inject(Op::History, Fault::Delay(Duration::from_secs(2)));
-    h.send(Command::LoadOlder(chat(1))).await;
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     h.until(older_answer).await;
     h.until(older_answer).await;
     h.send(Command::DiscardSend(LocalId(1))).await;
@@ -190,7 +190,7 @@ async fn revocation_after_a_failed_marker_takes_stay_signed_in_away() {
     })
     .await;
     h.fake.revoke_session();
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let server = |s: &AuthState| {
         matches!(
             s,

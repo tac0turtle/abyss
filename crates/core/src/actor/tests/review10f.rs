@@ -12,7 +12,7 @@ use crate::api::{Command, Event, HistoryDir, LoadTarget, SendState, UserError, W
 use crate::backend::fake::{FakeScript, Fault, Op, text_message};
 use crate::backend::{BackendError, Update};
 use crate::cache::CacheKey;
-use crate::model::{ChatId, LocalId, Message, MsgId};
+use crate::model::{ChatId, LocalId, Message, MsgId, ThreadKey};
 
 /// Older-page requests one user load makes before it gives up.
 fn requests() -> i32 {
@@ -20,28 +20,28 @@ fn requests() -> i32 {
 }
 
 fn reconciled_in(c: ChatId) -> impl Fn(&Event) -> bool {
-    move |e| matches!(e, Event::Reconciled { chat, .. } if *chat == c)
+    move |e| matches!(e, Event::Reconciled { thread, .. } if *thread == ThreadKey::whole(c))
 }
 
 fn older(e: &Event) -> bool {
-    matches!(e, Event::History { chat: c, dir: HistoryDir::Older, .. } if *c == chat(1))
+    matches!(e, Event::History { thread: c, dir: HistoryDir::Older, .. } if *c == ThreadKey::whole(chat(1)))
 }
 
 fn ended(e: &Event) -> bool {
     let target = LoadTarget::History {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         dir: HistoryDir::Older,
     };
     matches!(e, Event::LoadEnded { target: t, .. } if *t == target)
 }
 
 fn tail_of(c: ChatId) -> impl Fn(&Event) -> bool {
-    move |e| matches!(e, Event::History { chat, dir: HistoryDir::Tail, .. } if *chat == c)
+    move |e| matches!(e, Event::History { thread, dir: HistoryDir::Tail, .. } if *thread == ThreadKey::whole(c))
 }
 
 async fn open(h: &mut Harness) {
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(reconciled_in(chat(1))).await;
 }
 
@@ -60,9 +60,9 @@ async fn delete(h: &mut Harness, id: i32) {
 /// Switches to chat 2 and back to chat 1: a new view of chat 1, with its
 /// tail applied.
 async fn reopen(h: &mut Harness) {
-    h.send(Command::OpenChat(chat(2))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(2)))).await;
     h.until(tail_of(chat(2))).await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(reconciled_in(chat(1))).await;
 }
 
@@ -80,7 +80,7 @@ async fn an_older_load_cut_off_every_time_ends_with_an_error() {
         h.fake
             .inject(Op::History, Fault::Delay(Duration::from_secs(25)));
     }
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     // Request k runs from about 25k s; its edge (51 + k) goes at 25k + 1.
     for front in 51..51 + requests() {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -102,7 +102,7 @@ async fn an_older_load_cut_off_every_time_ends_with_an_error() {
     let made = h.fake.calls(Op::History) - before;
     assert_eq!(made, usize::try_from(requests()).unwrap(), "bounded");
     // The next request of the UI has a budget of its own.
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let (ev, skipped) = h.until(|e| ended(e) || older(e)).await;
     assert!(older(&ev), "{ev:?}");
     assert!(!skipped.iter().any(ended));
@@ -121,7 +121,7 @@ async fn a_cached_older_page_cut_off_every_time_ends_with_an_error() {
     let gate = cache.gate_older_reads();
     let mut h = harness(FakeScript::demo(1, 200), Some(cache.clone())).await;
     open_settled(&mut h, &cache).await;
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     for (k, front) in (151..151 + requests()).enumerate() {
         assert!(
             wait_for(|| gate.entered() > k).await,
@@ -170,7 +170,7 @@ async fn an_old_views_failure_does_not_end_the_new_views_load() {
     h.fake.lead(Op::History, Duration::from_secs(10));
     h.fake
         .inject(Op::History, Fault::Error(BackendError::Transient));
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     old_view_ends_quietly(h).await;
 }
 
@@ -181,7 +181,7 @@ async fn an_old_views_panic_does_not_end_the_new_views_load() {
     open(&mut h).await;
     h.fake.lead(Op::History, Duration::from_secs(10));
     h.fake.inject(Op::History, Fault::Panic);
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     old_view_ends_quietly(h).await;
 }
 
@@ -195,7 +195,7 @@ async fn old_view_ends_quietly(mut h: Harness) {
     h.fake
         .inject(Op::History, Fault::Delay(Duration::from_secs(20)));
     reopen(&mut h).await;
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let (ev, skipped) = h.until(|e| ended(e) || older(e)).await;
     assert!(older(&ev), "{ev:?}");
     assert_eq!(history_ids(&ev), (101..=150).collect::<Vec<_>>());
@@ -222,7 +222,7 @@ async fn a_stale_absorbed_fetch_leaves_nothing_behind() {
     h.fake
         .inject(Op::Send, Fault::Error(BackendError::SentUnconfirmed));
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -245,11 +245,11 @@ async fn a_stale_absorbed_fetch_leaves_nothing_behind() {
     tokio::time::sleep(Duration::from_secs(16)).await;
     h.send(Command::Window(WindowState::Active)).await;
     h.until(reconciled_in(chat(1))).await;
-    h.send(Command::LoadOlder(chat(1))).await; // absorbed by the fetch
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await; // absorbed by the fetch
     reopen(&mut h).await;
     tokio::time::sleep(Duration::from_secs(60)).await;
     h.drain();
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let (ev, _) = h.until(|e| ended(e) || older(e)).await;
     assert!(older(&ev) || ended(&ev));
     tokio::time::sleep(Duration::from_secs(60)).await;
@@ -267,7 +267,7 @@ async fn logout_with_an_older_load_in_flight_completes() {
     let mut h = harness(FakeScript::demo(2, 200), None).await;
     open(&mut h).await;
     h.fake.lead(Op::History, Duration::from_secs(10));
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     h.send(Command::Logout).await;
     h.auth(|s| matches!(s, crate::api::AuthState::LoggedOut { .. }))
@@ -294,7 +294,7 @@ async fn a_queued_older_load_purged_by_a_rebuild_is_answered() {
     for i in 0..max {
         let id = i64::try_from(i).unwrap() + 10;
         h.send(Command::MarkRead {
-            chat: chat(id),
+            thread: ThreadKey::whole(chat(id)),
             max_id: MsgId(1),
         })
         .await;
@@ -302,7 +302,7 @@ async fn a_queued_older_load_purged_by_a_rebuild_is_answered() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(h.fake.calls(Op::Read), max);
     let before = h.fake.calls(Op::History);
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(h.fake.calls(Op::History), before, "queued behind the reads");
     h.fake

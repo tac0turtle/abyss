@@ -14,12 +14,15 @@ async fn close_flushes_closes_and_stops_the_worker() {
     let c = user(1);
     let handle = CacheHandle::spawn(dir.clone(), &key).unwrap();
     handle
-        .write(worker::CacheCmd::PutMessages(c, vec![msg(c, 1, "a")]))
+        .write(worker::CacheCmd::PutMessages(
+            ThreadKey::whole(c),
+            vec![msg(c, 1, "a")],
+        ))
         .await;
     handle.close().await.unwrap();
     assert!(matches!(handle.chats().await, Err(WorkerError::Stopped)));
     let mut db = Cache::open(&dir, &key).unwrap();
-    assert_eq!(ids(&db.tail(c, 10).unwrap()), vec![1]);
+    assert_eq!(ids(&db.tail(ThreadKey::whole(c), 10).unwrap()), vec![1]);
 }
 
 /// Exit SIGSEGV fix: a worker is in the census from before its open until
@@ -48,7 +51,10 @@ async fn a_worker_leaves_the_census_only_after_closing() {
     let handle = CacheHandle::spawn(dir.clone(), &key).unwrap();
     let c = user(1);
     handle
-        .write(worker::CacheCmd::PutMessages(c, vec![msg(c, 1, "a")]))
+        .write(worker::CacheCmd::PutMessages(
+            ThreadKey::whole(c),
+            vec![msg(c, 1, "a")],
+        ))
         .await;
     drop(handle);
     assert!(
@@ -77,7 +83,10 @@ async fn a_worker_panic_closes_the_connection_before_leaving_the_census() {
     let handle = CacheHandle::spawn(dir.clone(), &key).unwrap();
     let c = user(1);
     handle
-        .write(worker::CacheCmd::PutMessages(c, vec![msg(c, 1, "a")]))
+        .write(worker::CacheCmd::PutMessages(
+            ThreadKey::whole(c),
+            vec![msg(c, 1, "a")],
+        ))
         .await;
     handle.barrier().await.unwrap();
     assert!(wal.exists(), "the connection is open");
@@ -192,8 +201,11 @@ fn roundtrip_survives_reopen() {
         let mut db = Cache::open(&dir, &key).unwrap();
         db.put_chats(&[summary(user(2), "b"), summary(c, "a")])
             .unwrap();
-        db.put_messages(c, &[msg(c, 3, "x"), msg(c, 1, "y"), msg(c, 2, "z")])
-            .unwrap();
+        db.put_messages(
+            ThreadKey::whole(c),
+            &[msg(c, 3, "x"), msg(c, 1, "y"), msg(c, 2, "z")],
+        )
+        .unwrap();
     }
     let mut db = Cache::open(&dir, &key).unwrap();
     let chats = db.chats().unwrap();
@@ -201,9 +213,15 @@ fn roundtrip_survives_reopen() {
         chats.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
         ["b", "a"]
     );
-    assert_eq!(ids(&db.tail(c, 2).unwrap()), [2, 3]);
-    assert_eq!(ids(&db.before(c, MsgId(3), 10).unwrap()), [1, 2]);
-    assert_eq!(ids(&db.after(c, MsgId(1), 1).unwrap()), [2]);
+    assert_eq!(ids(&db.tail(ThreadKey::whole(c), 2).unwrap()), [2, 3]);
+    assert_eq!(
+        ids(&db.before(ThreadKey::whole(c), MsgId(3), 10).unwrap()),
+        [1, 2]
+    );
+    assert_eq!(
+        ids(&db.after(ThreadKey::whole(c), MsgId(1), 1).unwrap()),
+        [2]
+    );
 }
 
 #[test]
@@ -211,7 +229,7 @@ fn wrong_key_is_detected_and_destroy_recovers() {
     let (_t, dir, key) = setup();
     Cache::open(&dir, &key)
         .unwrap()
-        .put_messages(user(1), &[msg(user(1), 1, "a")])
+        .put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 1, "a")])
         .unwrap();
     let other = CacheKey::generate().unwrap();
     assert!(matches!(
@@ -221,7 +239,7 @@ fn wrong_key_is_detected_and_destroy_recovers() {
     destroy_unopened(&dir).unwrap();
     assert!(!dir.exists());
     let mut db = Cache::open(&dir, &other).unwrap();
-    assert!(db.tail(user(1), 10).unwrap().is_empty());
+    assert!(db.tail(ThreadKey::whole(user(1)), 10).unwrap().is_empty());
 }
 
 #[test]
@@ -230,7 +248,7 @@ fn files_on_disk_are_encrypted() {
     {
         let mut db = Cache::open(&dir, &key).unwrap();
         db.put_chats(&[summary(user(1), SECRET)]).unwrap();
-        db.put_messages(user(1), &[msg(user(1), 1, SECRET)])
+        db.put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 1, SECRET)])
             .unwrap();
         // Leave the WAL populated: no checkpoint before inspecting.
         for name in std::iter::once("cache.db").chain(SIDE_FILES) {
@@ -290,7 +308,8 @@ fn a_symlinked_database_file_is_refused() {
     let other = t.path().join("other");
     {
         let mut db = Cache::open(&other, &key).unwrap();
-        db.put_messages(user(1), &[msg(user(1), 1, "a")]).unwrap();
+        db.put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 1, "a")])
+            .unwrap();
     }
     let target = other.join(DB_FILE);
     let before = std::fs::read(&target).unwrap();
@@ -314,7 +333,7 @@ fn symlinked_side_files_are_never_followed() {
         let _ = std::fs::remove_file(dir.join(&name));
         std::os::unix::fs::symlink(&victim, dir.join(&name)).unwrap();
         let wrote = Cache::open(&dir, &key)
-            .and_then(|mut db| db.put_messages(user(1), &[msg(user(1), 1, "a")]));
+            .and_then(|mut db| db.put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 1, "a")]));
         assert!(wrote.is_err(), "{side}: wrote through the link");
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched", "{side}");
     }
@@ -331,7 +350,8 @@ fn a_symlink_above_the_directory_is_allowed() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let dir = link.join("cache");
     let mut db = Cache::open(&dir, &key).unwrap();
-    db.put_messages(user(1), &[msg(user(1), 1, "a")]).unwrap();
+    db.put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 1, "a")])
+        .unwrap();
     assert!(real.join("cache").join(DB_FILE).exists());
 }
 
@@ -374,20 +394,20 @@ fn reconcile_removes_messages_deleted_on_server() {
     let c = user(1);
     let mut db = Cache::open(&dir, &key).unwrap();
     db.put_messages(
-        c,
+        ThreadKey::whole(c),
         &[msg(c, 1, ""), msg(c, 2, ""), msg(c, 3, ""), msg(c, 9, "")],
     )
     .unwrap();
     let gone = db
         .reconcile_range(
-            c,
+            ThreadKey::whole(c),
             MsgId(1),
             MsgId(5),
             &[msg(c, 1, ""), msg(c, 3, "edited"), msg(c, 4, "")],
         )
         .unwrap();
     assert_eq!(gone, [MsgId(2)]);
-    let all = db.tail(c, 100).unwrap();
+    let all = db.tail(ThreadKey::whole(c), 100).unwrap();
     assert_eq!(ids(&all), [1, 3, 4, 9]);
     assert_eq!(all[1].body, Body::Text(RichText::plain("edited")));
 }
@@ -401,22 +421,25 @@ fn unscoped_delete_skips_channels() {
         id: 2,
     };
     let mut db = Cache::open(&dir, &key).unwrap();
-    db.put_messages(a, &[msg(a, 5, "")]).unwrap();
-    db.put_messages(ch, &[msg(ch, 5, "")]).unwrap();
+    db.put_messages(ThreadKey::whole(a), &[msg(a, 5, "")])
+        .unwrap();
+    db.put_messages(ThreadKey::whole(ch), &[msg(ch, 5, "")])
+        .unwrap();
     assert_eq!(
         db.delete_unscoped(&[MsgId(5), MsgId(6)]).unwrap(),
         [(a, vec![MsgId(5)])]
     );
-    assert_eq!(ids(&db.tail(ch, 10).unwrap()), [5]);
+    assert_eq!(ids(&db.tail(ThreadKey::whole(ch), 10).unwrap()), [5]);
 }
 
 #[test]
 fn messages_for_other_chats_are_ignored_on_put() {
     let (_t, dir, key) = setup();
     let mut db = Cache::open(&dir, &key).unwrap();
-    db.put_messages(user(1), &[msg(user(2), 1, "")]).unwrap();
-    assert!(db.tail(user(1), 10).unwrap().is_empty());
-    assert!(db.tail(user(2), 10).unwrap().is_empty());
+    db.put_messages(ThreadKey::whole(user(1)), &[msg(user(2), 1, "")])
+        .unwrap();
+    assert!(db.tail(ThreadKey::whole(user(1)), 10).unwrap().is_empty());
+    assert!(db.tail(ThreadKey::whole(user(2)), 10).unwrap().is_empty());
 }
 
 #[test]
@@ -424,7 +447,8 @@ fn corrupt_rows_are_deleted_not_returned() {
     let (_t, dir, key) = setup();
     let c = user(1);
     let mut db = Cache::open(&dir, &key).unwrap();
-    db.put_messages(c, &[msg(c, 1, "ok")]).unwrap();
+    db.put_messages(ThreadKey::whole(c), &[msg(c, 1, "ok")])
+        .unwrap();
     let garbage = vec![0xFFu8; 32];
     let oversized = vec![0u8; MAX_ROW_BYTES + 1];
     for (id, body) in [(2, &garbage), (3, &oversized)] {
@@ -435,7 +459,7 @@ fn corrupt_rows_are_deleted_not_returned() {
             )
             .unwrap();
     }
-    assert_eq!(ids(&db.tail(c, 10).unwrap()), [1]);
+    assert_eq!(ids(&db.tail(ThreadKey::whole(c), 10).unwrap()), [1]);
     let left: i64 = db
         .conn()
         .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
@@ -463,11 +487,12 @@ fn version_1_messages_are_dropped_on_upgrade() {
     let c = user(1);
     {
         let mut db = Cache::open(&dir, &key).unwrap();
-        db.put_messages(c, &[msg(c, 1, "old")]).unwrap();
+        db.put_messages(ThreadKey::whole(c), &[msg(c, 1, "old")])
+            .unwrap();
         db.conn().execute_batch("PRAGMA user_version = 1").unwrap();
     }
     let mut db = Cache::open(&dir, &key).unwrap();
-    assert!(db.tail(c, 10).unwrap().is_empty());
+    assert!(db.tail(ThreadKey::whole(c), 10).unwrap().is_empty());
     assert_eq!(db.total_bytes(), 0);
     let version: i64 = db
         .conn()
@@ -483,12 +508,13 @@ fn version_2_chat_list_is_dropped_on_upgrade() {
     {
         let mut db = Cache::open(&dir, &key).unwrap();
         db.put_chats(&[summary(c, "c")]).unwrap();
-        db.put_messages(c, &[msg(c, 1, "kept")]).unwrap();
+        db.put_messages(ThreadKey::whole(c), &[msg(c, 1, "kept")])
+            .unwrap();
         db.conn().execute_batch("PRAGMA user_version = 2").unwrap();
     }
     let mut db = Cache::open(&dir, &key).unwrap();
     assert!(db.chats().unwrap().is_empty());
-    assert_eq!(ids(&db.tail(c, 10).unwrap()), [1]);
+    assert_eq!(ids(&db.tail(ThreadKey::whole(c), 10).unwrap()), [1]);
 }
 
 #[test]
@@ -498,8 +524,8 @@ fn per_chat_cap_drops_oldest() {
     let mut db = Cache::open(&dir, &key).unwrap();
     let cap = i32::try_from(MAX_CACHED_PER_CHAT).unwrap();
     let batch: Vec<_> = (1..=cap + 5).map(|i| msg(c, i, "")).collect();
-    db.put_messages(c, &batch).unwrap();
-    let oldest = db.after(c, MsgId(0), 1).unwrap();
+    db.put_messages(ThreadKey::whole(c), &batch).unwrap();
+    let oldest = db.after(ThreadKey::whole(c), MsgId(0), 1).unwrap();
     assert_eq!(ids(&oldest), [6]);
 }
 
@@ -511,21 +537,22 @@ fn byte_budget_evicts_least_recently_used_chat_first() {
     db.put_chats(&[summary(a, "a"), summary(b, "b")]).unwrap();
     let text = "t".repeat(1000);
     let fill = |c| (1..=2000).map(|i| msg(c, i, &text)).collect::<Vec<_>>();
-    db.put_messages(a, &fill(a)).unwrap();
+    db.put_messages(ThreadKey::whole(a), &fill(a)).unwrap();
     db.touch(a).unwrap();
     db.touch(b).unwrap(); // b is now most recent
-    db.put_messages(b, &fill(b)).unwrap();
+    db.put_messages(ThreadKey::whole(b), &fill(b)).unwrap();
     let per_chat = db.total_bytes() / 2;
     db.set_budget(per_chat + per_chat / 2);
-    db.put_messages(b, &[msg(b, 2001, "")]).unwrap();
+    db.put_messages(ThreadKey::whole(b), &[msg(b, 2001, "")])
+        .unwrap();
     assert!(db.total_bytes() <= per_chat + per_chat / 2);
-    assert_eq!(db.tail(b, 1).unwrap().len(), 1);
-    let a_left = db.after(a, MsgId(0), 1).unwrap();
+    assert_eq!(db.tail(ThreadKey::whole(b), 1).unwrap().len(), 1);
+    let a_left = db.after(ThreadKey::whole(a), MsgId(0), 1).unwrap();
     assert!(
         a_left.first().is_none_or(|m| m.id.0 > 1000),
         "a's oldest evicted first"
     );
-    let b_oldest = db.after(b, MsgId(0), 1).unwrap();
+    let b_oldest = db.after(ThreadKey::whole(b), MsgId(0), 1).unwrap();
     assert_eq!(ids(&b_oldest), [1], "most recent chat untouched");
 }
 
@@ -534,9 +561,12 @@ fn byte_accounting_matches_table() {
     let (_t, dir, key) = setup();
     let c = user(1);
     let mut db = Cache::open(&dir, &key).unwrap();
-    db.put_messages(c, &[msg(c, 1, "aaa"), msg(c, 2, "bbbbbb")])
-        .unwrap();
-    db.put_messages(c, &[msg(c, 1, "replaced with longer")])
+    db.put_messages(
+        ThreadKey::whole(c),
+        &[msg(c, 1, "aaa"), msg(c, 2, "bbbbbb")],
+    )
+    .unwrap();
+    db.put_messages(ThreadKey::whole(c), &[msg(c, 1, "replaced with longer")])
         .unwrap();
     db.delete_messages(c, &[MsgId(2)]).unwrap();
     let sum: i64 = db
@@ -572,7 +602,7 @@ fn key_v2_is_equivalent_to_pragma_raw_key() {
     let (_t, dir, key) = setup();
     Cache::open(&dir, &key)
         .unwrap()
-        .put_messages(user(1), &[msg(user(1), 1, "a")])
+        .put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 1, "a")])
         .unwrap();
     // Open with the documented PRAGMA form to prove sqlite3_key_v2 used the raw key.
     let conn = rusqlite::Connection::open(dir.join("cache.db")).unwrap();
@@ -594,18 +624,22 @@ fn rollback_keeps_byte_accounting_exact() {
     let (_t, dir, key) = setup();
     let c = user(1);
     let mut db = Cache::open(&dir, &key).unwrap();
-    db.put_messages(c, &[msg(c, 1, "first")]).unwrap();
+    db.put_messages(ThreadKey::whole(c), &[msg(c, 1, "first")])
+        .unwrap();
     sql(
         &db,
         "CREATE TEMP TRIGGER boom BEFORE INSERT ON messages WHEN NEW.id = 3
               BEGIN SELECT RAISE(ABORT, 'boom'); END;",
     );
     assert!(
-        db.put_messages(c, &[msg(c, 2, "second"), msg(c, 3, "third")])
-            .is_err()
+        db.put_messages(
+            ThreadKey::whole(c),
+            &[msg(c, 2, "second"), msg(c, 3, "third")]
+        )
+        .is_err()
     );
     assert_eq!(db.total_bytes(), stored_sum(&db));
-    assert_eq!(ids(&db.tail(c, 10).unwrap()), [1]);
+    assert_eq!(ids(&db.tail(ThreadKey::whole(c), 10).unwrap()), [1]);
 }
 
 #[test]
@@ -624,7 +658,7 @@ fn oversized_rows_are_never_materialized_or_stored() {
         &db,
         "INSERT INTO messages (kind, chat, id, size, body) VALUES (0, 1, 7, 1, zeroblob(8388608))",
     );
-    assert!(db.tail(user(1), 10).unwrap().is_empty());
+    assert!(db.tail(ThreadKey::whole(user(1)), 10).unwrap().is_empty());
 }
 
 #[test]
@@ -648,8 +682,9 @@ fn rows_with_mismatched_identity_or_unclean_fields_are_rejected() {
             )
             .unwrap();
     }
-    db.put_messages(c, &[msg(c, 2, "ok"), spoof]).unwrap(); // invalid one skipped on write too
-    assert_eq!(ids(&db.tail(c, 10).unwrap()), [2]);
+    db.put_messages(ThreadKey::whole(c), &[msg(c, 2, "ok"), spoof])
+        .unwrap(); // invalid one skipped on write too
+    assert_eq!(ids(&db.tail(ThreadKey::whole(c), 10).unwrap()), [2]);
 }
 
 #[test]
@@ -657,12 +692,13 @@ fn reconcile_ignores_same_id_from_another_chat() {
     let (_t, dir, key) = setup();
     let (a, b) = (user(1), user(2));
     let mut db = Cache::open(&dir, &key).unwrap();
-    db.put_messages(a, &[msg(a, 5, "")]).unwrap();
+    db.put_messages(ThreadKey::whole(a), &[msg(a, 5, "")])
+        .unwrap();
     let gone = db
-        .reconcile_range(a, MsgId(1), MsgId(9), &[msg(b, 5, "")])
+        .reconcile_range(ThreadKey::whole(a), MsgId(1), MsgId(9), &[msg(b, 5, "")])
         .unwrap();
     assert_eq!(gone, [MsgId(5)]);
-    assert!(db.tail(a, 10).unwrap().is_empty());
+    assert!(db.tail(ThreadKey::whole(a), 10).unwrap().is_empty());
 }
 
 #[test]
@@ -713,7 +749,8 @@ fn bind_claims_an_empty_cache_and_refuses_another_account() {
     let mut db = Cache::open(&dir, &key).unwrap();
     assert_eq!(db.bind(None).unwrap(), Binding::Blank);
     assert_eq!(db.bind(Some(7)).unwrap(), Binding::Claimed);
-    db.put_messages(user(1), &[msg(user(1), 1, "a")]).unwrap();
+    db.put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 1, "a")])
+        .unwrap();
     assert_eq!(db.bind(Some(7)).unwrap(), Binding::Same);
     assert_eq!(db.bind(Some(8)).unwrap(), Binding::Foreign);
     assert_eq!(db.bind(None).unwrap(), Binding::Foreign, "owned");

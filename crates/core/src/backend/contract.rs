@@ -15,7 +15,7 @@ use super::{
     Backend, BackendError, Client, HistoryQuery, Instance, InstanceControl, Seed, SessionSeed,
     SessionSnapshot, StreamError, StreamItem, Update, UpdateStream,
 };
-use crate::model::{ChatId, Message, MsgId};
+use crate::model::{ChatId, Message, MsgId, ThreadKey};
 
 /// Core's bootstrap waits this long for the baseline (plan section 2).
 const BASELINE_WAIT: Duration = Duration::from_secs(10);
@@ -105,7 +105,7 @@ async fn check_dialogs(client: &impl Client) -> Vec<ChatId> {
 
 async fn check_history(client: &impl Client, chat: ChatId) -> Option<MsgId> {
     let tail = client
-        .history(chat, HistoryQuery::Tail, HISTORY)
+        .history(ThreadKey::whole(chat), HistoryQuery::Tail, HISTORY)
         .await
         .expect("tail");
     assert_history(&tail.messages, chat, HISTORY);
@@ -115,7 +115,7 @@ async fn check_history(client: &impl Client, chat: ChatId) -> Option<MsgId> {
     );
     let first = tail.messages.first()?;
     let older = client
-        .history(chat, HistoryQuery::Before(first.id), 5)
+        .history(ThreadKey::whole(chat), HistoryQuery::Before(first.id), 5)
         .await
         .expect("older");
     assert_history(&older.messages, chat, 5);
@@ -127,7 +127,7 @@ async fn check_history(client: &impl Client, chat: ChatId) -> Option<MsgId> {
         );
     }
     let newer = client
-        .history(chat, HistoryQuery::After(first.id), 5)
+        .history(ThreadKey::whole(chat), HistoryQuery::After(first.id), 5)
         .await
         .expect("newer");
     assert_history(&newer.messages, chat, 5);
@@ -171,7 +171,7 @@ async fn check_rebuild<B: Backend>(
         .expect("stream");
     assert!(matches!(first, StreamItem::Baseline));
     let tail = client
-        .history(chat, HistoryQuery::Tail, HISTORY)
+        .history(ThreadKey::whole(chat), HistoryQuery::Tail, HISTORY)
         .await
         .expect("the carried chat is addressable after a rebuild");
     assert_history(&tail.messages, chat, HISTORY);
@@ -191,15 +191,18 @@ async fn check_send(client: &impl Client, chat: ChatId) -> MsgId {
     let rid = random_id();
     let text = format!("abyss contract check {}", rid.unsigned_abs() % 10_000);
     let id = client
-        .send_text(chat, text.clone(), rid)
+        .send_text(ThreadKey::whole(chat), text.clone(), rid)
         .await
         .expect("send");
-    match client.send_text(chat, text.clone(), rid).await {
+    match client
+        .send_text(ThreadKey::whole(chat), text.clone(), rid)
+        .await
+    {
         Ok(again) => assert_eq!(again, id, "a resend must not create a message"),
         Err(e) => assert_eq!(e, BackendError::SentUnconfirmed),
     }
     let tail = client
-        .history(chat, HistoryQuery::Tail, HISTORY)
+        .history(ThreadKey::whole(chat), HistoryQuery::Tail, HISTORY)
         .await
         .expect("tail after send");
     let copies: Vec<&Message> = tail.messages.iter().filter(|m| m.id == id).collect();
@@ -249,7 +252,10 @@ pub(crate) async fn run<B: Backend>(backend: &B, target: Option<ChatId>, sends: 
         newest = Some(check_send(&client, chat).await);
     }
     if let Some(max_id) = newest {
-        client.read_history(chat, max_id).await.expect("read mark");
+        client
+            .read_history(ThreadKey::whole(chat), max_id)
+            .await
+            .expect("read mark");
     }
 
     control.quit();

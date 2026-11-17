@@ -165,7 +165,7 @@ fn state_label(state: SendState) -> SharedString {
 mod send_label_tests {
     use std::time::Duration;
 
-    use abyss_core::model::{ChatId, LocalId, PeerKind};
+    use abyss_core::model::{ChatId, LocalId, PeerKind, ThreadKey};
 
     use super::*;
     use crate::chat::sends::Echoes;
@@ -178,7 +178,7 @@ mod send_label_tests {
         };
         let mut echoes = Echoes::default();
         echoes
-            .push(Echo::new(LocalId(1), chat, "x".into(), 0))
+            .push(Echo::new(LocalId(1), ThreadKey::whole(chat), "x".into(), 0))
             .unwrap();
         echoes.admitted(LocalId(1));
         let now = Instant::now();

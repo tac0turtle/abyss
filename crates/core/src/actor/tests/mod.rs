@@ -27,6 +27,7 @@ mod review6g;
 mod review6h;
 mod review6i;
 mod review6j;
+mod topic_keys;
 mod watchdog;
 
 use std::path::PathBuf;
@@ -46,7 +47,7 @@ use crate::backend::fake::{
 use crate::backend::{BackendError, Update};
 use crate::cache::{CacheHandle, CacheKey};
 use crate::events::{self, EventReceiver};
-use crate::model::{ChatId, LocalId, MsgId, PeerKind};
+use crate::model::{ChatId, LocalId, MsgId, PeerKind, ThreadKey};
 use crate::secret::{FaultControl, FaultyStore, MemoryStore, SecretItem, SecretStore};
 use crate::session::{PersistHandle, signed_in_blob};
 
@@ -300,7 +301,7 @@ impl Harness {
     }
 
     async fn history(&mut self, c: ChatId, d: HistoryDir) -> Event {
-        self.until(|e| matches!(e, Event::History { chat, dir, .. } if *chat == c && *dir == d))
+        self.until(|e| matches!(e, Event::History { thread, dir, .. } if *thread == ThreadKey::whole(c) && *dir == d))
             .await
             .0
     }
@@ -349,11 +350,11 @@ async fn loads_dialogs_and_tail() {
     let (ev, _) = h.until(|e| matches!(e, Event::DialogsReset(_))).await;
     assert!(matches!(ev, Event::DialogsReset(v) if v.len() == 3));
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let ev = h.history(chat(1), HistoryDir::Tail).await;
     assert_eq!(history_ids(&ev), (71..=120).collect::<Vec<_>>());
     assert!(matches!(ev, Event::History { has_more: true, .. }));
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let ev = h.history(chat(1), HistoryDir::Older).await;
     assert_eq!(history_ids(&ev), (21..=70).collect::<Vec<_>>());
     h.stop().await;
@@ -418,7 +419,7 @@ async fn refresh_merges_the_first_page_into_loaded_pages() {
 #[tokio::test(start_paused = true)]
 async fn commands_before_online_wait_for_the_bootstrap() {
     let mut h = harness(FakeScript::demo(2, 10), None).await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let ev = h.history(chat(1), HistoryDir::Tail).await;
     assert_eq!(history_ids(&ev).len(), 10);
     h.online().await;
@@ -431,16 +432,17 @@ async fn stale_completion_after_close_is_dropped() {
     script.latency = Duration::from_secs(1);
     let mut h = harness(script, None).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
-    h.send(Command::CloseChat(chat(1))).await;
-    h.send(Command::OpenChat(chat(2))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
+    h.send(Command::CloseThread(ThreadKey::whole(chat(1))))
+        .await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(2)))).await;
     let (_, skipped) = h
-        .until(|e| matches!(e, Event::History { chat: c, .. } if *c == chat(2)))
+        .until(|e| matches!(e, Event::History { thread: c, .. } if *c == ThreadKey::whole(chat(2))))
         .await;
     assert!(
-        !skipped
-            .iter()
-            .any(|e| matches!(e, Event::History { chat: c, .. } if *c == chat(1)))
+        !skipped.iter().any(
+            |e| matches!(e, Event::History { thread: c, .. } if *c == ThreadKey::whole(chat(1)))
+        )
     );
     assert_eq!(h.fake.calls(Op::History), 2);
     h.stop().await;
@@ -450,10 +452,10 @@ async fn stale_completion_after_close_is_dropped() {
 async fn panic_in_backend_is_contained() {
     let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.fake.inject(Op::History, Fault::Panic);
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(|e| matches!(e, Event::Error(UserError::Internal)))
         .await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let ev = h.history(chat(1), HistoryDir::Tail).await;
     assert_eq!(history_ids(&ev).len(), 10);
     h.stop().await;
@@ -471,7 +473,7 @@ async fn send_retries_transient_with_same_random_id() {
             .inject(Op::Send, Fault::Error(BackendError::Transient));
     }
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -497,7 +499,7 @@ async fn send_unknown_after_retries_then_manual_retry() {
         h.fake.inject(Op::Send, Fault::Hang);
     }
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(7),
     })
@@ -531,7 +533,7 @@ async fn rejected_send_fails_and_empty_text_is_refused() {
     h.fake
         .inject(Op::Send, Fault::Error(BackendError::Rejected));
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -545,7 +547,7 @@ async fn rejected_send_fails_and_empty_text_is_refused() {
         }
     ));
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "  ".into(),
         local_id: LocalId(2),
     })
@@ -568,7 +570,7 @@ async fn rejected_send_fails_and_empty_text_is_refused() {
 async fn live_messages_extend_open_window_and_bump_others() {
     let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.until(|e| matches!(e, Event::DialogsReset(_))).await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.history(chat(1), HistoryDir::Tail).await;
     h.fake
         .push_update(Update::NewMessage(text_message(chat(1), 11, "new")))
@@ -598,7 +600,7 @@ async fn mark_read_coalesces_per_flush() {
     let h = harness(FakeScript::demo(1, 10), None).await;
     for id in [3, 7, 5] {
         h.send(Command::MarkRead {
-            chat: chat(1),
+            thread: ThreadKey::whole(chat(1)),
             max_id: MsgId(id),
         })
         .await;
@@ -644,9 +646,13 @@ fn cache_at(dir: &std::path::Path, key: &CacheKey) -> CacheHandle {
 /// Once online, opens chat 1 and waits until the server tail is applied: after
 /// the cached tail, if the cache holds one.
 async fn open_settled(h: &mut Harness, cache: &CacheHandle) {
-    let cached = !cache.tail(chat(1), 1).await.unwrap().is_empty();
+    let cached = !cache
+        .tail(ThreadKey::whole(chat(1)), 1)
+        .await
+        .unwrap()
+        .is_empty();
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     for _ in 0..=usize::from(cached) {
         h.history(chat(1), HistoryDir::Tail).await;
     }
@@ -657,7 +663,7 @@ async fn session(script: FakeScript, cache: CacheHandle, older: usize) -> FakeHa
     let mut h = harness(script, Some(cache.clone())).await;
     open_settled(&mut h, &cache).await;
     for _ in 0..older {
-        h.send(Command::LoadOlder(chat(1))).await;
+        h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
         h.history(chat(1), HistoryDir::Older).await;
     }
     let fake = h.fake.clone();
@@ -676,7 +682,7 @@ async fn cache_serves_history_offline_then_reconciles() {
     let cache = cache_at(dir.path(), &key);
     let mut h = harness(FakeScript::demo(1, 200), Some(cache.clone())).await;
     h.fake.inject(Op::History, Fault::Hang);
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let ev = h.history(chat(1), HistoryDir::Tail).await;
     assert_eq!(history_ids(&ev), (151..=200).collect::<Vec<_>>());
     // A rebuild meanwhile shows the cached tail again rather than nothing.
@@ -695,7 +701,7 @@ async fn cache_serves_history_offline_then_reconciles() {
     assert!(
         skipped
             .iter()
-            .any(|e| matches!(e, Event::ChatInvalidated(c) if *c == chat(1)))
+            .any(|e| matches!(e, Event::ThreadInvalidated(c) if *c == ThreadKey::whole(chat(1))))
     );
     h.stop().await;
 
@@ -708,7 +714,7 @@ async fn cache_serves_history_offline_then_reconciles() {
         .retain(|m| m.id != MsgId(190));
     let cache = cache_at(dir.path(), &key);
     session(script, cache.clone(), 0).await;
-    let tail = cache.tail(chat(1), 50).await.unwrap();
+    let tail = cache.tail(ThreadKey::whole(chat(1)), 50).await.unwrap();
     assert!(!tail.iter().any(|m| m.id == MsgId(190)));
     assert_eq!(tail.last().map(|m| m.id), Some(MsgId(200)));
 }
@@ -723,7 +729,7 @@ async fn contiguous_cache_serves_older_pages_without_the_server() {
     let mut h = harness(FakeScript::demo(1, 300), Some(cache.clone())).await;
     open_settled(&mut h, &cache).await;
     let server_calls = h.fake.calls(Op::History);
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let ev = h.history(chat(1), HistoryDir::Older).await;
     assert_eq!(history_ids(&ev), (201..=250).collect::<Vec<_>>());
     assert_eq!(
@@ -743,7 +749,10 @@ async fn gap_in_cache_is_replaced_by_server_tail() {
     // 200 more messages arrived while offline: the new tail does not overlap.
     let cache = cache_at(dir.path(), &key);
     session(FakeScript::demo(1, 300), cache.clone(), 0).await;
-    let older = cache.before(chat(1), MsgId(251), 50).await.unwrap();
+    let older = cache
+        .before(ThreadKey::whole(chat(1)), MsgId(251), 50)
+        .await
+        .unwrap();
     assert!(
         older.is_empty(),
         "stale pre-gap history must be dropped, got {}",
@@ -759,7 +768,7 @@ async fn erase_runs_after_queued_writes() {
     for i in 1..=100 {
         cache
             .write(crate::cache::CacheCmd::PutMessages(
-                chat(1),
+                ThreadKey::whole(chat(1)),
                 vec![text_message(chat(1), i, "x")],
             ))
             .await;
@@ -774,7 +783,7 @@ async fn erase_runs_after_queued_writes() {
     assert!(res.is_ok(), "erase failed: {res:?}");
     assert!(rx.try_recv().is_ok(), "key deletion ran");
     assert!(
-        cache.tail(chat(1), 10).await.is_err(),
+        cache.tail(ThreadKey::whole(chat(1)), 10).await.is_err(),
         "worker stops after erase"
     );
     assert!(std::fs::read_dir(dir.path()).map_or(true, |d| d.count() == 0));

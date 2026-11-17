@@ -13,6 +13,7 @@ use crate::actor::logout::{erase_cache, open_cache};
 use crate::api::{Command, HistoryDir};
 use crate::backend::fake::{FakeBackend, FakeScript, QuitBehavior};
 use crate::cache::{Cache, CacheError, CacheKey, Refused, wait_closed};
+use crate::model::ThreadKey;
 use crate::secret::{MemoryStore, SecretItem, SecretStore, StoreError};
 use crate::session::PersistHandle;
 
@@ -31,7 +32,7 @@ async fn shutdown_closes_the_cache_while_retirement_still_runs() {
     };
     let mut h = start(backend, fake, setup).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.history(chat(1), HistoryDir::Tail).await;
     h.fake.set_quit(QuitBehavior::Ignore);
 

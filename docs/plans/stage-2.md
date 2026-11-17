@@ -878,7 +878,8 @@ Each task is one implementation and review cycle on `agent/stage-2`, recorded in
 1. **Re-key by `ThreadKey`** (no behaviour change).
    - Add the validated `TopicId` (private field, `TryFrom<i32>`, serde `try_from`, `GENERAL`). Change `ThreadKey.topic` to `Option<TopicId>`, and make `reply_and_topic` drop messages with malformed ids.
    - Re-key the commands, events, `Windows` (including `cache_contiguous` per thread), the actor's history and read maps, pending sends, covers, the cache API and `CacheCmd`s (`ThreadKey` arguments, still ignoring topic in SQL), and the app's selection, drafts and echoes.
-   - Topic is always `None`.
+   - Topic is always `None` in **keys**: commands, events, windows, the actor's maps, pending sends and cache arguments use `ThreadKey { chat, topic: None }`. Message **payloads** keep the raw topic the server stated (`Message.thread.topic` may be `Some` for forum messages); core files every message under its whole chat (`apply::shown_in`) without rewriting it.
+   - So the section 3/6.2 invariant (a message's `thread` equals its window's key) does **not** hold yet. Normalization through `route` and the window/event key-equality enforcement are deferred to task 7; the cache's row-key and `TopicId` enforcement to task 5.
    
    *Done when:*
    - every existing test passes unchanged apart from the renames;
@@ -888,14 +889,14 @@ Each task is one implementation and review cycle on `agent/stage-2`, recorded in
 2. **Topic model, ordering and merge policy** (pure code). `Topic`, `TopicOrder`, `Freshness`, `Visibility`, `Deletion`, `route`, and `TopicList` with ordering per mode, caps, the clock, per-group stamps and the merge rule, due state with backoff and the round-robin drain, disposable discovery, tombstones with overflow invalidation, and the new-message and edit reducers. Also the pure badge stamp ordering of section 7. *Done when:* the proptests for `route`, `TopicList` ordering, the merge policy, the reducers and the forum badge pass, including the round-3 finding 1, 2 and 7 counterexamples as fixed cases, the drain under continuous reordering and a continuously due open topic (≤ 27 calls), the automatic-refresh limiter, the badge dirty bits and the round-5 crossing deletion as a fixed case, and the memory-bound test passes.
 3. **Backend trait and fake.** Add `topics`, `topics_by_id`, `peer_dialogs` and the new `Update` variants. Give the re-keyed `history`/`send_text`/`read_history` topic behaviour in the fake. Add the fake forum data in both orders, the controls (including `drop_next_update` and `set_topic_order`), the ops and faults, demo forums, and contract cases. *Done when:* the contract suite passes against the fake, and `cargo dev` data includes forums with paging-sized topic lists (not yet shown).
 4. **Grammers implementation.** Raw `getForumTopics` (both orders, cursor per mode), `getForumTopicsByID`, `getPeerDialogs`, `getReplies`, `readDiscussion`, `sendMessage.reply_to`, the response size checks, id validation, and the new update mappings, with U1/U2 behind one function each. *Done when:* the mapping and request tests in section 11 pass, it builds in the production configuration, and the log tests show no title leaking.
-5. **Cache schema v4.** The topic column, index and migration; thread-filtered queries; thread-scoped `reconcile_range`; **`ReconcileTail` re-keyed with its overlap query and replace scope per thread**; the row key and `TopicId` check. *Done when:* the cache tests in section 11 pass (including the section 10 example as a test, sibling-topic preservation, and the proptests), and the existing cache tests pass.
+5. **Cache schema v4.** The topic column, index and migration; thread-filtered queries; thread-scoped `reconcile_range`; **`ReconcileTail` re-keyed with its overlap query and replace scope per thread**; the row key and `TopicId` check. *Done when:* the cache tests in section 11 pass (including the section 10 example as a test, sibling-topic preservation, and the proptests), and the existing cache tests pass. This task takes over the cache-side enforcement task 1 deferred: rows checked against the decoded `thread` and its `TopicId`.
 6. **Core topic lists.**
    - `OpenForum`/`CloseForum`/`LoadTopics`, `TopicsGen`, the paging events, LRU.
    - Applying page and by-id results through the merge policy; the by-id drain (shown forum only, open topic first, rate-limited); fresh by-id deletions.
    - Bootstrap, reconcile and light-refresh additions, including the open topic by id.
    
    *Done when:* the "opening a forum", "crossing responses", "top-message deletion", "draining" (with reordering and a continuously due open topic), "repeated overflow", "by-id flood wait", "open topic beyond page one", "deleted while offline" and bootstrap actor tests pass, and a stale page is provably dropped.
-7. **Core topic threads.** Opening a topic thread, history, the cache per thread under the continuity gate, `Reconciled`, invalidation, and normalization of everything entering windows and the cache through `route`. *Done when:* the "topic thread" and "cache continuity" actor tests pass, and the thread-equals-key invariant holds under the existing history proptests run with topics.
+7. **Core topic threads.** Opening a topic thread, history, the cache per thread under the continuity gate, `Reconciled`, invalidation, and normalization of everything entering windows and the cache through `route`. *Done when:* the "topic thread" and "cache continuity" actor tests pass, and the thread-equals-key invariant holds under the existing history proptests run with topics. This task replaces task 1's temporary `apply::shown_in` (whole-chat keys, raw message topics) with `route` normalization, and enforces key equality for windows and events.
 8. **Core live routing, forum badge, forum flag.**
    - Routing and topic bumps; unknown-topic by-id fetches with caps; General; topic edits and pins; root deletion.
    - The badge queue and section 7's set-only badge.
@@ -1045,3 +1046,10 @@ Follow-ups (not Stage 2 tasks):
 |---|---|---|
 | 1 | P3: the budget table still said "3 tries each, then abandoned" | Reworded to the per-fence budgets and the 4-attempt bound (section 9) |
 | 2 | P3: no test of cumulative failures across a check and its recheck, or of budgets across a rebuild | Fence-budget trace test added (section 11) |
+
+### Task 1: re-key by `ThreadKey` (verdict: ready after fixes; no P0–P2)
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | P3: "topic is always `None`" was false for message payloads; the key-equality invariant doesn't hold yet | Task 1 text says `None` applies to keys only; normalization and window/event equality deferred to task 7, cache enforcement to task 5; `shown_in` documents the hand-off |
+| 2 | P3: no regression test for a topic-tagged message in a whole-chat window | `actor/tests/topic_keys.rs` (deliver and edit into an open window; no cache write-through for a closed one) and an invalid `TopicCreate` id case in `map.rs` |

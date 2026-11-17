@@ -12,6 +12,7 @@ use crate::api::{
     UserError,
 };
 use crate::backend::fake::{FakeBackend, FakeScript, Fault, Op, QuitBehavior};
+use crate::model::ThreadKey;
 use crate::secret::{MemoryStore, SecretItem, SecretStore};
 use crate::session::PersistHandle;
 
@@ -177,7 +178,7 @@ async fn remote_revocation_wipes_local_data() {
     let mut h = harness(FakeScript::demo(2, 5), None).await;
     h.online().await;
     h.fake.revoke_session();
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let (remote, local) = h.logged_out().await;
     assert_eq!(
         (remote, local),

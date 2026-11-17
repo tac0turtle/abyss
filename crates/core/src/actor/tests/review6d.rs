@@ -14,7 +14,7 @@ use crate::backend::fake::{
     BuildFault, FAKE_API_ID, FAKE_CODE, FakeBackend, FakeScript, Fault, Op, fake_credentials,
 };
 use crate::credentials::EnvResolution;
-use crate::model::LocalId;
+use crate::model::{LocalId, ThreadKey};
 use crate::secret::{SecretItem, SecretStore};
 
 const PHONE: &str = "+44 7700 900123";
@@ -316,7 +316,7 @@ async fn flood_window_is_enforced_at_replay_after_a_long_outage() {
         Fault::Error(BackendError::FloodWait { seconds: 500 }),
     );
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -406,7 +406,7 @@ async fn rebind_report_before_the_task_finishes_still_adopts_the_cache() {
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     hold.add_permits(1);
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let tail = h.history(chat(1), HistoryDir::Tail).await;
     assert!(!history_ids(&tail).is_empty());
     let store = h.store.clone();
@@ -439,19 +439,19 @@ async fn commands_queued_after_logout_never_act_for_the_next_account() {
     h.send(Command::Logout).await;
     // Queued behind the Logout before the UI saw any of its events.
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "for account A".into(),
         local_id: LocalId(7),
     })
     .await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.send(Command::RetrySend(LocalId(7))).await;
     h.auth(|s| matches!(s, AuthState::LoggedOut { .. })).await;
     h.fake.sign_in_as(OTHER_ID);
     h.log_in().await;
     // Made in account A's epoch, delivered after B signed in.
     let stale = Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "stale".into(),
         local_id: LocalId(8),
     };

@@ -9,14 +9,14 @@ use super::{Harness, chat, harness, history_ids};
 use crate::api::{Command, Event, HistoryDir, LoadTarget, SendState, WindowState};
 use crate::backend::fake::{FakeScript, Fault, Op, text_message};
 use crate::backend::{BackendError, Update};
-use crate::model::{LocalId, Message, MsgId};
+use crate::model::{LocalId, Message, MsgId, ThreadKey};
 
 fn reconciled(e: &Event) -> bool {
-    matches!(e, Event::Reconciled { chat: c, .. } if *c == chat(1))
+    matches!(e, Event::Reconciled { thread: c, .. } if *c == ThreadKey::whole(chat(1)))
 }
 
 fn older(e: &Event) -> bool {
-    matches!(e, Event::History { chat: c, dir: HistoryDir::Older, .. } if *c == chat(1))
+    matches!(e, Event::History { thread: c, dir: HistoryDir::Older, .. } if *c == ThreadKey::whole(chat(1)))
 }
 
 fn covered(e: &Event) -> bool {
@@ -33,7 +33,7 @@ fn history(ids: std::ops::RangeInclusive<i32>) -> Vec<Message> {
 
 async fn open(h: &mut Harness) {
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(reconciled).await;
 }
 
@@ -102,7 +102,7 @@ async fn a_covering_page_cut_off_from_the_window_is_dropped() {
     h.fake
         .inject(Op::Send, Fault::Error(BackendError::SentUnconfirmed));
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -125,7 +125,7 @@ async fn a_covering_page_cut_off_from_the_window_is_dropped() {
         .inject(Op::History, Fault::Delay(Duration::from_secs(25)));
     refresh(&h).await;
     h.until(reconciled).await;
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     h.fake.set_history(chat(1), history(1..=2_110));
     let during = trim_then_free(&mut h, 111).await;
     assert!(!during.iter().any(older), "the fetch was still running");
@@ -158,7 +158,7 @@ async fn a_users_older_page_cut_off_from_the_window_starts_over() {
     h.fake.set_history(chat(1), history(1..=2_100));
     h.fake
         .inject(Op::History, Fault::Delay(Duration::from_secs(25)));
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let during = trim_then_free(&mut h, 101).await;
     assert!(!during.iter().any(older), "the load was still running");
     let (first, before) = h.until(older).await;
@@ -183,7 +183,7 @@ async fn a_panicked_tail_does_not_end_a_deferred_load() {
     open(&mut h).await;
     h.fake.inject(Op::History, Fault::Panic);
     refresh(&h).await;
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let (ev, before) = h.until(older).await;
     assert_eq!(history_ids(&ev), (101..=150).collect::<Vec<_>>());
     assert!(!before.iter().any(ended), "{before:?}");
@@ -192,10 +192,10 @@ async fn a_panicked_tail_does_not_end_a_deferred_load() {
     assert!(!rest.iter().any(|e| older(e) || ended(e)), "{rest:?}");
     // A panicked load the UI asked for still ends, in its own direction.
     h.fake.inject(Op::History, Fault::Panic);
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let (ev, _) = h.until(ended).await;
     let target = LoadTarget::History {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         dir: HistoryDir::Older,
     };
     assert!(matches!(ev, Event::LoadEnded { target: t, .. } if t == target));

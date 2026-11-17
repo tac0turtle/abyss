@@ -50,7 +50,7 @@ use crate::backend::{Backend, DialogsCursor, HistoryQuery, StreamItem};
 use crate::cache::CacheHandle;
 use crate::core::ShutdownReport;
 use crate::events::EventSender;
-use crate::model::{ChatId, MsgId};
+use crate::model::{MsgId, ThreadKey};
 use crate::session::{PersistHandle, SessionSnapshot};
 use crate::store::{Dialogs, MAX_DIALOGS, ViewGen, Window, Windows};
 
@@ -75,8 +75,8 @@ fn account_scoped(cmd: &Command) -> bool {
     matches!(
         cmd,
         Command::LoadDialogs
-            | Command::OpenChat(_)
-            | Command::CloseChat(_)
+            | Command::OpenThread(_)
+            | Command::CloseThread(_)
             | Command::LoadOlder(_)
             | Command::LoadNewer(_)
             | Command::SendText { .. }
@@ -124,15 +124,15 @@ pub(crate) struct Actor<B: Backend> {
     boot: Option<Boot>,
     window: WindowState,
     last_refresh: Instant,
-    /// Chats with a history load (cache or server) in flight, and that load.
-    /// At most one per window chat.
-    history_busy: HashMap<ChatId, Load>,
-    /// `LoadOlder`/`LoadNewer` asked while their chat's load ran; started
+    /// Threads with a history load (cache or server) in flight, and that
+    /// load. At most one per window thread.
+    history_busy: HashMap<ThreadKey, Load>,
+    /// `LoadOlder`/`LoadNewer` asked while their thread's load ran; started
     /// when it ends (at most [`loads::MAX_DEFERRED`]).
     deferred: Vec<loads::Deferred>,
     /// The history load in flight that owes the UI its answer (task 10f).
     owed: Option<loads::Owed>,
-    /// Server history known to cover chats with `SentUnconfirmed` sends.
+    /// Server history known to cover threads with `SentUnconfirmed` sends.
     covers: covered::Covers,
     /// Source of [`jobs::ReqId`]s.
     next_req: u64,
@@ -140,14 +140,14 @@ pub(crate) struct Actor<B: Backend> {
     dialogs_queued: bool,
     dialogs_loaded: bool,
     dialogs_next: Option<DialogsCursor>,
-    open: Option<ChatId>,
-    /// The chat whose live tail the UI reports on screen
+    open: Option<ThreadKey>,
+    /// The thread whose live tail the UI reports on screen
     /// (`Command::ViewingTail`).
-    viewing: Option<ChatId>,
+    viewing: Option<ThreadKey>,
     /// The peer set last handed to the instance (`Client::retain_peers`).
     peers: peers::PeerSync,
-    /// Highest displayed id per chat, flushed every `READ_FLUSH`.
-    reads: HashMap<ChatId, MsgId>,
+    /// Highest displayed id per thread, flushed every `READ_FLUSH`.
+    reads: HashMap<ThreadKey, MsgId>,
     sends: sends::PendingSends,
     deadline: Duration,
     updates_tx: mpsc::Sender<(ClientGen, StreamItem)>,
@@ -459,7 +459,7 @@ impl<B: Backend> Actor<B> {
                 Job::Dialogs { .. } => self.dialogs_busy = false,
                 Job::History { load, .. } => {
                     self.release_history(load);
-                    self.covers.fetch_ended(load.chat, load.req);
+                    self.covers.fetch_ended(load.thread, load.req);
                 }
                 Job::Send { .. } | Job::Read { .. } => {}
             }
@@ -520,9 +520,9 @@ impl<B: Backend> Actor<B> {
                 // Only the load the UI waits on ends: a load deferred behind
                 // it still runs (and answers), and a load of an old view or a
                 // background load answers nothing (task 10f).
-                self.covers.fetch_ended(load.chat, load.req);
+                self.covers.fetch_ended(load.thread, load.req);
                 if self.take_owed(load).is_some() {
-                    self.history_ended(load.chat, dir, Some(UserError::Internal))
+                    self.history_ended(load.thread, dir, Some(UserError::Internal))
                         .await;
                 }
                 self.snapshot_done(boot::Snapshot::Tail(load)).await;
@@ -571,26 +571,26 @@ impl<B: Backend> Actor<B> {
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
             Command::LoadDialogs => self.load_dialogs().await,
-            Command::OpenChat(chat) => self.open_chat(chat).await,
-            Command::CloseChat(chat) => self.close_chat(chat),
-            Command::LoadOlder(chat) => {
-                self.load_more(Deferred::fresh(chat, HistoryDir::Older))
+            Command::OpenThread(thread) => self.open_thread(thread).await,
+            Command::CloseThread(thread) => self.close_thread(thread),
+            Command::LoadOlder(thread) => {
+                self.load_more(Deferred::fresh(thread, HistoryDir::Older))
                     .await;
             }
-            Command::LoadNewer(chat) => {
-                self.load_more(Deferred::fresh(chat, HistoryDir::Newer))
+            Command::LoadNewer(thread) => {
+                self.load_more(Deferred::fresh(thread, HistoryDir::Newer))
                     .await;
             }
             Command::SendText {
-                chat,
+                thread,
                 text,
                 local_id,
-            } => self.send_text(chat, text, local_id).await,
+            } => self.send_text(thread, text, local_id).await,
             Command::RetrySend(local_id) => self.retry_send(local_id).await,
             Command::DiscardSend(local_id) => self.discard_send(local_id).await,
             Command::Window(state) => self.on_window(state).await,
-            Command::MarkRead { chat, max_id } => self.mark_read(chat, max_id).await,
-            Command::ViewingTail(chat) => self.viewing = chat,
+            Command::MarkRead { thread, max_id } => self.mark_read(thread, max_id).await,
+            Command::ViewingTail(thread) => self.viewing = thread,
             Command::SubmitPhone(phone) => {
                 let phone = zeroize::Zeroizing::new(phone);
                 self.submit_phone(&phone).await;
@@ -633,40 +633,46 @@ impl<B: Backend> Actor<B> {
         }
     }
 
-    /// Opens `chat`: the retained window (if attached to the live tail) is
+    /// Opens `thread`: the retained window (if attached to the live tail) is
     /// shown at once as a complete `Tail` snapshot of the new view, then the
     /// cached and server tails follow. During a full bootstrap the tail is a
-    /// boot snapshot, replacing any earlier one of the same chat.
-    async fn open_chat(&mut self, chat: ChatId) {
-        if let Some(prev) = self.open.filter(|p| *p != chat) {
+    /// boot snapshot, replacing any earlier one of the same thread.
+    async fn open_thread(&mut self, thread: ThreadKey) {
+        if let Some(prev) = self.open.filter(|p| *p != thread) {
             self.windows.close(prev);
             self.forget_owed(prev);
         }
-        self.forget_owed(chat);
+        self.forget_owed(thread);
         // A detached window is not what the user asked for: start from the tail.
-        if self.windows.get(chat).is_some_and(Window::has_newer) {
-            self.windows.invalidate(chat);
+        if self.windows.get(thread).is_some_and(Window::has_newer) {
+            self.windows.invalidate(thread);
         }
-        let view = self.windows.open(chat);
-        self.open = Some(chat);
-        self.seed_view(chat, view).await;
-        let load = self.begin_load(chat, view);
+        let view = self.windows.open(thread);
+        self.open = Some(thread);
+        self.seed_view(thread, view).await;
+        let load = self.begin_load(thread, view);
         self.claim_if_booting(load);
         if let Some(cache) = &self.cache {
-            cache.write(crate::cache::CacheCmd::Touch(chat)).await;
+            cache
+                .write(crate::cache::CacheCmd::Touch(thread.chat))
+                .await;
         }
         // The server tail is requested once the cache tail is shown.
         self.start_tail(load, boot::TailVia::Cache).await;
     }
 
-    /// Emits the window `chat` retains as a complete `Tail` of `view`, so a
+    /// Emits the window `thread` retains as a complete `Tail` of `view`, so a
     /// newly opened view never starts empty while its tail loads.
-    async fn seed_view(&self, chat: ChatId, view: ViewGen) {
-        let Some(w) = self.windows.get(chat).filter(|w| !w.messages().is_empty()) else {
+    async fn seed_view(&self, thread: ThreadKey, view: ViewGen) {
+        let Some(w) = self
+            .windows
+            .get(thread)
+            .filter(|w| !w.messages().is_empty())
+        else {
             return;
         };
         self.emit(Event::History {
-            chat,
+            thread,
             view,
             dir: HistoryDir::Tail,
             messages: w.messages().iter().cloned().collect(),
@@ -676,24 +682,24 @@ impl<B: Backend> Actor<B> {
         .await;
     }
 
-    /// Starts a history load for `chat`'s `view`, making it the chat's
+    /// Starts a history load for `thread`'s `view`, making it the thread's
     /// single-flight load.
-    fn begin_load(&mut self, chat: ChatId, view: ViewGen) -> Load {
+    fn begin_load(&mut self, thread: ThreadKey, view: ViewGen) -> Load {
         self.next_req = self.next_req.wrapping_add(1);
         let load = Load {
-            chat,
+            thread,
             view,
             req: ReqId(self.next_req),
         };
-        self.history_busy.insert(chat, load);
+        self.history_busy.insert(thread, load);
         load
     }
 
-    /// The newest id `chat`'s window holds now: what a tail requested now
+    /// The newest id `thread`'s window holds now: what a tail requested now
     /// is authoritative up to.
-    fn tail_floor(&self, chat: ChatId) -> Option<MsgId> {
+    fn tail_floor(&self, thread: ThreadKey) -> Option<MsgId> {
         self.windows
-            .get(chat)
+            .get(thread)
             .and_then(|w| w.messages().back())
             .map(|m| m.id)
     }
@@ -703,43 +709,43 @@ impl<B: Backend> Actor<B> {
             load,
             dir: HistoryDir::Tail,
             query: HistoryQuery::Tail,
-            floor: self.tail_floor(load.chat),
+            floor: self.tail_floor(load.thread),
         };
         if !self.enqueue(job).await {
             self.release_history(load);
         }
     }
 
-    fn close_chat(&mut self, chat: ChatId) {
-        self.windows.close(chat);
-        self.forget_owed(chat);
-        if self.open == Some(chat) {
+    fn close_thread(&mut self, thread: ThreadKey) {
+        self.windows.close(thread);
+        self.forget_owed(thread);
+        if self.open == Some(thread) {
             self.open = None;
         }
     }
 
     /// Scrolls the open window. Serves from the disk cache when it is known to be
-    /// contiguous, else asks the server. Single-flight per chat: asked while
+    /// contiguous, else asks the server. Single-flight per thread: asked while
     /// a load runs, it waits for that one, except that a covering fetch
     /// (`covered.rs`) already loads the older page. Answered by `History` in
     /// `dir`, or by `LoadEnded` (see `loads.rs`).
     async fn load_more(&mut self, asked: Deferred) {
         let Deferred {
-            chat,
+            thread,
             dir,
             restarts,
         } = asked;
-        if self.open != Some(chat) {
-            return self.history_ended(chat, dir, None).await;
+        if self.open != Some(thread) {
+            return self.history_ended(thread, dir, None).await;
         }
-        if dir == HistoryDir::Older && self.absorb_older(chat, restarts) {
+        if dir == HistoryDir::Older && self.absorb_older(thread, restarts) {
             return; // the covering fetch running answers it
         }
-        if self.history_busy.contains_key(&chat) {
+        if self.history_busy.contains_key(&thread) {
             return self.defer_load(asked);
         }
-        let Some(w) = self.windows.get(chat) else {
-            return self.history_ended(chat, dir, None).await;
+        let Some(w) = self.windows.get(thread) else {
+            return self.history_ended(thread, dir, None).await;
         };
         let view = w.view_gen();
         let (edge, more) = match dir {
@@ -747,14 +753,14 @@ impl<B: Backend> Actor<B> {
             _ => (w.messages().back(), w.has_newer()),
         };
         let Some(edge) = edge.filter(|_| more).map(|m| m.id) else {
-            return self.history_ended(chat, dir, None).await;
+            return self.history_ended(thread, dir, None).await;
         };
-        let load = self.begin_load(chat, view);
+        let load = self.begin_load(thread, view);
         self.owe(load, dir, restarts);
         if let Some(cache) = self
             .cache
             .clone()
-            .filter(|_| self.windows.is_cache_contiguous(chat))
+            .filter(|_| self.windows.is_cache_contiguous(thread))
         {
             let cgen = self.cgen;
             self.spawn_local(
@@ -781,21 +787,21 @@ impl<B: Backend> Actor<B> {
         if !self.enqueue(job).await {
             self.release_history(load);
             // A covering fetch that cannot be queued answers nobody.
-            self.covers.fetch_ended(load.chat, load.req);
+            self.covers.fetch_ended(load.thread, load.req);
             if self.take_owed(load).is_some() {
-                self.history_ended(load.chat, dir, Some(UserError::Busy))
+                self.history_ended(load.thread, dir, Some(UserError::Busy))
                     .await;
             }
         }
     }
 
-    async fn mark_read(&mut self, chat: ChatId, max_id: MsgId) {
-        if self.reads.len() >= MAX_DIALOGS && !self.reads.contains_key(&chat) {
+    async fn mark_read(&mut self, thread: ThreadKey, max_id: MsgId) {
+        if self.reads.len() >= MAX_DIALOGS && !self.reads.contains_key(&thread) {
             return;
         }
-        let entry = self.reads.entry(chat).or_insert(max_id);
+        let entry = self.reads.entry(thread).or_insert(max_id);
         *entry = (*entry).max(max_id);
-        if let Some(summary) = self.dialogs.set_unread(chat, 0).cloned() {
+        if let Some(summary) = self.dialogs.set_unread(thread.chat, 0).cloned() {
             self.emit(Event::ChatBumped(summary)).await;
         }
     }
@@ -806,9 +812,9 @@ impl<B: Backend> Actor<B> {
         if self.life.phase != Phase::Live {
             return;
         }
-        let reads: Vec<(ChatId, MsgId)> = self.reads.drain().collect();
-        for (chat, max_id) in reads {
-            self.enqueue(Job::Read { chat, max_id }).await;
+        let reads: Vec<(ThreadKey, MsgId)> = self.reads.drain().collect();
+        for (thread, max_id) in reads {
+            self.enqueue(Job::Read { thread, max_id }).await;
         }
     }
 }

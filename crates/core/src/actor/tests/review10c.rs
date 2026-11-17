@@ -9,14 +9,14 @@ use crate::actor::covered::MAX_COVER_FETCHES;
 use crate::api::{Command, Event, HistoryDir, LoadTarget, SendState, UserError, WindowState};
 use crate::backend::BackendError;
 use crate::backend::fake::{FakeScript, Fault, Op, text_message};
-use crate::model::{LocalId, Message};
+use crate::model::{LocalId, Message, ThreadKey};
 
 fn reconciled(e: &Event) -> bool {
-    matches!(e, Event::Reconciled { chat: c, .. } if *c == chat(1))
+    matches!(e, Event::Reconciled { thread: c, .. } if *c == ThreadKey::whole(chat(1)))
 }
 
 fn older(e: &Event) -> bool {
-    matches!(e, Event::History { chat: c, dir: HistoryDir::Older, .. } if *c == chat(1))
+    matches!(e, Event::History { thread: c, dir: HistoryDir::Older, .. } if *c == ThreadKey::whole(chat(1)))
 }
 
 fn covered(e: &Event) -> bool {
@@ -26,7 +26,7 @@ fn covered(e: &Event) -> bool {
 /// Opens chat 1 and waits for its server tail.
 async fn open(h: &mut Harness) {
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(reconciled).await;
 }
 
@@ -46,16 +46,16 @@ async fn a_load_asked_during_a_refresh_runs_after_it() {
         .inject(Op::History, Fault::Delay(Duration::from_secs(3)));
     refresh(&h).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let (_, before) = h.until(reconciled).await;
     assert!(!before.iter().any(older), "the refresh was still running");
     let (ev, _) = h.until(older).await;
     assert_eq!(history_ids(&ev), (1..=50).collect::<Vec<_>>());
     // A load core cannot run is answered too.
-    h.send(Command::LoadOlder(chat(2))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(2)))).await;
     let (ev, _) = h.until(|e| matches!(e, Event::LoadEnded { .. })).await;
     let target = LoadTarget::History {
-        chat: chat(2),
+        thread: ThreadKey::whole(chat(2)),
         dir: HistoryDir::Older,
     };
     assert!(matches!(ev, Event::LoadEnded { target: t, error: None } if t == target));
@@ -100,7 +100,7 @@ async fn unconfirmed_send(h: &mut Harness, last: i32) {
     h.fake
         .inject(Op::Send, Fault::Error(BackendError::SentUnconfirmed));
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -130,7 +130,7 @@ async fn a_send_below_the_tail_is_covered_only_once_fetched() {
     refresh(&h).await;
     let (ev, before) = h.until(covered).await;
     assert!(
-        matches!(&ev, Event::SendsCovered { chat: c, sends } if *c == chat(1) && *sends == [LocalId(1)])
+        matches!(&ev, Event::SendsCovered { thread: c, sends } if *c == ThreadKey::whole(chat(1)) && *sends == [LocalId(1)])
     );
     let tail = before.iter().position(reconciled).expect("the refresh");
     let page = before.iter().rposition(older).expect("an older page");

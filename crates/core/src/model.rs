@@ -57,13 +57,70 @@ pub(crate) fn group_by_chat(
     groups
 }
 
-/// A conversation within a chat. `topic` is the forum topic a message belongs to
-/// when the server says so; Stage 1 shows forum chats as one stream and never
-/// keys on it (forum topics are Stage 2).
+/// A forum topic's id: the id of the service message that created it. Always
+/// at least 1: the only constructors are [`TryFrom<i32>`] and
+/// [`TopicId::GENERAL`], and deserialization goes through `TryFrom`, so a
+/// stored or received non-positive id fails to decode.
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+#[serde(try_from = "i32", into = "i32")]
+pub struct TopicId(i32);
+
+impl TopicId {
+    /// The General topic every forum has.
+    pub const GENERAL: TopicId = TopicId(1);
+
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// A topic id that is zero or negative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidTopicId(pub i32);
+
+impl std::fmt::Display for InvalidTopicId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid topic id {} (must be at least 1)", self.0)
+    }
+}
+
+impl std::error::Error for InvalidTopicId {}
+
+impl TryFrom<i32> for TopicId {
+    type Error = InvalidTopicId;
+
+    fn try_from(id: i32) -> Result<Self, InvalidTopicId> {
+        if id > 0 {
+            Ok(Self(id))
+        } else {
+            Err(InvalidTopicId(id))
+        }
+    }
+}
+
+impl From<TopicId> for i32 {
+    fn from(id: TopicId) -> i32 {
+        id.0
+    }
+}
+
+/// A conversation: a whole chat (`topic: None`) or one topic of a forum.
+/// `topic` is the forum topic a message belongs to when the server says so;
+/// forum chats are still shown as one stream, keyed with `topic: None`
+/// (forum topics are Stage 2).
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ThreadKey {
     pub chat: ChatId,
-    pub topic: Option<i32>,
+    pub topic: Option<TopicId>,
+}
+
+impl ThreadKey {
+    /// The whole of `chat`, not one of its topics.
+    pub const fn whole(chat: ChatId) -> Self {
+        Self { chat, topic: None }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,5 +309,81 @@ impl Message {
             Body::Service(s) => is_clean(s, MAX_SERVICE_BYTES),
         };
         sender_ok && body_ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(topic: Option<TopicId>) -> Message {
+        Message {
+            id: MsgId(5),
+            thread: ThreadKey {
+                chat: ChatId {
+                    kind: PeerKind::Channel,
+                    id: 10,
+                },
+                topic,
+            },
+            sender: None,
+            date: 0,
+            edit_date: None,
+            outgoing: false,
+            reply_to: None,
+            body: Body::Unsupported,
+        }
+    }
+
+    #[test]
+    fn topic_ids_below_one_are_rejected() {
+        for bad in [0, -1, i32::MIN] {
+            assert_eq!(TopicId::try_from(bad), Err(InvalidTopicId(bad)));
+        }
+        assert_eq!(TopicId::try_from(1), Ok(TopicId::GENERAL));
+        assert_eq!(TopicId::GENERAL.get(), 1);
+        assert_eq!(TopicId::try_from(i32::MAX).map(TopicId::get), Ok(i32::MAX));
+    }
+
+    /// Decoding goes through `TryFrom`: a serialized 0 or -1 is no topic id,
+    /// alone or inside a stored message.
+    #[test]
+    fn serialized_topic_ids_below_one_fail_to_decode() {
+        for bad in [0i32, -1] {
+            let bytes = postcard::to_allocvec(&bad).unwrap();
+            assert!(postcard::from_bytes::<TopicId>(&bytes).is_err());
+        }
+        let bytes = postcard::to_allocvec(&7i32).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<TopicId>(&bytes).ok(),
+            TopicId::try_from(7).ok()
+        );
+
+        let stored = message(Some(TopicId::GENERAL));
+        let bytes = postcard::to_allocvec(&stored).unwrap();
+        assert_eq!(postcard::from_bytes::<Message>(&bytes).ok(), Some(stored));
+        // The same message with its topic overwritten by 0 or -1 on the wire.
+        let encoded_one = postcard::to_allocvec(&1i32).unwrap();
+        for bad in [0i32, -1] {
+            let encoded_bad = postcard::to_allocvec(&bad).unwrap();
+            let tampered = splice(&bytes, &encoded_one, &encoded_bad);
+            assert!(postcard::from_bytes::<Message>(&tampered).is_err());
+        }
+    }
+
+    /// `bytes` with the single occurrence of `old` after the `Some` tag of
+    /// the topic replaced by `new`.
+    fn splice(bytes: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
+        let none = postcard::to_allocvec(&message(None)).unwrap();
+        // The encodings differ from the topic on: `None` is tag 0, `Some` is
+        // tag 1 followed by the id.
+        let at = bytes
+            .iter()
+            .zip(&none)
+            .position(|(a, b)| a != b)
+            .expect("the topic differs");
+        let start = at + 1;
+        assert_eq!(bytes.get(start..start + old.len()), Some(old));
+        [&bytes[..start], new, &bytes[start + old.len()..]].concat()
     }
 }

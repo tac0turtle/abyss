@@ -3,6 +3,7 @@
 //! code.
 
 use abyss_core::api::{HistoryDir, LoadTarget};
+use abyss_core::model::ThreadKey;
 use abyss_core::store::ViewGen;
 use gpui::{Modifiers, px, size};
 
@@ -37,7 +38,7 @@ fn exhausted_frame_retries_paint_the_retry_pill(cx: &mut TestAppContext) {
     harness
         .events
         .unbounded_send(Event::History {
-            chat: CHAT,
+            thread: ThreadKey::whole(CHAT),
             view: ViewGen(1),
             dir: HistoryDir::Tail,
             messages: (1..=30).map(|id| message(CHAT, id)).collect(),
@@ -85,7 +86,7 @@ fn the_sidebar_retry_pill_takes_its_click(cx: &mut TestAppContext) {
     cx.simulate_click(pill.center(), Modifiers::none());
     cx.run_until_parked();
     let sent = commands_since(&harness, from);
-    assert_eq!(count(&sent, "OpenChat"), 0, "no row under it: {sent:?}");
+    assert_eq!(count(&sent, "OpenThread"), 0, "no row under it: {sent:?}");
     assert_eq!(count(&sent, "LoadDialogs"), 1, "Retry: {sent:?}");
     assert_eq!(read(&root, cx, |s| s.shell.selected()), None);
 }

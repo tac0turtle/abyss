@@ -50,7 +50,7 @@ use super::{
     PasswordChallenge, Seed, SessionSeed, SessionSnapshot, SignIn,
 };
 use crate::api::{ApiCredentials, PasswordBuf};
-use crate::model::{ChatId, MsgId};
+use crate::model::{ChatId, MsgId, ThreadKey};
 use crate::session::{AbyssSession, PersistHandle};
 use calls::Calls;
 
@@ -272,24 +272,24 @@ impl Client for GrammersClient {
 
     async fn history(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         query: HistoryQuery,
         limit: u32,
     ) -> Result<HistoryPage, BackendError> {
-        self.calls.history(chat, query, limit).await
+        self.calls.history(thread.chat, query, limit).await
     }
 
     async fn send_text(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         text: String,
         random_id: i64,
     ) -> Result<MsgId, BackendError> {
-        self.calls.send_text(chat, text, random_id).await
+        self.calls.send_text(thread.chat, text, random_id).await
     }
 
-    async fn read_history(&self, chat: ChatId, max_id: MsgId) -> Result<(), BackendError> {
-        self.calls.read_history(chat, max_id).await
+    async fn read_history(&self, thread: ThreadKey, max_id: MsgId) -> Result<(), BackendError> {
+        self.calls.read_history(thread.chat, max_id).await
     }
 
     fn retain_peers(&self, required: &[ChatId]) {

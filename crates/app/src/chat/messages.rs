@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::time::Instant;
 
 use abyss_core::api::{HistoryDir, UserError};
-use abyss_core::model::{ChatId, Message, MsgId};
+use abyss_core::model::{Message, MsgId, ThreadKey};
 use abyss_core::store::{MAX_MESSAGES_PER_CHAT, ViewGen};
 
 use super::retry::{Backoff, earliest};
@@ -158,7 +158,7 @@ impl Pending {
 
 #[derive(Debug)]
 pub(crate) struct MessageWindow {
-    chat: ChatId,
+    thread: ThreadKey,
     /// Core's view this mirrors; `None` until the first tail arrives.
     view: Option<ViewGen>,
     /// Ascending by id, unique, at most [`MAX_MESSAGES_PER_CHAT`].
@@ -169,9 +169,9 @@ pub(crate) struct MessageWindow {
 }
 
 impl MessageWindow {
-    pub(crate) fn new(chat: ChatId) -> Self {
+    pub(crate) fn new(thread: ThreadKey) -> Self {
         Self {
-            chat,
+            thread,
             view: None,
             messages: VecDeque::new(),
             has_older: true,
@@ -180,8 +180,8 @@ impl MessageWindow {
         }
     }
 
-    pub(crate) fn chat(&self) -> ChatId {
-        self.chat
+    pub(crate) fn thread(&self) -> ThreadKey {
+        self.thread
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -215,7 +215,7 @@ impl MessageWindow {
         self.view
     }
 
-    /// Whether core has answered with this chat's history at least once.
+    /// Whether core has answered with this thread's history at least once.
     pub(crate) fn is_loaded(&self) -> bool {
         self.view.is_some()
     }
@@ -235,7 +235,7 @@ impl MessageWindow {
 
     /// Applies a `History` event. A newer view replaces the window; an older
     /// one is stale. Until the first tail arrives only a tail is accepted, so
-    /// late events from a previous opening of the chat cannot seed it.
+    /// late events from a previous opening of the thread cannot seed it.
     pub(crate) fn apply(&mut self, b: Batch) -> Applied {
         match self.view {
             None if b.dir != HistoryDir::Tail => return Applied::Ignored,
@@ -333,9 +333,10 @@ impl MessageWindow {
         }
     }
 
-    /// A live edit of a message in the window.
+    /// A live edit of a message in the window. Matched by chat: forum chats
+    /// are still shown as one stream, whatever topic the server stated.
     pub(crate) fn edit(&mut self, m: Message) -> Applied {
-        if m.thread.chat != self.chat {
+        if m.thread.chat != self.thread.chat {
             return Applied::Ignored;
         }
         match self.find(m.id) {

@@ -30,7 +30,7 @@ use super::jobs::{CallError, Job, ReqId};
 use super::lifecycle::Phase;
 use crate::api::{Event, SendState, UserError};
 use crate::backend::{Backend, BackendError};
-use crate::model::{ChatId, LocalId, MsgId};
+use crate::model::{ChatId, LocalId, MsgId, ThreadKey};
 
 /// Maximum ordinary sends tracked at once (in flight, failed, waiting or
 /// unknown).
@@ -72,7 +72,7 @@ pub(super) const AUTO_RETRY_WINDOW: Duration = Duration::from_mins(10);
 
 #[derive(Debug)]
 struct Pending {
-    chat: ChatId,
+    thread: ThreadKey,
     text: String,
     random_id: i64,
     /// Attempts made since the last user action.
@@ -89,7 +89,7 @@ struct Pending {
     in_flight: bool,
     /// While `FloodWait`: when the send may go again.
     retry_at: Option<Instant>,
-    /// The newest id of `chat` core knew when the user sent it: the
+    /// The newest id of `thread` core knew when the user sent it: the
     /// server's id for the send is higher.
     floor: Option<MsgId>,
     /// Which capacity it counts against; a kept send becomes ordinary when
@@ -102,7 +102,7 @@ struct Pending {
 struct Unconfirmed {
     random_id: i64,
     local_id: LocalId,
-    chat: ChatId,
+    thread: ThreadKey,
     /// See [`Pending::floor`].
     floor: Option<MsgId>,
     /// The last history load begun before the acceptance was seen: a load
@@ -113,11 +113,11 @@ struct Unconfirmed {
 impl Unconfirmed {
     /// Whether server history applied from `lo` up to a tail requested as
     /// `req` holds this send's message (or it was deleted).
-    fn covered(&self, chat: ChatId, lo: MsgId, req: ReqId) -> bool {
+    fn covered(&self, thread: ThreadKey, lo: MsgId, req: ReqId) -> bool {
         let above = self
             .floor
             .map_or(MsgId(1), |f| MsgId(f.0.saturating_add(1)));
-        self.chat == chat && req.0 > self.after.0 && lo <= above
+        self.thread == thread && req.0 > self.after.0 && lo <= above
     }
 }
 
@@ -188,14 +188,14 @@ impl PendingSends {
     pub(super) fn chats(&self) -> Vec<ChatId> {
         let mut ids: Vec<(&LocalId, &Pending)> = self.map.iter().collect();
         ids.sort_unstable_by_key(|(id, _)| **id);
-        ids.into_iter().map(|(_, p)| p.chat).collect()
+        ids.into_iter().map(|(_, p)| p.thread.chat).collect()
     }
 
     fn job(&self, id: LocalId) -> Option<Job> {
         let p = self.map.get(&id)?;
         Some(Job::Send {
             local_id: id,
-            chat: p.chat,
+            thread: p.thread,
             text: p.text.clone(),
             random_id: p.random_id,
             expires: (p.flood_waits > 0).then_some(p.auto_until),
@@ -247,23 +247,23 @@ impl PendingSends {
         self.unconfirmed.push_back(Unconfirmed {
             random_id: p.random_id,
             local_id,
-            chat: p.chat,
+            thread: p.thread,
             floor: p.floor,
             after,
         });
     }
 
-    /// Whether a `SentUnconfirmed` send of `chat` waits for covering history.
-    pub(super) fn awaits_cover(&self, chat: ChatId) -> bool {
-        self.unconfirmed.iter().any(|u| u.chat == chat)
+    /// Whether a `SentUnconfirmed` send of `thread` waits for covering history.
+    pub(super) fn awaits_cover(&self, thread: ThreadKey) -> bool {
+        self.unconfirmed.iter().any(|u| u.thread == thread)
     }
 
-    /// Forgets and returns the `SentUnconfirmed` sends of `chat` that server
+    /// Forgets and returns the `SentUnconfirmed` sends of `thread` that server
     /// history applied from `lo` up to a tail requested as `req` covers.
-    pub(super) fn covered_by(&mut self, chat: ChatId, lo: MsgId, req: ReqId) -> Vec<LocalId> {
+    pub(super) fn covered_by(&mut self, thread: ThreadKey, lo: MsgId, req: ReqId) -> Vec<LocalId> {
         let mut covered = Vec::new();
         self.unconfirmed.retain(|u| {
-            let hit = u.covered(chat, lo, req);
+            let hit = u.covered(thread, lo, req);
             if hit {
                 covered.push(u.local_id);
             }
@@ -310,9 +310,9 @@ impl<B: Backend> Actor<B> {
 
     /// A new send. Past the ordinary bound it is kept `Failed` (`Busy`)
     /// rather than dropped, so Retry sends it once a slot frees.
-    pub(super) async fn send_text(&mut self, chat: ChatId, text: String, local_id: LocalId) {
+    pub(super) async fn send_text(&mut self, thread: ThreadKey, text: String, local_id: LocalId) {
         let order = [Slot::Ordinary, Slot::Kept];
-        match self.admit_send(chat, text, local_id, order).await {
+        match self.admit_send(thread, text, local_id, order).await {
             Some(Slot::Ordinary) => self.dispatch_send(local_id).await,
             Some(Slot::Kept) => {
                 self.error(UserError::Busy).await;
@@ -327,9 +327,13 @@ impl<B: Backend> Actor<B> {
     /// it after "Stay signed in". It takes an ordinary slot once the kept
     /// ones are full (review round 33), so core keeps every send while its
     /// whole table has room, as the UI's one capacity rule assumes.
-    pub(super) async fn hold_send(&mut self, chat: ChatId, text: String, local_id: LocalId) {
+    pub(super) async fn hold_send(&mut self, thread: ThreadKey, text: String, local_id: LocalId) {
         let order = [Slot::Kept, Slot::Ordinary];
-        if self.admit_send(chat, text, local_id, order).await.is_some() {
+        if self
+            .admit_send(thread, text, local_id, order)
+            .await
+            .is_some()
+        {
             self.send_state(local_id, SendState::Failed).await;
         }
     }
@@ -341,7 +345,7 @@ impl<B: Backend> Actor<B> {
     /// the UI never reuses one, and the answer must not touch that send.
     async fn admit_send(
         &mut self,
-        chat: ChatId,
+        thread: ThreadKey,
         text: String,
         local_id: LocalId,
         order: [Slot; 2],
@@ -368,10 +372,10 @@ impl<B: Backend> Actor<B> {
         };
         // `None` sorts below every id: the newest of what is known.
         let floor = self
-            .tail_floor(chat)
-            .max(self.dialogs.get(chat).and_then(|c| c.last_id));
+            .tail_floor(thread)
+            .max(self.dialogs.get(thread.chat).and_then(|c| c.last_id));
         let pending = Pending {
-            chat,
+            thread,
             text,
             random_id,
             attempts: 0,

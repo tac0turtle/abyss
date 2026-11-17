@@ -9,14 +9,14 @@ use crate::actor::covered::MAX_COVER_FETCHES;
 use crate::api::{Command, Event, HistoryDir, SendState, WindowState};
 use crate::backend::BackendError;
 use crate::backend::fake::{FakeScript, Fault, Op, text_message};
-use crate::model::{LocalId, Message};
+use crate::model::{LocalId, Message, ThreadKey};
 
 fn reconciled(e: &Event) -> bool {
-    matches!(e, Event::Reconciled { chat: c, .. } if *c == chat(1))
+    matches!(e, Event::Reconciled { thread: c, .. } if *c == ThreadKey::whole(chat(1)))
 }
 
 fn older(e: &Event) -> bool {
-    matches!(e, Event::History { chat: c, dir: HistoryDir::Older, .. } if *c == chat(1))
+    matches!(e, Event::History { thread: c, dir: HistoryDir::Older, .. } if *c == ThreadKey::whole(chat(1)))
 }
 
 fn covered(e: &Event) -> bool {
@@ -39,7 +39,7 @@ fn history(ids: std::ops::RangeInclusive<i32>) -> Vec<Message> {
 
 async fn open(h: &mut Harness) {
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(reconciled).await;
 }
 
@@ -102,14 +102,14 @@ async fn accepted_after_reopen(h: &mut Harness) {
     open(h).await;
     h.fake.inject(Op::Send, Fault::CompleteThenHang);
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
     .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     h.fake.set_history(chat(1), history(1..=100));
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let tail = |e: &Event| matches!(e, Event::History { dir: HistoryDir::Tail, messages, .. } if messages.len() == 50);
     let (ev, _) = h.until(tail).await;
     assert_eq!(history_ids(&ev), (51..=100).collect::<Vec<_>>());
@@ -136,7 +136,7 @@ async fn a_load_asked_during_a_covering_fetch_is_answered_by_it() {
     h.fake
         .inject(Op::Send, Fault::Error(BackendError::SentUnconfirmed));
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -150,7 +150,7 @@ async fn a_load_asked_during_a_covering_fetch_is_answered_by_it() {
     refresh(&h).await;
     h.until(reconciled).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let (first, _) = h.until(older).await;
     assert_eq!(history_ids(&first), (301..=350).collect::<Vec<_>>());
     tokio::time::sleep(Duration::from_secs(60)).await;

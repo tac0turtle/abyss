@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, ffi, params};
 
 use super::census::{self, Open};
 use super::{CacheError, CacheKey, MAX_CACHE_BYTES, MAX_CACHED_PER_CHAT, MAX_ROW_BYTES};
-use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerKind, group_by_chat};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerKind, ThreadKey, group_by_chat};
 use crate::store::MAX_DIALOGS;
 
 const SCHEMA_VERSION: i64 = 3;
@@ -435,9 +435,11 @@ impl Cache {
         Ok(out)
     }
 
-    /// Inserts or replaces messages of one chat, then enforces the bounds.
+    /// Inserts or replaces messages of one thread, then enforces the bounds.
     /// Messages of other chats, invalid or oversized messages are skipped.
-    pub fn put_messages(&mut self, chat: ChatId, msgs: &[Message]) -> Result<(), CacheError> {
+    /// The topic is not stored yet: rows are per chat (schema version 3).
+    pub fn put_messages(&mut self, thread: ThreadKey, msgs: &[Message]) -> Result<(), CacheError> {
+        let chat = thread.chat;
         self.write(|tx, mut bytes| {
             register_chat(tx, chat)?;
             for m in msgs.iter().filter(|m| m.thread.chat == chat) {
@@ -453,11 +455,12 @@ impl Cache {
     /// Returns the deleted ids.
     pub fn reconcile_range(
         &mut self,
-        chat: ChatId,
+        thread: ThreadKey,
         lo: MsgId,
         hi: MsgId,
         server: &[Message],
     ) -> Result<Vec<MsgId>, CacheError> {
+        let chat = thread.chat;
         let page: Vec<&Message> = server
             .iter()
             .filter(|m| m.thread.chat == chat && (lo..=hi).contains(&m.id))
@@ -510,9 +513,9 @@ impl Cache {
     }
 
     /// Newest `limit` messages, ascending.
-    pub fn tail(&mut self, chat: ChatId, limit: u32) -> Result<Vec<Message>, CacheError> {
+    pub fn tail(&mut self, thread: ThreadKey, limit: u32) -> Result<Vec<Message>, CacheError> {
         let mut v = self.page(
-            chat,
+            thread,
             "id <= ?3 ORDER BY id DESC",
             i64::from(i32::MAX),
             limit,
@@ -524,11 +527,16 @@ impl Cache {
     /// Up to `limit` messages older than `before`, ascending.
     pub fn before(
         &mut self,
-        chat: ChatId,
+        thread: ThreadKey,
         before: MsgId,
         limit: u32,
     ) -> Result<Vec<Message>, CacheError> {
-        let mut v = self.page(chat, "id < ?3 ORDER BY id DESC", i64::from(before.0), limit)?;
+        let mut v = self.page(
+            thread,
+            "id < ?3 ORDER BY id DESC",
+            i64::from(before.0),
+            limit,
+        )?;
         v.reverse();
         Ok(v)
     }
@@ -536,20 +544,23 @@ impl Cache {
     /// Up to `limit` messages newer than `after`, ascending.
     pub fn after(
         &mut self,
-        chat: ChatId,
+        thread: ThreadKey,
         after: MsgId,
         limit: u32,
     ) -> Result<Vec<Message>, CacheError> {
-        self.page(chat, "id > ?3 ORDER BY id ASC", i64::from(after.0), limit)
+        self.page(thread, "id > ?3 ORDER BY id ASC", i64::from(after.0), limit)
     }
 
+    /// A page of `thread`'s chat: the topic is not stored yet (schema
+    /// version 3), so rows are selected per chat.
     fn page(
         &mut self,
-        chat: ChatId,
+        thread: ThreadKey,
         clause: &str,
         bound: i64,
         limit: u32,
     ) -> Result<Vec<Message>, CacheError> {
+        let chat = thread.chat;
         let sql = format!(
             "SELECT id, {} FROM messages WHERE kind = ?1 AND chat = ?2 AND {clause} LIMIT ?4",
             bounded_body(5)

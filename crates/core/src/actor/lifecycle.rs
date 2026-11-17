@@ -27,7 +27,7 @@ use crate::api::{
 use crate::backend::{
     Backend, BackendError, Instance, InstanceControl, Seed, SessionSeed, SessionSnapshot,
 };
-use crate::model::ChatId;
+use crate::model::ThreadKey;
 
 /// First rebuild delay; doubles per attempt.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -496,11 +496,11 @@ impl<B: Backend> Actor<B> {
             return;
         };
         let after = self.after_for(reason);
-        for (chat, dir) in self.begin_retire() {
+        for (thread, dir) in self.begin_retire() {
             // The UI keeps its window across a rebuild: tell it the loads it
             // waits on are gone, so its backoff and Retry take over (rounds
             // 20 and 22).
-            self.history_ended(chat, dir, Some(UserError::Busy)).await;
+            self.history_ended(thread, dir, Some(UserError::Busy)).await;
         }
         self.life.phase = Phase::Retiring(after);
         if after == After::Rebuild {
@@ -538,7 +538,7 @@ impl<B: Backend> Actor<B> {
     /// come (round 22). Each is taken here, so nothing answers or starts it
     /// again (task 10g). Distinct, at most `1 + MAX_DEFERRED`.
     #[must_use]
-    pub(super) fn begin_retire(&mut self) -> Vec<(ChatId, HistoryDir)> {
+    pub(super) fn begin_retire(&mut self) -> Vec<(ThreadKey, HistoryDir)> {
         self.cgen = ClientGen(self.cgen.0 + 1);
         self.boot = None;
         self.life.timeouts.clear();
@@ -547,8 +547,8 @@ impl<B: Backend> Actor<B> {
         self.dialogs_queued = false;
         self.purge_queued();
         let mut waiting = Vec::with_capacity(self.deferred.len().saturating_add(1));
-        let owed = self.owed.take().map(|o| (o.load.chat, o.dir));
-        let deferred = self.deferred.drain(..).map(|d| (d.chat, d.dir));
+        let owed = self.owed.take().map(|o| (o.load.thread, o.dir));
+        let deferred = self.deferred.drain(..).map(|d| (d.thread, d.dir));
         for target in owed.into_iter().chain(deferred) {
             if !waiting.contains(&target) {
                 waiting.push(target);

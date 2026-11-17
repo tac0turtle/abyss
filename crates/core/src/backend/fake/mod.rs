@@ -885,23 +885,28 @@ impl Client for FakeClient {
 
     async fn history(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         query: HistoryQuery,
         limit: u32,
     ) -> Result<HistoryPage, BackendError> {
         let _g = self.enter(Op::History).await?;
         Ok(self.shared.with(|s| {
-            let all = s.history.get(&chat).map(Vec::as_slice).unwrap_or_default();
+            let all = s
+                .history
+                .get(&thread.chat)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             page(all, query, to_usize(limit))
         }))
     }
 
     async fn send_text(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         text: String,
         random_id: i64,
     ) -> Result<MsgId, BackendError> {
+        let chat = thread.chat;
         self.shared
             .with(|s| push_capped(&mut s.attempted, (chat, random_id)));
         let fault = self.take_fault(Op::Send);
@@ -923,10 +928,10 @@ impl Client for FakeClient {
         Ok(self.accept(chat, &text, random_id))
     }
 
-    async fn read_history(&self, chat: ChatId, max_id: MsgId) -> Result<(), BackendError> {
+    async fn read_history(&self, thread: ThreadKey, max_id: MsgId) -> Result<(), BackendError> {
         let _g = self.enter(Op::Read).await?;
         self.shared
-            .with(|s| push_capped(&mut s.read, (chat, max_id)));
+            .with(|s| push_capped(&mut s.read, (thread.chat, max_id)));
         Ok(())
     }
 

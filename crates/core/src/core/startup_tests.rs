@@ -7,6 +7,7 @@ use super::{CoreConfig, SendError, start_with};
 use crate::SHUTDOWN_DEADLINE;
 use crate::api::{AuthState, Command, Event, SaveStatus};
 use crate::backend::fake::{FAKE_SELF_HASH, FAKE_SELF_ID, FakeBackend, FakeScript};
+use crate::model::ThreadKey;
 use crate::secret::{FaultyStore, MemoryStore, SecretItem, SecretStore};
 
 /// Finding 4: a stalled Keychain read at startup (a prompt nobody answers)
@@ -118,8 +119,8 @@ async fn cached_history_survives_a_core_restart() {
     };
     let online = |e: &Event| matches!(e, Event::Connection(ConnState::Online));
     let tail = |e: &Event| {
-        matches!(e, Event::History { chat: c, dir: HistoryDir::Tail, messages, .. }
-            if *c == chat && !messages.is_empty())
+        matches!(e, Event::History { thread: c, dir: HistoryDir::Tail, messages, .. }
+            if *c == ThreadKey::whole(chat) && !messages.is_empty())
     };
 
     for run in 0..2 {
@@ -130,7 +131,8 @@ async fn cached_history_survives_a_core_restart() {
         }
         let mut core = start_with(config(), move |_| fake, store.clone(), || {}).unwrap();
         next_matching(&mut core, online).await;
-        core.send(Command::OpenChat(chat)).unwrap();
+        core.send(Command::OpenThread(ThreadKey::whole(chat)))
+            .unwrap();
         let Event::History { messages, .. } = next_matching(&mut core, tail).await else {
             unreachable!()
         };

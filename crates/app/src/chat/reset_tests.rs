@@ -13,6 +13,7 @@ const SHARED: ChatId = ChatId {
     kind: PeerKind::User,
     id: 7,
 };
+const SHARED_THREAD: ThreadKey = ThreadKey::whole(SHARED);
 
 fn summary(title: &str) -> ChatSummary {
     ChatSummary {
@@ -46,7 +47,7 @@ fn tail(ids: std::ops::RangeInclusive<i32>) -> Event {
         })
         .collect();
     Event::History {
-        chat: SHARED,
+        thread: SHARED_THREAD,
         view: ViewGen(1),
         dir: HistoryDir::Tail,
         messages,
@@ -65,7 +66,7 @@ fn logout_forgets_account_a_before_account_b_opens_the_same_peer() {
     let mut shell = ChatShell::default();
     // Account A: the chat is open, messages shown, a send pending.
     shell.apply(Event::DialogsReset(vec![summary("A's chat")]));
-    shell.select(SHARED, &mut admit).unwrap();
+    shell.select(SHARED_THREAD, &mut admit).unwrap();
     shell.apply(tail(1..=20));
     let target = shell.send_target().unwrap().unwrap();
     let local = shell
@@ -90,9 +91,9 @@ fn logout_forgets_account_a_before_account_b_opens_the_same_peer() {
         sent.push(cmd);
         Ok(())
     };
-    shell.select(SHARED, &mut admit).unwrap();
+    shell.select(SHARED_THREAD, &mut admit).unwrap();
     assert!(
-        matches!(sent.as_slice(), [Command::OpenChat(SHARED), ..]),
+        matches!(sent.as_slice(), [Command::OpenThread(SHARED_THREAD), ..]),
         "B's chat is opened afresh: {sent:?}"
     );
     assert_eq!(shell.row_count(), 0);

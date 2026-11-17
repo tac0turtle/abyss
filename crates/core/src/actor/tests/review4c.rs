@@ -16,7 +16,7 @@ use crate::backend::fake::{FakeBackend, FakeScript, Fault, Op, summary, text_mes
 use crate::backend::{BackendError, HistoryPage, HistoryQuery, Update};
 use crate::cache::{CacheCmd, CacheHandle, CacheKey};
 use crate::events::{self, EventReceiver};
-use crate::model::{ChatId, LocalId, Message, MsgId};
+use crate::model::{ChatId, LocalId, Message, MsgId, ThreadKey};
 use crate::store::MAX_DIALOGS;
 
 fn state_of(id: LocalId) -> impl Fn(&Event) -> bool {
@@ -25,7 +25,7 @@ fn state_of(id: LocalId) -> impl Fn(&Event) -> bool {
 
 async fn send_text(h: &Harness, c: ChatId, id: u64) {
     h.send(Command::SendText {
-        chat: c,
+        thread: ThreadKey::whole(c),
         text: "hi".into(),
         local_id: LocalId(id),
     })
@@ -72,18 +72,19 @@ async fn emptied_tail(kind: BootKind) -> (Vec<i32>, Vec<i32>) {
     let cache = cache_at(dir.path(), &key);
     let (mut actor, _events) = actor_with(cache.clone());
     let c = chat(1);
-    let view = actor.windows.open(c);
-    actor.open = Some(c);
+    let t = ThreadKey::whole(c);
+    let view = actor.windows.open(t);
+    actor.open = Some(t);
     let all = HistoryPage {
         messages: msgs(c, 1..=100),
         has_more: false,
     };
     cache
-        .write(CacheCmd::PutMessages(c, all.messages.clone()))
+        .write(CacheCmd::PutMessages(t, all.messages.clone()))
         .await;
-    actor.windows.prepend(c, view, all).unwrap();
-    actor.windows.set_cache_contiguous(c);
-    let load = actor.begin_load(c, view);
+    actor.windows.prepend(t, view, all).unwrap();
+    actor.windows.set_cache_contiguous(t);
+    let load = actor.begin_load(t, view);
     let dead = Update::Deleted {
         chat: Some(c),
         ids: (51..=100).map(MsgId).collect(),
@@ -110,11 +111,11 @@ async fn emptied_tail(kind: BootKind) -> (Vec<i32>, Vec<i32>) {
         .await;
     let window = actor
         .windows
-        .get(c)
+        .get(t)
         .map(|w| ids_of(&w.messages().iter().cloned().collect::<Vec<_>>()))
         .unwrap_or_default();
     cache.barrier().await.unwrap();
-    let cached = ids_of(&cache.tail(c, 200).await.unwrap());
+    let cached = ids_of(&cache.tail(t, 200).await.unwrap());
     (window, cached)
 }
 

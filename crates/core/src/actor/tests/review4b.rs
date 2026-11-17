@@ -15,7 +15,7 @@ use crate::backend::fake::{FakeBackend, FakeScript, Fault, Op, text_message};
 use crate::backend::{BackendError, HistoryPage, HistoryQuery, StreamError, Update};
 use crate::cache::CacheKey;
 use crate::events::{self, EventReceiver};
-use crate::model::{ChatId, LocalId, Message, MsgId};
+use crate::model::{ChatId, LocalId, Message, MsgId, ThreadKey};
 use crate::session::MAX_PINNED_PEERS;
 
 const FAIL_FAST: Duration = Duration::from_secs(120);
@@ -25,7 +25,7 @@ fn rebuilding(e: &Event) -> bool {
 }
 
 fn tail_of(c: ChatId) -> impl Fn(&Event) -> bool {
-    move |e| matches!(e, Event::History { chat, dir: HistoryDir::Tail, .. } if *chat == c)
+    move |e| matches!(e, Event::History { thread, dir: HistoryDir::Tail, .. } if *thread == ThreadKey::whole(c))
 }
 
 fn state_of(id: LocalId) -> impl Fn(&Event) -> bool {
@@ -34,7 +34,7 @@ fn state_of(id: LocalId) -> impl Fn(&Event) -> bool {
 
 async fn send_text(h: &Harness, c: ChatId, id: u64) {
     h.send(Command::SendText {
-        chat: c,
+        thread: ThreadKey::whole(c),
         text: "hi".into(),
         local_id: LocalId(id),
     })
@@ -56,15 +56,15 @@ async fn wake_and_settle(h: &mut Harness) -> Vec<Event> {
 async fn reopening_the_tail_chat_during_bootstrap_still_goes_online() {
     let mut h = harness(FakeScript::demo(3, 10), None).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(tail_of(chat(1))).await;
     h.fake
         .inject(Op::History, Fault::Delay(Duration::from_secs(3)));
     h.internal.send(Internal::Wake).await.unwrap();
-    h.until(|e| matches!(e, Event::ChatInvalidated(c) if *c == chat(1)))
+    h.until(|e| matches!(e, Event::ThreadInvalidated(c) if *c == ThreadKey::whole(chat(1))))
         .await;
-    h.send(Command::OpenChat(chat(2))).await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(2)))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let mut events = tokio::time::timeout(FAIL_FAST, h.online())
         .await
         .expect("bootstrap deadlocked: Online never came");
@@ -81,7 +81,7 @@ async fn reopening_the_tail_chat_during_bootstrap_still_goes_online() {
 async fn refresh_removes_a_deleted_newest_message_and_empty_history() {
     let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(tail_of(chat(1))).await;
     let server: Vec<Message> = (1..=9).map(|i| text_message(chat(1), i, "m")).collect();
     h.fake.set_history(chat(1), server);
@@ -119,14 +119,14 @@ async fn cached_newest_message_deleted_on_the_server_is_dropped() {
     let cache = cache_at(dir.path(), &key);
     let mut h = harness(script, Some(cache.clone())).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let (cached, _) = h.until(tail_of(chat(1))).await;
     assert_eq!(history_ids(&cached).last(), Some(&60), "the cache held 60");
     let (server, _) = h.until(tail_of(chat(1))).await;
     assert_eq!(history_ids(&server).last(), Some(&59));
     h.stop().await;
     cache.barrier().await.unwrap();
-    let tail = cache.tail(chat(1), 50).await.unwrap();
+    let tail = cache.tail(ThreadKey::whole(chat(1)), 50).await.unwrap();
     assert_eq!(tail.last().map(|m| m.id), Some(MsgId(59)));
 }
 
@@ -417,14 +417,15 @@ async fn unread_after(h: &mut Harness, id: i32) -> u32 {
 async fn unread_counts_unless_the_tail_is_on_screen() {
     let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.until(tail_of(chat(1))).await;
     assert_eq!(
         unread_after(&mut h, 11).await,
         1,
         "open but not reported seen"
     );
-    h.send(Command::ViewingTail(Some(chat(1)))).await;
+    h.send(Command::ViewingTail(Some(ThreadKey::whole(chat(1)))))
+        .await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(unread_after(&mut h, 12).await, 1, "tail on screen");
     h.send(Command::Window(WindowState::Inactive)).await;
@@ -439,12 +440,12 @@ async fn unread_counts_unless_the_tail_is_on_screen() {
 async fn reopening_a_retained_chat_shows_it_at_once() {
     let mut h = harness(FakeScript::demo(3, 10), None).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let (first, _) = h.until(tail_of(chat(1))).await;
-    h.send(Command::OpenChat(chat(2))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(2)))).await;
     h.until(tail_of(chat(2))).await;
     h.fake.inject(Op::History, Fault::Hang);
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     let (ev, _) = tokio::time::timeout(Duration::from_secs(5), h.until(tail_of(chat(1))))
         .await
         .expect("the reopened view stayed empty");
@@ -485,15 +486,16 @@ fn bare_actor() -> (Actor<FakeBackend>, EventReceiver) {
 async fn short_cached_newer_page_does_not_claim_the_live_tail() {
     let (mut actor, _events) = bare_actor();
     let c = chat(1);
-    let view = actor.windows.open(c);
-    actor.open = Some(c);
+    let t = ThreadKey::whole(c);
+    let view = actor.windows.open(t);
+    actor.open = Some(t);
     let first: Vec<Message> = (1..=10).map(|i| text_message(c, i, "m")).collect();
     let page = HistoryPage {
         messages: first,
         has_more: true,
     };
-    actor.windows.append_newer(c, view, page).unwrap();
-    let load = actor.begin_load(c, view);
+    actor.windows.append_newer(t, view, page).unwrap();
+    let load = actor.begin_load(t, view);
     let cached: Vec<Message> = (11..=15).map(|i| text_message(c, i, "m")).collect();
     let cgen = actor.cgen;
     actor
@@ -508,7 +510,7 @@ async fn short_cached_newer_page_does_not_claim_the_live_tail() {
             },
         })
         .await;
-    let w = actor.windows.get(c).unwrap();
+    let w = actor.windows.get(t).unwrap();
     assert_eq!(w.messages().back().map(|m| m.id), Some(MsgId(15)));
     assert!(w.has_newer(), "only the server proves the live tail");
     assert!(actor.queue.iter().any(|j| matches!(
@@ -518,7 +520,7 @@ async fn short_cached_newer_page_does_not_claim_the_live_tail() {
             ..
         }
     )));
-    assert!(actor.history_busy.contains_key(&c), "still single-flight");
+    assert!(actor.history_busy.contains_key(&t), "still single-flight");
 }
 
 /// Coordinator add-on: core hands the backend the peers it still needs:
@@ -531,7 +533,8 @@ async fn retained_peers_follow_sends_windows_and_dialogs_at_capacity() {
         h.send(Command::LoadDialogs).await;
         h.until(|e| matches!(e, Event::DialogsAppended(_))).await;
     }
-    h.send(Command::OpenChat(chat(1100))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1100))))
+        .await;
     h.until(tail_of(chat(1100))).await;
     h.fake.inject(Op::Send, Fault::Hang);
     send_text(&h, chat(1151), 1).await;

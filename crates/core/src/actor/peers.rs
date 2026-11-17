@@ -68,7 +68,7 @@ impl<B: Backend> Actor<B> {
         }
         let new_instance = self.peers.inputs.is_none_or(|i| i.cgen != inputs.cgen);
         self.peers.inputs = Some(inputs);
-        let mut windows: Vec<ChatId> = self.windows.chats().collect();
+        let mut windows: Vec<ChatId> = self.windows.threads().map(|t| t.chat).collect();
         windows.reverse();
         let set = required(
             self.sends.chats(),

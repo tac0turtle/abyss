@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use abyss_core::SendError;
 use abyss_core::api::{Command, ConnState, Event, LoadTarget, SendState, UserError, WindowState};
-use abyss_core::model::{ChatId, LocalId};
+use abyss_core::model::{ChatId, LocalId, ThreadKey};
 use gpui::{App, Context, Focusable, Subscription, WeakEntity, Window};
 
 use super::Root;
@@ -258,20 +258,22 @@ impl Session {
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
+        // A chat row opens the whole chat (forum topics are Stage 2).
+        let thread = ThreadKey::whole(chat);
         let from = self.shell.selected();
-        if from != Some(chat) {
+        if from != Some(thread) {
             let text = self.composer.read(cx).text().to_owned();
-            if !self.shell.can_switch(chat, &text) {
+            if !self.shell.can_switch(thread, &text) {
                 // Never drop a draft (task 6l): the chat and its text stay.
                 self.show_notice(chat_copy::TOO_MANY_DRAFTS.into(), window, cx);
                 return;
             }
         }
         let opened = self.drive(OnRefusal::Notice, window, cx, |s, admit| {
-            s.select(chat, admit)
+            s.select(thread, admit)
         });
-        if opened.is_some() && from != Some(chat) {
-            self.swap_draft(from, chat, window, cx);
+        if opened.is_some() && from != Some(thread) {
+            self.swap_draft(from, thread, window, cx);
         }
         if opened.is_some() && self.auth == AuthView::SignedIn {
             window.focus(&self.composer.focus_handle(cx), cx);
@@ -289,8 +291,8 @@ impl Session {
         if self.auth != AuthView::SignedIn {
             return;
         }
-        let chat = match self.shell.send_target() {
-            Ok(Some(chat)) => chat,
+        let thread = match self.shell.send_target() {
+            Ok(Some(thread)) => thread,
             Ok(None) => return,
             Err(error) => {
                 self.show_notice(copy::user_error(error), window, cx);
@@ -299,7 +301,7 @@ impl Session {
         };
         let text = self.composer.read(cx).text().to_owned();
         let sent = self.drive(OnRefusal::Notice, window, cx, |s, admit| {
-            s.submit(chat, &text, format::now(), admit)
+            s.submit(thread, &text, format::now(), admit)
         });
         if let Some(Some(_)) = sent {
             self.composer
@@ -332,14 +334,14 @@ impl Session {
         cx.notify();
     }
 
-    /// The open chat changed from `from` to `to` (task 6k): the box's text
+    /// The open thread changed from `from` to `to` (task 6k): the box's text
     /// stays `from`'s draft, and `to`'s draft comes back. Transactional
     /// (task 6l): `to`'s draft leaves first, freeing its slot, and
     /// `select_chat` checked there is room, so no draft is dropped.
     fn swap_draft(
         &mut self,
-        from: Option<ChatId>,
-        to: ChatId,
+        from: Option<ThreadKey>,
+        to: ThreadKey,
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
@@ -368,21 +370,21 @@ impl Session {
 
     /// Puts a refused send's text back into the message box, which must be
     /// empty (nothing typed there is ever overwritten), and only while the
-    /// send's own chat is open: the box belongs to it.
+    /// send's own thread is open: the box belongs to it.
     pub(super) fn put_back(
         &mut self,
         local_id: LocalId,
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        let Some((chat, text)) = self
+        let Some((thread, text)) = self
             .shell
             .returned(local_id)
-            .map(|(chat, text)| (chat, text.to_owned()))
+            .map(|(thread, text)| (thread, text.to_owned()))
         else {
             return;
         };
-        if self.shell.selected() != Some(chat) {
+        if self.shell.selected() != Some(thread) {
             self.show_notice(chat_copy::OTHER_CHAT.into(), window, cx);
             return;
         }

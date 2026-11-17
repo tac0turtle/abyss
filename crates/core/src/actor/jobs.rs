@@ -15,7 +15,7 @@ use crate::backend::{
     StreamItem, UpdateStream,
 };
 use crate::cache::CacheHandle;
-use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId};
+use crate::model::{ChatSummary, LocalId, Message, MsgId, ThreadKey};
 use crate::store::ViewGen;
 
 /// Messages per history page (server and cache).
@@ -31,16 +31,16 @@ pub(super) const STREAM_RETRY: [Duration; 3] = [
 ];
 
 /// Identity of one history load, unique per actor. A bootstrap snapshot is
-/// tracked by `(chat, ReqId)`, independent of the view it fills, so it always
+/// tracked by `(thread, ReqId)`, independent of the view it fills, so it always
 /// completes even when its view went stale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct ReqId(pub(super) u64);
 
-/// One history load (cache read and/or server call): its chat, the view it
-/// fills, and its identity.
+/// One history load (cache read and/or server call): its thread, the view
+/// it fills, and its identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Load {
-    pub(super) chat: ChatId,
+    pub(super) thread: ThreadKey,
     pub(super) view: ViewGen,
     pub(super) req: ReqId,
 }
@@ -62,7 +62,7 @@ pub(super) enum Job {
     },
     Send {
         local_id: LocalId,
-        chat: ChatId,
+        thread: ThreadKey,
         text: String,
         random_id: i64,
         /// A flood-waited send's automatic-retry window: past it, the send
@@ -70,7 +70,7 @@ pub(super) enum Job {
         expires: Option<tokio::time::Instant>,
     },
     Read {
-        chat: ChatId,
+        thread: ThreadKey,
         max_id: MsgId,
     },
 }
@@ -251,7 +251,7 @@ pub(super) fn job_future<C: Client>(
             query,
             floor,
         } => {
-            let call = async move { client.history(load.chat, query, PAGE).await };
+            let call = async move { client.history(load.thread, query, PAGE).await };
             let fut = admitted.run(call, move |res| Outcome::History {
                 load,
                 dir,
@@ -263,12 +263,12 @@ pub(super) fn job_future<C: Client>(
         }
         Job::Send {
             local_id,
-            chat,
+            thread,
             text,
             random_id,
             expires,
         } => {
-            let call = async move { client.send_text(chat, text, random_id).await };
+            let call = async move { client.send_text(thread, text, random_id).await };
             let fut = async move {
                 // Admission includes the window: a queued (or preserved)
                 // automatic send never reaches the server after it closed.
@@ -281,8 +281,8 @@ pub(super) fn job_future<C: Client>(
             };
             (TaskKind::Send(local_id), Box::pin(fut))
         }
-        Job::Read { chat, max_id } => {
-            let call = async move { client.read_history(chat, max_id).await };
+        Job::Read { thread, max_id } => {
+            let call = async move { client.read_history(thread, max_id).await };
             // Read marks are best effort; the next read covers a lost one.
             let fut = admitted.run(call, Outcome::Read);
             (TaskKind::Read, Box::pin(fut))
@@ -298,11 +298,11 @@ pub(super) async fn cache_history(
     dir: HistoryDir,
     anchor: Option<MsgId>,
 ) -> Done {
-    let chat = load.chat;
+    let thread = load.thread;
     let res = match (dir, anchor) {
-        (HistoryDir::Older, Some(id)) => cache.before(chat, id, PAGE).await,
-        (HistoryDir::Newer, Some(id)) => cache.after(chat, id, PAGE).await,
-        _ => cache.tail(chat, PAGE).await,
+        (HistoryDir::Older, Some(id)) => cache.before(thread, id, PAGE).await,
+        (HistoryDir::Newer, Some(id)) => cache.after(thread, id, PAGE).await,
+        _ => cache.tail(thread, PAGE).await,
     };
     Done {
         cgen,

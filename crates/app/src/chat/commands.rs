@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 use abyss_core::api::{Command, HistoryDir, UserError, WindowState};
-use abyss_core::model::{ChatId, LocalId};
+use abyss_core::model::{LocalId, ThreadKey};
 use gpui::FollowMode;
 
 use super::messages::MessageWindow;
@@ -29,22 +29,22 @@ pub(crate) enum Refused {
 pub(crate) type Admit<'a> = &'a mut dyn FnMut(Command) -> Result<(), Refused>;
 
 impl ChatShell {
-    /// Opens `chat` once core admitted `OpenChat` (core closes the previous
-    /// one). Refused, the previous chat stays selected.
-    pub(crate) fn select(&mut self, chat: ChatId, admit: Admit<'_>) -> Result<(), Refused> {
-        if self.selected == Some(chat) {
+    /// Opens `thread` once core admitted `OpenThread` (core closes the
+    /// previous one). Refused, the previous thread stays selected.
+    pub(crate) fn select(&mut self, thread: ThreadKey, admit: Admit<'_>) -> Result<(), Refused> {
+        if self.selected == Some(thread) {
             return Ok(());
         }
-        // Core stopped (task 6l): local only, so the chat's stranded
+        // Core stopped (task 6l): local only, so the thread's stranded
         // echoes and draft stay reachable; nothing is asked of core.
         if self.core == CoreState::Running {
-            admit(Command::OpenChat(chat))?;
+            admit(Command::OpenThread(thread))?;
         }
-        self.selected = Some(chat);
-        self.window = Some(MessageWindow::new(chat));
+        self.selected = Some(thread);
+        self.window = Some(MessageWindow::new(thread));
         self.revealed.clear();
         self.read_sent = None;
-        // The user's choice: frame commands for the new chat start afresh.
+        // The user's choice: frame commands for the new thread start afresh.
         self.frame_retry.reset();
         self.shown_echoes = self.echo_count();
         self.rows.reset(self.shown_echoes);
@@ -54,25 +54,28 @@ impl ChatShell {
 
     /// Where a composer submission would go: `Ok(None)` when nothing is open
     /// or the chat is read-only, `Busy` when the send table is full.
-    pub(crate) fn send_target(&self) -> Result<Option<ChatId>, UserError> {
+    pub(crate) fn send_target(&self) -> Result<Option<ThreadKey>, UserError> {
         if self.core == CoreState::Stopped {
             return Ok(None);
         }
-        let Some(chat) = self.selected_chat().filter(|c| c.can_send) else {
+        let Some(thread) = self
+            .selected
+            .filter(|_| self.selected_chat().is_some_and(|c| c.can_send))
+        else {
             return Ok(None);
         };
         if self.echoes.is_full() {
             return Err(UserError::Busy);
         }
-        Ok(Some(chat.id))
+        Ok(Some(thread))
     }
 
-    /// Sends `text` to `chat` (from [`Self::send_target`]). Only once core
+    /// Sends `text` to `thread` (from [`Self::send_target`]). Only once core
     /// admitted the send does its echo appear; the caller clears the
     /// composer on `Ok(Some(_))`. `Ok(None)`: nothing to send.
     pub(crate) fn submit(
         &mut self,
-        chat: ChatId,
+        thread: ThreadKey,
         text: &str,
         now: i64,
         admit: Admit<'_>,
@@ -87,14 +90,14 @@ impl ChatShell {
         };
         let local_id = LocalId(self.next_local);
         admit(Command::SendText {
-            chat,
+            thread,
             text: text.to_owned(),
             local_id,
         })?;
         self.next_local = next;
         let pushed = self
             .echoes
-            .push(Echo::new(local_id, chat, text.to_owned(), now));
+            .push(Echo::new(local_id, thread, text.to_owned(), now));
         debug_assert!(pushed.is_ok(), "checked not full above");
         self.sync_echoes();
         self.rows.set_follow_mode(FollowMode::Tail);
@@ -137,12 +140,12 @@ impl ChatShell {
         Some(echo.text)
     }
 
-    /// The chat and text of a returned echo, if `local_id` is one.
-    pub(crate) fn returned(&self, local_id: LocalId) -> Option<(ChatId, &str)> {
+    /// The thread and text of a returned echo, if `local_id` is one.
+    pub(crate) fn returned(&self, local_id: LocalId) -> Option<(ThreadKey, &str)> {
         self.echoes
             .get(local_id)
             .filter(|e| e.is_returned())
-            .map(|e| (e.chat, e.text.as_str()))
+            .map(|e| (e.thread, e.text.as_str()))
     }
 
     /// The text of a stranded echo (core stopped), for Copy.
@@ -169,31 +172,31 @@ impl ChatShell {
         self.core == CoreState::Stopped
     }
 
-    /// Stashes the composer's text as `chat`'s draft (an empty one clears
+    /// Stashes the composer's text as `thread`'s draft (an empty one clears
     /// it). Full: `Err` hands the text back; see [`Self::can_switch`].
-    pub(crate) fn stash_draft(&mut self, chat: ChatId, text: String) -> Result<(), String> {
-        self.drafts.stash(chat, text)
+    pub(crate) fn stash_draft(&mut self, thread: ThreadKey, text: String) -> Result<(), String> {
+        self.drafts.stash(thread, text)
     }
 
-    /// Whether the open chat can change to `to` without losing a draft:
+    /// Whether the open thread can change to `to` without losing a draft:
     /// the box's `text` needs a slot unless it is empty or the slots free.
-    pub(crate) fn can_switch(&self, to: ChatId, text: &str) -> bool {
+    pub(crate) fn can_switch(&self, to: ThreadKey, text: &str) -> bool {
         self.selected
             .is_none_or(|from| self.drafts.can_switch(from, to, text))
     }
 
-    /// Takes `chat`'s stashed draft.
-    pub(crate) fn take_draft(&mut self, chat: ChatId) -> Option<String> {
-        self.drafts.take(chat)
+    /// Takes `thread`'s stashed draft.
+    pub(crate) fn take_draft(&mut self, thread: ThreadKey) -> Option<String> {
+        self.drafts.take(thread)
     }
 
-    /// Back to the live tail from far up the history: core reopens the chat
-    /// at its tail.
+    /// Back to the live tail from far up the history: core reopens the
+    /// thread at its tail.
     pub(crate) fn jump_to_latest(&mut self, admit: Admit<'_>) -> Result<(), Refused> {
-        let Some(chat) = self.window.as_ref().map(MessageWindow::chat) else {
+        let Some(thread) = self.window.as_ref().map(MessageWindow::thread) else {
             return Ok(());
         };
-        admit(Command::OpenChat(chat))?;
+        admit(Command::OpenThread(thread))?;
         self.rows.set_follow_mode(FollowMode::Tail);
         Ok(())
     }
@@ -278,16 +281,16 @@ impl ChatShell {
         let Some(w) = self.window.as_mut() else {
             return self.set_viewing(None, admit);
         };
-        let chat = w.chat();
+        let thread = w.thread();
         if let Some(seen) = seen {
             if w.wants_older(seen.first_row, now) {
-                admit(Command::LoadOlder(chat))?;
+                admit(Command::LoadOlder(thread))?;
                 w.requested(HistoryDir::Older);
             }
             if let Some(last) = seen.last_message
                 && w.wants_newer(last, now)
             {
-                admit(Command::LoadNewer(chat))?;
+                admit(Command::LoadNewer(thread))?;
                 w.requested(HistoryDir::Newer);
             }
         }
@@ -296,18 +299,18 @@ impl ChatShell {
             .map(|m| m.id)
             .filter(|id| active && self.read_sent.is_none_or(|r| *id > r))
         {
-            admit(Command::MarkRead { chat, max_id })?;
+            admit(Command::MarkRead { thread, max_id })?;
             self.read_sent = Some(max_id);
         }
         let tail = tail_on_screen(w, seen);
-        self.set_viewing((active && tail).then_some(chat), admit)
+        self.set_viewing((active && tail).then_some(thread), admit)
     }
 
-    /// Tells core which chat's live tail is on screen, when that changed.
-    fn set_viewing(&mut self, chat: Option<ChatId>, admit: Admit<'_>) -> Result<(), Refused> {
-        if self.viewing != chat {
-            admit(Command::ViewingTail(chat))?;
-            self.viewing = chat;
+    /// Tells core which thread's live tail is on screen, when that changed.
+    fn set_viewing(&mut self, thread: Option<ThreadKey>, admit: Admit<'_>) -> Result<(), Refused> {
+        if self.viewing != thread {
+            admit(Command::ViewingTail(thread))?;
+            self.viewing = thread;
         }
         Ok(())
     }

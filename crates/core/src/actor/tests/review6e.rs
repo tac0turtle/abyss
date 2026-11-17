@@ -10,7 +10,7 @@ use crate::api::{
 };
 use crate::backend::BackendError;
 use crate::backend::fake::{FAKE_SELF_HASH, FAKE_SELF_ID, FakeBackend, FakeScript, Fault, Op};
-use crate::model::LocalId;
+use crate::model::{LocalId, ThreadKey};
 use crate::secret::{MemoryStore, SecretItem, SecretStore};
 
 fn is_not_started(s: &AuthState) -> bool {
@@ -382,7 +382,7 @@ async fn occupy_permits(h: &Harness, first: u64, fault: Fault) {
     for id in first..first + count {
         h.fake.inject(Op::Send, fault);
         h.send(Command::SendText {
-            chat: super::chat(1),
+            thread: ThreadKey::whole(super::chat(1)),
             text: "filler".into(),
             local_id: LocalId(id),
         })
@@ -431,7 +431,7 @@ async fn flooded_at_zero() -> Harness {
         Fault::Error(BackendError::FloodWait { seconds: 599 }),
     );
     h.send(Command::SendText {
-        chat: super::chat(1),
+        thread: ThreadKey::whole(super::chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })

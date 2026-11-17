@@ -27,7 +27,7 @@ pub use seed::{MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 
 use crate::api::{CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
 pub use crate::credentials::CredentialSlot;
-use crate::model::{ChatId, ChatSummary, Message, MsgId};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, ThreadKey};
 
 /// Opaque position in the dialogs list, produced by the backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,7 +286,7 @@ pub trait Client: Send + Sync + 'static {
 
     fn history(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         query: HistoryQuery,
         limit: u32,
     ) -> impl Future<Output = Result<HistoryPage, BackendError>> + Send;
@@ -295,7 +295,7 @@ pub trait Client: Send + Sync + 'static {
     /// retry of the same logical send so the server can deduplicate.
     fn send_text(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         text: String,
         random_id: i64,
     ) -> impl Future<Output = Result<MsgId, BackendError>> + Send;
@@ -303,7 +303,7 @@ pub trait Client: Send + Sync + 'static {
     /// Marks history read up to and including `max_id`.
     fn read_history(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         max_id: MsgId,
     ) -> impl Future<Output = Result<(), BackendError>> + Send;
 

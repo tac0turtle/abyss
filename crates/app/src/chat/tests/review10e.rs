@@ -26,7 +26,7 @@ fn a_replaced_view_keeps_the_message_being_read(cx: &mut TestAppContext) {
     // What core's replacing tail sends: the server's whole history now
     // (1..=30, everything newer deleted) and the late messages on top.
     shell.apply(Event::History {
-        chat: CHAT,
+        thread: THREAD,
         view: ViewGen(2),
         dir: HistoryDir::Tail,
         messages: (1..=30).chain(101..=130).map(msg).collect(),
@@ -90,7 +90,7 @@ fn rapid_activation_keeps_retries_bounded() {
         last_message: Some(49),
     });
     shell.frame_seen(middle, now(), &mut core.admit()).unwrap();
-    assert!(viewing(&core.take()).contains(&Some(CHAT)));
+    assert!(viewing(&core.take()).contains(&Some(THREAD)));
     let attempts = Attempts::default();
     let loads = &attempts.older;
     let mut refuse = |cmd: Command| {

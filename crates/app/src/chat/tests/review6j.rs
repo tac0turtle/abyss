@@ -23,7 +23,7 @@ fn fill(shell: &mut ChatShell, core: &mut Core) -> Vec<LocalId> {
 /// `submit` (the composer keeps its text).
 fn no_room(shell: &mut ChatShell, core: &mut Core) -> bool {
     let target = shell.send_target();
-    let submitted = shell.submit(CHAT, "one more", 0, &mut core.admit());
+    let submitted = shell.submit(THREAD, "one more", 0, &mut core.admit());
     let refused = target == Err(UserError::Busy) && submitted == Ok(None);
     assert!(core.take().is_empty() || !refused, "sent while full");
     refused
@@ -44,7 +44,7 @@ fn a_discard_keeps_its_slot_until_core_answers() {
     shell.discard(racing, &mut core.admit()).unwrap();
     assert!(matches!(core.take().as_slice(), [Command::DiscardSend(r)] if *r == racing));
     assert_eq!(
-        shell.echoes().count(CHAT),
+        shell.echoes().count(THREAD),
         MAX_ECHOES,
         "discarding still counts"
     );
@@ -68,7 +68,7 @@ fn a_discard_keeps_its_slot_until_core_answers() {
     assert!(no_room(&mut shell, &mut core));
     shell.apply(Event::SendDiscarded { local_id: other });
     assert!(shell.echoes().get(other).is_none());
-    assert_eq!(shell.send_target(), Ok(Some(CHAT)));
+    assert_eq!(shell.send_target(), Ok(Some(THREAD)));
 }
 
 /// Finding 1, the UI's side: a send core refused and holds nothing for
@@ -80,7 +80,7 @@ fn a_refused_send_keeps_its_text_for_the_box() {
     let mut core = Core::default();
     let mut shell = open(&mut core);
     let local_id = shell
-        .submit(CHAT, "keep me", 0, &mut core.admit())
+        .submit(THREAD, "keep me", 0, &mut core.admit())
         .unwrap()
         .unwrap();
     core.take();
@@ -89,13 +89,13 @@ fn a_refused_send_keeps_its_text_for_the_box() {
     let echo = shell.echoes().get(local_id).unwrap();
     assert!(echo.is_returned() && !echo.can_retry() && !echo.can_discard());
     assert_eq!(send_label(echo, now()), RETURNED);
-    assert_eq!(shell.echoes().count(CHAT), 1, "still counted");
+    assert_eq!(shell.echoes().count(THREAD), 1, "still counted");
     // Late state events cannot revive it.
     set(&mut shell, local_id, SendState::Failed);
     assert!(shell.echoes().get(local_id).unwrap().is_returned());
-    assert_eq!(shell.returned(local_id), Some((CHAT, "keep me")));
+    assert_eq!(shell.returned(local_id), Some((THREAD, "keep me")));
     assert_eq!(shell.take_returned(local_id).as_deref(), Some("keep me"));
-    assert_eq!(shell.echoes().count(CHAT), 0);
+    assert_eq!(shell.echoes().count(THREAD), 0);
     assert_eq!(shell.take_returned(local_id), None);
 }
 
@@ -124,7 +124,7 @@ fn unanswered_submissions_count_toward_the_cap() {
     let mut shell = open(&mut core);
     for n in 0..MAX_ECHOES {
         let local_id = shell
-            .submit(CHAT, &format!("m{n}"), 0, &mut core.admit())
+            .submit(THREAD, &format!("m{n}"), 0, &mut core.admit())
             .unwrap()
             .unwrap();
         if n == 0 {

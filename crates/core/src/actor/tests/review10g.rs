@@ -9,31 +9,31 @@ use super::{Harness, chat, harness};
 use crate::api::{Command, ConnState, Event, HistoryDir, LoadTarget, UserError};
 use crate::backend::fake::{BuildFault, FakeScript, Op, text_message};
 use crate::backend::{BackendError, StreamError, Update};
-use crate::model::{ChatId, Message, Sender};
+use crate::model::{ChatId, Message, Sender, ThreadKey};
 use crate::store::MAX_STORE_BYTES;
 
 fn reconciled_in(c: ChatId) -> impl Fn(&Event) -> bool {
-    move |e| matches!(e, Event::Reconciled { chat, .. } if *chat == c)
+    move |e| matches!(e, Event::Reconciled { thread, .. } if *thread == ThreadKey::whole(c))
 }
 
 fn older(e: &Event) -> bool {
-    matches!(e, Event::History { chat: c, dir: HistoryDir::Older, .. } if *c == chat(1))
+    matches!(e, Event::History { thread: c, dir: HistoryDir::Older, .. } if *c == ThreadKey::whole(chat(1)))
 }
 
 fn ended(e: &Event) -> bool {
     let target = LoadTarget::History {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         dir: HistoryDir::Older,
     };
     matches!(e, Event::LoadEnded { target: t, .. } if *t == target)
 }
 
 fn invalidated(e: &Event) -> bool {
-    matches!(e, Event::ChatInvalidated(c) if *c == chat(1))
+    matches!(e, Event::ThreadInvalidated(c) if *c == ThreadKey::whole(chat(1)))
 }
 
 async fn open(h: &mut Harness, c: ChatId) {
-    h.send(Command::OpenChat(c)).await;
+    h.send(Command::OpenThread(ThreadKey::whole(c))).await;
     h.until(reconciled_in(c)).await;
 }
 
@@ -63,7 +63,7 @@ async fn a_background_message_over_budget_keeps_the_open_window() {
     open(&mut h, chat(1)).await;
     h.fake.lead(Op::History, Duration::from_secs(10));
     let before = h.fake.calls(Op::History);
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(h.fake.calls(Op::History), before + 1, "the load is running");
     h.fake
@@ -77,7 +77,7 @@ async fn a_background_message_over_budget_keeps_the_open_window() {
         .push_update(Update::NewMessage(text_message(chat(1), 201, "live")))
         .await;
     h.until(
-        |e| matches!(e, Event::History { chat: c, dir: HistoryDir::Newer, .. } if *c == chat(1)),
+        |e| matches!(e, Event::History { thread: c, dir: HistoryDir::Newer, .. } if *c == ThreadKey::whole(chat(1))),
     )
     .await;
     h.stop().await;
@@ -95,7 +95,7 @@ async fn a_running_older_load_abandoned_by_a_rebuild_is_answered_once() {
     open(&mut h, chat(1)).await;
     h.fake.lead(Op::History, Duration::from_secs(10));
     let before = h.fake.calls(Op::History);
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(h.fake.calls(Op::History), before + 1, "the load is running");
     // The first rebuild fails: recovery stalls behind its backoff.
@@ -120,7 +120,7 @@ async fn a_running_older_load_abandoned_by_a_rebuild_is_answered_once() {
     let rest: Vec<Event> = rest.into_iter().chain(h.drain()).collect();
     assert!(!rest.iter().any(|e| ended(e) || older(e)), "{rest:?}");
     // The UI's retry is a fresh load, answered by its page.
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     let (ev, _) = h.until(|e| older(e) || ended(e)).await;
     assert!(older(&ev), "{ev:?}");
     h.stop().await;
@@ -140,10 +140,10 @@ async fn a_deferred_older_load_is_answered_by_a_stalled_rebuild() {
     open(&mut h, chat(2)).await;
     // Chat 1's retained window refreshes its tail slowly on reopening.
     h.fake.lead(Op::History, Duration::from_secs(10));
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let before = h.fake.calls(Op::History);
-    h.send(Command::LoadOlder(chat(1))).await;
+    h.send(Command::LoadOlder(ThreadKey::whole(chat(1)))).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(
         h.fake.calls(Op::History),

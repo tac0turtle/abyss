@@ -9,12 +9,12 @@ use super::{Harness, chat, harness};
 use crate::actor::sends::{MAX_KEPT_SENDS, MAX_PENDING_SENDS};
 use crate::api::{AuthState, Command, Event, SendState, UserError};
 use crate::backend::fake::FakeScript;
-use crate::model::LocalId;
+use crate::model::{LocalId, ThreadKey};
 
 /// Sends `LocalId(id)` and returns the state it settles in.
 async fn send_settles(h: &mut Harness, id: u64) -> SendState {
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: format!("m{id}"),
         local_id: LocalId(id),
     })

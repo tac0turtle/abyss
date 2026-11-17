@@ -26,6 +26,7 @@ const CHAT: ChatId = ChatId {
     kind: PeerKind::User,
     id: 1,
 };
+const THREAD: ThreadKey = ThreadKey::whole(CHAT);
 
 /// Core's command queue: records what it admits, refuses all while full.
 #[derive(Default)]
@@ -93,7 +94,7 @@ fn msg(id: i32) -> Message {
 
 fn history(view: u64, dir: HistoryDir, ids: impl IntoIterator<Item = i32>) -> Event {
     Event::History {
-        chat: CHAT,
+        thread: THREAD,
         view: ViewGen(view),
         dir,
         messages: ids.into_iter().map(msg).collect(),
@@ -105,7 +106,7 @@ fn history(view: u64, dir: HistoryDir, ids: impl IntoIterator<Item = i32>) -> Ev
 /// A live message appended to the attached view 1.
 fn live(id: i32) -> Event {
     Event::History {
-        chat: CHAT,
+        thread: THREAD,
         view: ViewGen(1),
         dir: HistoryDir::Newer,
         messages: vec![msg(id)],
@@ -116,7 +117,7 @@ fn live(id: i32) -> Event {
 
 fn reconciled(view: u64, newest: i32) -> Event {
     Event::Reconciled {
-        chat: CHAT,
+        thread: THREAD,
         view: ViewGen(view),
         newest: Some(MsgId(newest)),
     }
@@ -126,9 +127,12 @@ fn reconciled(view: u64, newest: i32) -> Event {
 fn open(core: &mut Core) -> ChatShell {
     let mut shell = ChatShell::default();
     shell.apply(Event::DialogsReset(vec![summary()]));
-    shell.select(CHAT, &mut core.admit()).unwrap();
-    assert!(matches!(core.take().as_slice(), [Command::OpenChat(CHAT)]));
-    shell.select(CHAT, &mut core.admit()).unwrap();
+    shell.select(THREAD, &mut core.admit()).unwrap();
+    assert!(matches!(
+        core.take().as_slice(),
+        [Command::OpenThread(THREAD)]
+    ));
+    shell.select(THREAD, &mut core.admit()).unwrap();
     assert!(core.take().is_empty(), "already open");
     shell.apply(history(1, HistoryDir::Tail, 51..=100));
     shell
@@ -171,10 +175,10 @@ fn reads(cmds: &[Command]) -> Vec<i32> {
         .collect()
 }
 
-fn viewing(cmds: &[Command]) -> Vec<Option<ChatId>> {
+fn viewing(cmds: &[Command]) -> Vec<Option<ThreadKey>> {
     cmds.iter()
         .filter_map(|c| match c {
-            Command::ViewingTail(chat) => Some(*chat),
+            Command::ViewingTail(thread) => Some(*thread),
             _ => None,
         })
         .collect()
@@ -209,10 +213,10 @@ fn full_queue_creates_no_echo_and_changes_nothing() {
     let mut core = Core::default();
     let mut shell = open(&mut core);
     core.full = true;
-    let refused = shell.submit(CHAT, "draft", 0, &mut core.admit());
+    let refused = shell.submit(THREAD, "draft", 0, &mut core.admit());
     assert_eq!(refused, Err(Refused::Busy));
     assert_eq!(shell.row_count(), 50, "no echo for a send core never took");
-    assert_eq!(shell.echoes().count(CHAT), 0);
+    assert_eq!(shell.echoes().count(THREAD), 0);
     core.full = false;
     let id = send(&mut shell, &mut core, "draft");
     assert_eq!(id, LocalId(1), "the refused send used up no id");
@@ -234,8 +238,11 @@ fn full_queue_creates_no_echo_and_changes_nothing() {
         id: 2,
     };
     core.full = true;
-    assert_eq!(shell.select(other, &mut core.admit()), Err(Refused::Busy));
-    assert_eq!(shell.selected(), Some(CHAT));
+    assert_eq!(
+        shell.select(ThreadKey::whole(other), &mut core.admit()),
+        Err(Refused::Busy)
+    );
+    assert_eq!(shell.selected(), Some(THREAD));
 }
 
 #[test]
@@ -311,7 +318,7 @@ fn unconfirmed_echo_stays_until_core_reports_it_covered() {
     let mut shell = open(&mut core);
     let id = send(&mut shell, &mut core, "x");
     set(&mut shell, id, SendState::SentUnconfirmed);
-    shell.apply(Event::ChatInvalidated(CHAT));
+    shell.apply(Event::ThreadInvalidated(THREAD));
     shell.apply(history(2, HistoryDir::Tail, 160..=209));
     assert_eq!(shell.row_count(), 51, "a new view keeps the echo");
     for _ in 0..3 {
@@ -320,18 +327,18 @@ fn unconfirmed_echo_stays_until_core_reports_it_covered() {
     assert_eq!(shell.row_count(), 51, "the send is below every tail");
     let other = LocalId(id.0 + 1);
     shell.apply(Event::SendsCovered {
-        chat: CHAT,
+        thread: THREAD,
         sends: vec![other],
     });
     assert_eq!(shell.row_count(), 51, "another send");
     shell.apply(history(2, HistoryDir::Older, 101..=159));
     shell.apply(Event::SendsCovered {
-        chat: CHAT,
+        thread: THREAD,
         sends: vec![id],
     });
     assert_eq!(shell.row_count(), 109, "the server copy took its place");
     assert_eq!(shell.rows().item_count(), 109);
-    assert_eq!(shell.echoes().count(CHAT), 0);
+    assert_eq!(shell.echoes().count(THREAD), 0);
 }
 
 /// Task 10d, finding 5 (replaces 10c's `a_load_ended_by_reconciled_is_asked_again`,
@@ -350,7 +357,7 @@ fn reconciled_does_not_end_a_pending_load() {
     let older = |core: &mut Core| {
         core.take()
             .iter()
-            .filter(|c| matches!(c, Command::LoadOlder(CHAT)))
+            .filter(|c| matches!(c, Command::LoadOlder(THREAD)))
             .count()
     };
     shell.frame_seen(top, now(), &mut core.admit()).unwrap();
@@ -366,7 +373,7 @@ fn reconciled_does_not_end_a_pending_load() {
     assert_eq!(older(&mut core), 1, "answered by its history");
     // Core had nothing to load: parked until the window changes.
     let ended = LoadTarget::History {
-        chat: CHAT,
+        thread: THREAD,
         dir: HistoryDir::Older,
     };
     shell.load_ended(ended, None, now());
@@ -389,7 +396,7 @@ fn failed_history_loads_retry_a_bounded_number_of_times() {
         last_message: None,
     });
     let ended = LoadTarget::History {
-        chat: CHAT,
+        thread: THREAD,
         dir: HistoryDir::Older,
     };
     let mut asked = 0;
@@ -397,7 +404,7 @@ fn failed_history_loads_retry_a_bounded_number_of_times() {
     for _ in 0..1_000 {
         shell.frame_seen(top, t, &mut core.admit()).unwrap();
         let sent = core.take();
-        if sent.iter().any(|c| matches!(c, Command::LoadOlder(CHAT))) {
+        if sent.iter().any(|c| matches!(c, Command::LoadOlder(THREAD))) {
             asked += 1;
             // A send's error says nothing about the load.
             shell.apply(Event::Error(UserError::Rejected));
@@ -437,7 +444,7 @@ fn a_refused_deactivation_stops_reads_and_is_retried() {
         })
     };
     shell.frame_seen(at(49), now(), &mut core.admit()).unwrap();
-    assert_eq!(viewing(&core.take()), [Some(CHAT)]);
+    assert_eq!(viewing(&core.take()), [Some(THREAD)]);
     core.full = true;
     let refused = shell.set_focus(WindowState::Inactive, now(), &mut core.admit());
     assert_eq!(refused, Err(Refused::Busy));
@@ -462,7 +469,7 @@ fn a_refused_deactivation_stops_reads_and_is_retried() {
         .set_focus(WindowState::Active, now(), &mut core.admit())
         .unwrap();
     shell.frame_seen(at(50), now(), &mut core.admit()).unwrap();
-    assert_eq!(viewing(&core.take()), [Some(CHAT)]);
+    assert_eq!(viewing(&core.take()), [Some(THREAD)]);
     core.full = true;
     assert!(
         shell
@@ -515,7 +522,7 @@ fn reopening_a_chat_replaces_the_view_with_its_full_tail() {
     shell.jump_to_latest(&mut core.admit()).unwrap();
     assert!(matches!(
         core.take().as_slice(),
-        [.., Command::OpenChat(CHAT)]
+        [.., Command::OpenThread(THREAD)]
     ));
     shell.apply(history(3, HistoryDir::Tail, 41..=100));
     assert_eq!(shell.row_count(), 60, "replaced, not appended");
@@ -527,7 +534,7 @@ fn reopening_a_chat_replaces_the_view_with_its_full_tail() {
 fn read_only_and_empty_submissions_send_nothing() {
     let mut core = Core::default();
     let mut shell = open(&mut core);
-    assert_eq!(shell.submit(CHAT, "  \n", 0, &mut core.admit()), Ok(None));
+    assert_eq!(shell.submit(THREAD, "  \n", 0, &mut core.admit()), Ok(None));
     assert!(core.take().is_empty());
     shell.apply(Event::DialogsReset(vec![read_only()]));
     assert_eq!(shell.send_target(), Ok(None));
@@ -559,7 +566,7 @@ fn mark_read_and_live_tail_follow_what_is_on_screen() {
         .unwrap();
     let cmds = core.take();
     assert_eq!(reads(&cmds), [100]);
-    assert_eq!(viewing(&cmds), [Some(CHAT)]);
+    assert_eq!(viewing(&cmds), [Some(THREAD)]);
     shell
         .set_focus(WindowState::Inactive, now(), &mut core.admit())
         .unwrap();
@@ -587,7 +594,7 @@ fn mark_read_and_live_tail_follow_what_is_on_screen() {
         .unwrap();
     let cmds = core.take();
     assert_eq!(reads(&cmds), [101]);
-    assert_eq!(viewing(&cmds), [Some(CHAT)]);
+    assert_eq!(viewing(&cmds), [Some(THREAD)]);
     // A refused mark is asked again on a frame after the backoff.
     shell.apply(live(102));
     core.full = true;
@@ -620,7 +627,7 @@ fn scrolling_near_the_top_loads_older_once() {
     let older = |core: &mut Core| {
         core.take()
             .into_iter()
-            .filter(|c| matches!(c, Command::LoadOlder(CHAT)))
+            .filter(|c| matches!(c, Command::LoadOlder(THREAD)))
             .count()
     };
     shell.frame_seen(at(20), now(), &mut core.admit()).unwrap();
@@ -640,7 +647,7 @@ fn scrolling_near_the_top_loads_older_once() {
     shell.frame_seen(at(0), now(), &mut core.admit()).unwrap();
     assert_eq!(older(&mut core), 1);
     let ended = LoadTarget::History {
-        chat: CHAT,
+        thread: THREAD,
         dir: HistoryDir::Older,
     };
     shell.load_ended(ended, Some(UserError::Network), now());
@@ -689,7 +696,7 @@ fn other_chats_events_do_not_touch_the_open_window() {
         chat: other,
         ids: vec![MsgId(60)],
     });
-    shell.apply(Event::ChatInvalidated(other));
+    shell.apply(Event::ThreadInvalidated(ThreadKey::whole(other)));
     assert_eq!(shell.row_count(), 50);
     shell.apply(Event::Deleted {
         chat: CHAT,
@@ -708,10 +715,14 @@ fn switching_chats_keeps_echoes_with_their_chat() {
         id: 2,
     };
     core.take();
-    shell.select(other, &mut core.admit()).unwrap();
-    assert!(matches!(core.take().as_slice(), [Command::OpenChat(c)] if *c == other));
+    shell
+        .select(ThreadKey::whole(other), &mut core.admit())
+        .unwrap();
+    assert!(
+        matches!(core.take().as_slice(), [Command::OpenThread(t)] if *t == ThreadKey::whole(other))
+    );
     assert_eq!(shell.rows().item_count(), 0);
-    shell.select(CHAT, &mut core.admit()).unwrap();
+    shell.select(THREAD, &mut core.admit()).unwrap();
     assert_eq!(
         shell.rows().item_count(),
         1,
@@ -760,7 +771,7 @@ fn refused_frame_commands_back_off_and_give_up() {
         .unwrap();
     shell.frame_seen(seen, t, &mut core.admit()).unwrap();
     let cmds = core.take();
-    assert!(cmds.iter().any(|c| matches!(c, Command::LoadOlder(CHAT))));
+    assert!(cmds.iter().any(|c| matches!(c, Command::LoadOlder(THREAD))));
     assert_eq!(reads(&cmds), [100]);
     assert!(!shell.history_gave_up());
 }
@@ -840,7 +851,7 @@ fn exhausted_newer_loads_recover_while_detached() {
     let mut core = Core::default();
     let mut shell = open(&mut core);
     shell.apply(Event::History {
-        chat: CHAT,
+        thread: THREAD,
         view: ViewGen(1),
         dir: HistoryDir::Newer,
         messages: vec![msg(101)],
@@ -852,13 +863,13 @@ fn exhausted_newer_loads_recover_while_detached() {
         last_message: Some(50),
     });
     let ended = LoadTarget::History {
-        chat: CHAT,
+        thread: THREAD,
         dir: HistoryDir::Newer,
     };
     let newer = |core: &mut Core| {
         core.take()
             .iter()
-            .filter(|c| matches!(c, Command::LoadNewer(CHAT)))
+            .filter(|c| matches!(c, Command::LoadNewer(THREAD)))
             .count()
     };
     let mut t = now();
@@ -957,8 +968,8 @@ fn only_rows_inside_the_viewport_count_as_seen(cx: &mut TestAppContext) {
         .unwrap();
     let cmds = core.take();
     assert_eq!(reads(&cmds), [100]);
-    assert_eq!(viewing(&cmds), [Some(CHAT)]);
-    assert_eq!(shell.viewing(), Some(CHAT));
+    assert_eq!(viewing(&cmds), [Some(THREAD)]);
+    assert_eq!(shell.viewing(), Some(THREAD));
 
     shell.rows().scroll_to(ListOffset {
         item_ix: 20,

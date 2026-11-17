@@ -17,7 +17,7 @@ use crate::backend::{
     BackendError, DialogsPage, HistoryPage, HistoryQuery, SessionSeed, StreamError, Update,
 };
 use crate::events;
-use crate::model::{LocalId, Message, MsgId};
+use crate::model::{LocalId, Message, MsgId, ThreadKey};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,7 +76,7 @@ async fn fire(h: &mut Harness, trigger: Trigger) {
             for i in 1..=3 {
                 h.fake.inject(Op::Read, Fault::Hang);
                 h.send(Command::MarkRead {
-                    chat: chat(i),
+                    thread: ThreadKey::whole(chat(i)),
                     max_id: MsgId(1),
                 })
                 .await;
@@ -85,7 +85,7 @@ async fn fire(h: &mut Harness, trigger: Trigger) {
         Trigger::Migrated => {
             h.fake
                 .inject(Op::History, Fault::Error(BackendError::Migrated));
-            h.send(Command::OpenChat(chat(1))).await;
+            h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
         }
     }
 }
@@ -204,7 +204,7 @@ async fn parked_permits_recycle_only_after_the_runner_completes() {
     for i in 0..total {
         let id = i64::try_from(i).unwrap() + 1;
         h.send(Command::MarkRead {
-            chat: chat(id),
+            thread: ThreadKey::whole(chat(id)),
             max_id: MsgId(1),
         })
         .await;
@@ -259,11 +259,11 @@ async fn runner_ignoring_quit_is_aborted_and_awaited() {
 async fn rebuild_carries_the_live_session_and_peers() {
     let mut h = harness(FakeScript::demo(3, 10), None).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(2))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(2)))).await;
     h.history(chat(2), HistoryDir::Tail).await;
     h.fake.inject(Op::Send, Fault::Hang);
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -314,7 +314,7 @@ async fn stale_generation_completions_are_dropped() {
         cache_parts: None,
         pending_logout: None,
     });
-    let view = actor.windows.open(chat(1));
+    let view = actor.windows.open(ThreadKey::whole(chat(1)));
     let stale = ClientGen(actor.cgen.0 - 1);
     let page = DialogsPage {
         chats: vec![crate::backend::fake::summary(chat(1), "c")],
@@ -337,7 +337,7 @@ async fn stale_generation_completions_are_dropped() {
             parked: None,
             outcome: Outcome::History {
                 load: crate::actor::jobs::Load {
-                    chat: chat(1),
+                    thread: ThreadKey::whole(chat(1)),
                     view,
                     req: crate::actor::jobs::ReqId(1),
                 },
@@ -356,7 +356,14 @@ async fn stale_generation_completions_are_dropped() {
         "stale completions emit nothing"
     );
     assert!(actor.dialogs.is_empty());
-    assert!(actor.windows.get(chat(1)).unwrap().messages().is_empty());
+    assert!(
+        actor
+            .windows
+            .get(ThreadKey::whole(chat(1)))
+            .unwrap()
+            .messages()
+            .is_empty()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -365,11 +372,11 @@ async fn in_flight_call_of_a_retired_instance_never_reaches_the_ui() {
     script.latency = Duration::from_secs(1);
     let mut h = harness(script, None).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     h.internal.send(Internal::Wake).await.unwrap();
     let (_, before) = h
-        .until(|e| matches!(e, Event::ChatInvalidated(c) if *c == chat(1)))
+        .until(|e| matches!(e, Event::ThreadInvalidated(c) if *c == ThreadKey::whole(chat(1))))
         .await;
     assert!(
         !before.iter().any(|e| matches!(e, Event::History { .. })),
@@ -390,7 +397,7 @@ fn fold(events: &[Event]) -> BTreeMap<i32, Option<i64>> {
     let mut window = BTreeMap::new();
     for ev in events {
         match ev {
-            Event::ChatInvalidated(_) => window.clear(),
+            Event::ThreadInvalidated(_) => window.clear(),
             Event::History {
                 dir: HistoryDir::Tail,
                 messages,
@@ -446,7 +453,7 @@ fn deleted(id: i32) -> Update {
 /// after 4 s.
 async fn open_with_slow_snapshots(h: &mut Harness) {
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.history(chat(1), HistoryDir::Tail).await;
     let server = (1..=11).map(|i| match i {
         5 => edited(5, 100),
@@ -474,7 +481,7 @@ async fn bootstrap_merges_updates_around_the_snapshots() {
     h.fake.push_update(Update::NewMessage(new)).await;
     h.fake.push_update(deleted(7)).await;
     let (invalidated, _) = h
-        .until(|e| matches!(e, Event::ChatInvalidated(c) if *c == chat(1)))
+        .until(|e| matches!(e, Event::ThreadInvalidated(c) if *c == ThreadKey::whole(chat(1))))
         .await;
     let baseline = Instant::now();
     // During the tail fetch.
@@ -518,7 +525,7 @@ async fn bootstrap_merges_updates_around_the_snapshots() {
 async fn refresh_on_activation_and_every_five_minutes() {
     let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.online().await;
-    h.send(Command::OpenChat(chat(1))).await;
+    h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.history(chat(1), HistoryDir::Tail).await;
     h.send(Command::Window(WindowState::Inactive)).await;
     let (dialogs, history) = (h.fake.calls(Op::Dialogs), h.fake.calls(Op::History));
@@ -587,7 +594,7 @@ async fn pending_send_replays_with_the_same_random_id_across_a_rebuild() {
     h.online().await;
     h.fake.inject(Op::Send, Fault::Hang);
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -618,7 +625,7 @@ async fn discard_removes_failed_sends_but_not_in_flight_ones() {
     h.fake
         .inject(Op::Send, Fault::Error(BackendError::Rejected));
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "hi".into(),
         local_id: LocalId(1),
     })
@@ -633,7 +640,7 @@ async fn discard_removes_failed_sends_but_not_in_flight_ones() {
     ));
     h.fake.inject(Op::Send, Fault::Hang);
     h.send(Command::SendText {
-        chat: chat(1),
+        thread: ThreadKey::whole(chat(1)),
         text: "slow".into(),
         local_id: LocalId(2),
     })

@@ -11,6 +11,7 @@ const OTHER: ChatId = ChatId {
     kind: PeerKind::User,
     id: 2,
 };
+const OTHER_THREAD: ThreadKey = ThreadKey::whole(OTHER);
 
 fn in_other(m: Message) -> Message {
     Message {
@@ -23,14 +24,14 @@ fn in_other(m: Message) -> Message {
 }
 
 /// Refuses every frame command but admits focus changes, counting
-/// `LoadOlder` attempts per chat.
+/// `LoadOlder` attempts per thread.
 fn frames_refused(
-    sent: &std::cell::RefCell<Vec<ChatId>>,
+    sent: &std::cell::RefCell<Vec<ThreadKey>>,
 ) -> impl FnMut(Command) -> Result<(), Refused> + '_ {
     move |cmd| match cmd {
-        Command::Window(_) | Command::ViewingTail(_) | Command::OpenChat(_) => Ok(()),
-        Command::LoadOlder(chat) => {
-            sent.borrow_mut().push(chat);
+        Command::Window(_) | Command::ViewingTail(_) | Command::OpenThread(_) => Ok(()),
+        Command::LoadOlder(thread) => {
+            sent.borrow_mut().push(thread);
             Err(Refused::Busy)
         }
         _ => Err(Refused::Busy),
@@ -74,9 +75,9 @@ fn a_held_back_recovery_runs_when_the_gap_ends() {
     toggle(&mut shell, &mut admit, t0);
     assert!(!shell.history_gave_up(), "recovered");
     // Chat B gives up as well.
-    shell.select(OTHER, &mut admit).unwrap();
+    shell.select(OTHER_THREAD, &mut admit).unwrap();
     shell.apply(Event::History {
-        chat: OTHER,
+        thread: OTHER_THREAD,
         view: ViewGen(2),
         dir: HistoryDir::Tail,
         messages: (51..=100).map(|id| in_other(msg(id))).collect(),
@@ -85,7 +86,7 @@ fn a_held_back_recovery_runs_when_the_gap_ends() {
     });
     let t1 = frames(&mut shell, &mut admit, t0, Duration::from_secs(20));
     assert!(shell.history_gave_up());
-    let asked = sent.borrow().iter().filter(|c| **c == OTHER).count();
+    let asked = sent.borrow().iter().filter(|c| **c == OTHER_THREAD).count();
     assert_eq!(asked, usize::from(MAX_FAILURES));
     // Activation within the gap: held back, but a wake-up is due at its end.
     toggle(&mut shell, &mut admit, t1);
@@ -96,7 +97,7 @@ fn a_held_back_recovery_runs_when_the_gap_ends() {
     shell.retry_wakeup(end, &mut admit).unwrap();
     assert!(!shell.history_gave_up(), "recovered at the gap's end");
     frames(&mut shell, &mut admit, end, Duration::from_millis(100));
-    let asked = sent.borrow().iter().filter(|c| **c == OTHER).count();
+    let asked = sent.borrow().iter().filter(|c| **c == OTHER_THREAD).count();
     assert_eq!(asked, usize::from(MAX_FAILURES) + 1);
     assert_eq!(
         shell.retry_due(end),
@@ -124,7 +125,7 @@ fn a_replaced_view_without_the_anchor_falls_back_to_the_tail(cx: &mut TestAppCon
     });
     lay_out(cx, &shell);
     shell.apply(Event::History {
-        chat: CHAT,
+        thread: THREAD,
         view: ViewGen(2),
         dir: HistoryDir::Tail,
         messages: (1..=30)

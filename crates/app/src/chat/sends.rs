@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use abyss_core::api::SendState;
-use abyss_core::model::{ChatId, LocalId, MsgId};
+use abyss_core::model::{LocalId, MsgId, ThreadKey};
 
 /// Same bound as core's whole pending-send table (256 ordinary sends plus 32
 /// kept `Failed` for Retry, review rounds 31 to 33). No echo core keeps is
@@ -45,7 +45,7 @@ pub(crate) enum Phase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Echo {
     pub(crate) local_id: LocalId,
-    pub(crate) chat: ChatId,
+    pub(crate) thread: ThreadKey,
     pub(crate) text: String,
     pub(crate) state: SendState,
     /// Unix seconds when the user sent it.
@@ -56,10 +56,10 @@ pub(crate) struct Echo {
 }
 
 impl Echo {
-    pub(crate) fn new(local_id: LocalId, chat: ChatId, text: String, date: i64) -> Self {
+    pub(crate) fn new(local_id: LocalId, thread: ThreadKey, text: String, date: i64) -> Self {
         Self {
             local_id,
-            chat,
+            thread,
             text,
             state: SendState::Sending,
             date,
@@ -144,12 +144,12 @@ impl Echoes {
         self.list.iter().find(|e| e.local_id == local_id)
     }
 
-    pub(crate) fn for_chat(&self, chat: ChatId) -> impl Iterator<Item = &Echo> {
-        self.list.iter().filter(move |e| e.chat == chat)
+    pub(crate) fn for_thread(&self, thread: ThreadKey) -> impl Iterator<Item = &Echo> {
+        self.list.iter().filter(move |e| e.thread == thread)
     }
 
-    pub(crate) fn count(&self, chat: ChatId) -> usize {
-        self.for_chat(chat).count()
+    pub(crate) fn count(&self, thread: ThreadKey) -> usize {
+        self.for_thread(thread).count()
     }
 
     /// Whether any echo shows a flood-wait countdown.
@@ -158,13 +158,13 @@ impl Echoes {
     }
 
     /// Applies a `SendState` event received at `now`. Returns the echo's
-    /// chat if it changed.
+    /// thread if it changed.
     pub(crate) fn set_state(
         &mut self,
         local_id: LocalId,
         state: SendState,
         now: Instant,
-    ) -> Option<ChatId> {
+    ) -> Option<ThreadKey> {
         let echo = self
             .list
             .iter_mut()
@@ -176,7 +176,7 @@ impl Echoes {
             }
             _ => None,
         };
-        Some(echo.chat)
+        Some(echo.thread)
     }
 
     fn find_mut(&mut self, local_id: LocalId, phase: Phase) -> Option<&mut Echo> {
@@ -195,26 +195,26 @@ impl Echoes {
         }
     }
 
-    /// Core keeps a submitted send (`SendAdmitted`). Returns its chat.
-    pub(crate) fn admitted(&mut self, local_id: LocalId) -> Option<ChatId> {
+    /// Core keeps a submitted send (`SendAdmitted`). Returns its thread.
+    pub(crate) fn admitted(&mut self, local_id: LocalId) -> Option<ThreadKey> {
         let echo = self.find_mut(local_id, Phase::Submitted)?;
         echo.phase = Phase::Kept;
-        Some(echo.chat)
+        Some(echo.thread)
     }
 
     /// Core holds nothing for this send (`SendRefused`): its text stays
     /// here as [`Phase::Returned`]; a discard waiting on it is done.
-    /// Returns its chat. A send the server already has keeps its state
+    /// Returns its thread. A send the server already has keeps its state
     /// (task 6k): a Retry queued before a late confirmation is answered
     /// `SendRefused` once core has dropped the sent entry, and that answer
     /// is older than the confirmation it follows.
-    pub(crate) fn refused(&mut self, local_id: LocalId) -> Option<ChatId> {
+    pub(crate) fn refused(&mut self, local_id: LocalId) -> Option<ThreadKey> {
         let at = self.list.iter().position(|e| e.local_id == local_id)?;
         let echo = self.list.get_mut(at)?;
         if echo.delivered() {
             return None;
         }
-        let chat = echo.chat;
+        let thread = echo.thread;
         match echo.phase {
             Phase::Discarding => drop(self.list.remove(at)),
             Phase::Submitted | Phase::Kept | Phase::Returned => {
@@ -223,7 +223,7 @@ impl Echoes {
             }
             Phase::Stranded => {}
         }
-        Some(chat)
+        Some(thread)
     }
 
     /// Core's event stream closed while it ran (task 6k): no answer will
@@ -265,23 +265,23 @@ impl Echoes {
     }
 
     /// Core discarded the send (`SendDiscarded`): the echo goes. Returns
-    /// its chat.
-    pub(crate) fn discarded(&mut self, local_id: LocalId) -> Option<ChatId> {
+    /// its thread.
+    pub(crate) fn discarded(&mut self, local_id: LocalId) -> Option<ThreadKey> {
         let at = self
             .list
             .iter()
             .position(|e| e.local_id == local_id && e.phase != Phase::Returned)?;
-        Some(self.list.remove(at).chat)
+        Some(self.list.remove(at).thread)
     }
 
     /// Core refused a discard and keeps the send in `state`
-    /// (`DiscardRefused`). Returns its chat.
+    /// (`DiscardRefused`). Returns its thread.
     pub(crate) fn discard_refused(
         &mut self,
         local_id: LocalId,
         state: SendState,
         now: Instant,
-    ) -> Option<ChatId> {
+    ) -> Option<ThreadKey> {
         self.find_mut(local_id, Phase::Discarding)?.phase = Phase::Kept;
         self.set_state(local_id, state, now)
     }
@@ -295,20 +295,20 @@ impl Echoes {
         Some(self.list.remove(at))
     }
 
-    /// Drops sent echoes of `chat` whose server copy is now shown. Returns
+    /// Drops sent echoes of `thread` whose server copy is now shown. Returns
     /// whether any went.
-    pub(crate) fn resolve(&mut self, chat: ChatId, shown: impl Fn(MsgId) -> bool) -> bool {
+    pub(crate) fn resolve(&mut self, thread: ThreadKey, shown: impl Fn(MsgId) -> bool) -> bool {
         let before = self.list.len();
         self.list.retain(|e| {
             let SendState::Sent { id } = e.state else {
                 return true;
             };
-            e.chat != chat || !shown(id)
+            e.thread != thread || !shown(id)
         });
         self.list.len() != before
     }
 
-    /// Core reconciled `chat` with the server up to `newest`
+    /// Core reconciled `thread` with the server up to `newest`
     /// (`Event::Reconciled`). `shown` answers whether the reconciled view
     /// holds an id, when that view is the one on screen. A sent echo at or
     /// below `newest` that the view lacks was deleted. An unconfirmed echo
@@ -317,7 +317,7 @@ impl Echoes {
     /// Returns whether any echo went.
     pub(crate) fn reconciled(
         &mut self,
-        chat: ChatId,
+        thread: ThreadKey,
         newest: Option<MsgId>,
         shown: Option<&dyn Fn(MsgId) -> bool>,
     ) -> bool {
@@ -326,7 +326,7 @@ impl Echoes {
         };
         let before = self.list.len();
         self.list.retain(|e| match e.state {
-            SendState::Sent { id } if e.chat == chat => id > newest || shown(id),
+            SendState::Sent { id } if e.thread == thread => id > newest || shown(id),
             _ => true,
         });
         self.list.len() != before
@@ -345,25 +345,25 @@ impl Echoes {
 
 #[cfg(test)]
 mod tests {
-    use abyss_core::model::PeerKind;
+    use abyss_core::model::{ChatId, PeerKind};
 
     use super::*;
 
-    const A: ChatId = ChatId {
+    const A: ThreadKey = ThreadKey::whole(ChatId {
         kind: PeerKind::User,
         id: 1,
-    };
-    const B: ChatId = ChatId {
+    });
+    const B: ThreadKey = ThreadKey::whole(ChatId {
         kind: PeerKind::User,
         id: 2,
-    };
+    });
 
-    fn echo(n: u64, chat: ChatId) -> Echo {
-        Echo::new(LocalId(n), chat, format!("t{n}"), 0)
+    fn echo(n: u64, thread: ThreadKey) -> Echo {
+        Echo::new(LocalId(n), thread, format!("t{n}"), 0)
     }
 
-    fn states(e: &Echoes, chat: ChatId) -> Vec<SendState> {
-        e.for_chat(chat).map(|e| e.state).collect()
+    fn states(e: &Echoes, thread: ThreadKey) -> Vec<SendState> {
+        e.for_thread(thread).map(|e| e.state).collect()
     }
 
     fn set(e: &mut Echoes, n: u64, state: SendState) {

@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::census::Open;
 use super::{Binding, Cache, CacheError, CacheKey, EraseError};
-use crate::model::{ChatId, ChatSummary, Message, MsgId};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, ThreadKey};
 
 /// Commands queued to the worker.
 pub const CACHE_QUEUE: usize = 256;
@@ -24,20 +24,20 @@ pub type DeleteKey = Box<dyn FnOnce() -> Result<(), KeyError> + Send>;
 
 pub(crate) enum CacheCmd {
     PutChats(Vec<ChatSummary>),
-    PutMessages(ChatId, Vec<Message>),
+    PutMessages(ThreadKey, Vec<Message>),
     Reconcile {
-        chat: ChatId,
+        thread: ThreadKey,
         lo: MsgId,
         hi: MsgId,
         messages: Vec<Message>,
     },
     /// A server tail (ascending, plus any newer live messages); see `reconcile_tail`.
     ReconcileTail {
-        chat: ChatId,
+        thread: ThreadKey,
         messages: Vec<Message>,
         /// The oldest id the server page covered when it is partial (which
         /// may be absent from `messages` if it was deleted meanwhile), or
-        /// `None` when the page is the chat's whole history.
+        /// `None` when the page is the thread's whole history.
         from: Option<MsgId>,
     },
     Delete(ChatId, Vec<MsgId>),
@@ -45,18 +45,18 @@ pub(crate) enum CacheCmd {
     Touch(ChatId),
     Chats(Reply<Vec<ChatSummary>>),
     Tail {
-        chat: ChatId,
+        thread: ThreadKey,
         limit: u32,
         reply: Reply<Vec<Message>>,
     },
     Before {
-        chat: ChatId,
+        thread: ThreadKey,
         id: MsgId,
         limit: u32,
         reply: Reply<Vec<Message>>,
     },
     After {
-        chat: ChatId,
+        thread: ThreadKey,
         id: MsgId,
         limit: u32,
         reply: Reply<Vec<Message>>,
@@ -194,14 +194,18 @@ impl CacheHandle {
         self.ask(CacheCmd::Chats).await
     }
 
-    pub async fn tail(&self, chat: ChatId, limit: u32) -> Result<Vec<Message>, WorkerError> {
-        self.ask(|reply| CacheCmd::Tail { chat, limit, reply })
-            .await
+    pub async fn tail(&self, thread: ThreadKey, limit: u32) -> Result<Vec<Message>, WorkerError> {
+        self.ask(|reply| CacheCmd::Tail {
+            thread,
+            limit,
+            reply,
+        })
+        .await
     }
 
     pub async fn before(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         id: MsgId,
         limit: u32,
     ) -> Result<Vec<Message>, WorkerError> {
@@ -210,7 +214,7 @@ impl CacheHandle {
             gate.pass().await;
         }
         self.ask(|reply| CacheCmd::Before {
-            chat,
+            thread,
             id,
             limit,
             reply,
@@ -220,12 +224,12 @@ impl CacheHandle {
 
     pub async fn after(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         id: MsgId,
         limit: u32,
     ) -> Result<Vec<Message>, WorkerError> {
         self.ask(|reply| CacheCmd::After {
-            chat,
+            thread,
             id,
             limit,
             reply,
@@ -356,21 +360,23 @@ fn run(mut cache: Cache, dir: &Path, mut rx: mpsc::Receiver<CacheCmd>) {
 }
 
 /// Applies a server tail. If it overlaps the cached history (or reaches the
-/// start of the chat), only the range it covers is reconciled. Otherwise there
-/// may be a gap between the cache and the tail, so the chat's cache is replaced.
+/// start of the thread), only the range it covers is reconciled. Otherwise there
+/// may be a gap between the cache and the tail, so the thread's cache is
+/// replaced. The topic is not stored yet (schema version 3), so the thread's
+/// cache is its chat's.
 /// Decided here, against what the cache holds, because the actor's window may
 /// have been invalidated by a rebuild. `older` is the tail's first id when older
 /// history exists beyond it.
 fn reconcile_tail(
     cache: &mut Cache,
-    chat: ChatId,
+    thread: ThreadKey,
     messages: &[Message],
     older: Option<MsgId>,
 ) -> Result<Vec<MsgId>, CacheError> {
     const MIN: MsgId = MsgId(i32::MIN);
     let lo = match older {
         Some(first) => {
-            let newest = cache.tail(chat, 1)?.last().map(|m| m.id);
+            let newest = cache.tail(thread, 1)?.last().map(|m| m.id);
             if newest.is_none_or(|n| first <= n) {
                 first
             } else {
@@ -379,7 +385,7 @@ fn reconcile_tail(
         }
         None => MIN,
     };
-    cache.reconcile_range(chat, lo, MsgId(i32::MAX), messages)
+    cache.reconcile_range(thread, lo, MsgId(i32::MAX), messages)
 }
 
 /// Write errors are dropped deliberately: the cache is disposable, and a failed
@@ -387,39 +393,43 @@ fn reconcile_tail(
 fn handle(cache: &mut Cache, cmd: CacheCmd) {
     match cmd {
         CacheCmd::PutChats(chats) => drop(cache.put_chats(&chats)),
-        CacheCmd::PutMessages(chat, msgs) => drop(cache.put_messages(chat, &msgs)),
+        CacheCmd::PutMessages(thread, msgs) => drop(cache.put_messages(thread, &msgs)),
         CacheCmd::Reconcile {
-            chat,
+            thread,
             lo,
             hi,
             messages,
         } => {
-            drop(cache.reconcile_range(chat, lo, hi, &messages));
+            drop(cache.reconcile_range(thread, lo, hi, &messages));
         }
         CacheCmd::ReconcileTail {
-            chat,
+            thread,
             messages,
             from,
         } => {
-            drop(reconcile_tail(cache, chat, &messages, from));
+            drop(reconcile_tail(cache, thread, &messages, from));
         }
         CacheCmd::Delete(chat, ids) => drop(cache.delete_messages(chat, &ids)),
         CacheCmd::DeleteUnscoped(ids) => drop(cache.delete_unscoped(&ids)),
         CacheCmd::Touch(chat) => drop(cache.touch(chat)),
         CacheCmd::Chats(reply) => drop(reply.send(cache.chats())),
-        CacheCmd::Tail { chat, limit, reply } => drop(reply.send(cache.tail(chat, limit))),
+        CacheCmd::Tail {
+            thread,
+            limit,
+            reply,
+        } => drop(reply.send(cache.tail(thread, limit))),
         CacheCmd::Before {
-            chat,
+            thread,
             id,
             limit,
             reply,
-        } => drop(reply.send(cache.before(chat, id, limit))),
+        } => drop(reply.send(cache.before(thread, id, limit))),
         CacheCmd::After {
-            chat,
+            thread,
             id,
             limit,
             reply,
-        } => drop(reply.send(cache.after(chat, id, limit))),
+        } => drop(reply.send(cache.after(thread, id, limit))),
         CacheCmd::Barrier(reply) => drop(reply.send(())),
         CacheCmd::Bind { owner, reply } => drop(reply.send(cache.bind(owner))),
         // Unreachable: `run` intercepts Erase. Report "not performed" if it ever arrives.

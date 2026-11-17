@@ -165,7 +165,7 @@ fn appearance_choice_rethemes_the_window_and_reset_restores_it(cx: &mut TestAppC
 mod fake {
     use abyss_core::api::{AuthState, PasswordBuf, UserError};
     use abyss_core::backend::fake::{FakeScript, summary};
-    use abyss_core::model::{ChatId, PeerKind};
+    use abyss_core::model::{ChatId, PeerKind, ThreadKey};
 
     use super::*;
     use crate::shell::auth::AuthView;
@@ -640,13 +640,15 @@ mod fake {
         // The short list also asks for the next dialogs page (LoadDialogs).
         let [
             ..,
-            Command::OpenChat(_),
-            Command::SendText { chat: to, text, .. },
+            Command::OpenThread(_),
+            Command::SendText {
+                thread: to, text, ..
+            },
         ] = sent.commands.as_slice()
         else {
-            panic!("expected OpenChat, then one SendText");
+            panic!("expected OpenThread, then one SendText");
         };
-        assert_eq!(*to, chat);
+        assert_eq!(*to, ThreadKey::whole(chat));
         assert_eq!(text, "hello\nthere");
         drop(sent);
         // Live updates apply.
@@ -695,7 +697,7 @@ mod fake {
         assert_eq!(
             read(&root, cx, |s| s.shell.selected()),
             None,
-            "a refused OpenChat opens nothing"
+            "a refused OpenThread opens nothing"
         );
         harness.sent.borrow_mut().full = false;
         root.update_in(cx, |root, window, cx| {
@@ -857,7 +859,7 @@ mod fake {
         assert!(
             matches!(
                 harness.sent.borrow().commands.last(),
-                Some(Command::SendText { text, chat, .. }) if text == "for chat 2" && chat.id == 2
+                Some(Command::SendText { text, thread, .. }) if text == "for chat 2" && thread.chat.id == 2
             ),
             "chat 2's own text went to chat 2"
         );
@@ -960,7 +962,9 @@ mod fake {
             root.with_session(
                 |s, _| {
                     for id in 2..=max + 1 {
-                        s.shell.stash_draft(user(id), format!("t{id}")).unwrap();
+                        s.shell
+                            .stash_draft(ThreadKey::whole(user(id)), format!("t{id}"))
+                            .unwrap();
                     }
                 },
                 cx,
@@ -971,7 +975,7 @@ mod fake {
     }
 
     fn selected(root: &Entity<Root>, cx: &mut VisualTestContext) -> Option<ChatId> {
-        read(root, cx, |s| s.shell.selected())
+        read(root, cx, |s| s.shell.selected().map(|t| t.chat))
     }
 
     /// Task 6l, finding 1: at the bound, switching to the chat with the
@@ -987,9 +991,12 @@ mod fake {
         root.update_in(cx, |root, _, cx| {
             root.with_session(
                 |s, _| {
-                    assert_eq!(s.shell.take_draft(user(1)).as_deref(), Some("typed in 1"));
+                    assert_eq!(
+                        s.shell.take_draft(ThreadKey::whole(user(1))).as_deref(),
+                        Some("typed in 1")
+                    );
                     for id in 3..=max + 1 {
-                        let draft = s.shell.take_draft(user(id));
+                        let draft = s.shell.take_draft(ThreadKey::whole(user(id)));
                         assert_eq!(draft, Some(format!("t{id}")), "chat {id}");
                     }
                 },
@@ -1011,7 +1018,7 @@ mod fake {
             read(&root, cx, |s| s.notice.clone()),
             Some(crate::chat::copy::TOO_MANY_DRAFTS.into())
         );
-        assert!(commands_since(&harness, from).is_empty(), "no OpenChat");
+        assert!(commands_since(&harness, from).is_empty(), "no OpenThread");
     }
 
     /// Task 6l, finding 1: an empty box stashes nothing, so it switches
@@ -1142,7 +1149,13 @@ mod fake {
         harness.events.close_channel();
         cx.run_until_parked();
         assert_eq!(screen(&root, cx), crate::shell::view::Screen::Stopped);
-        assert_eq!(read(&root, cx, |s| s.shell.echoes().count(user(1))), 0);
+        assert_eq!(
+            read(&root, cx, |s| s
+                .shell
+                .echoes()
+                .count(ThreadKey::whole(user(1)))),
+            0
+        );
     }
 
     /// Task 6m, finding 2: a chat opened after a core stop, whose history
@@ -1208,7 +1221,7 @@ mod fake {
         harness
             .events
             .unbounded_send(Event::History {
-                chat,
+                thread: ThreadKey::whole(chat),
                 view: abyss_core::store::ViewGen(1),
                 dir: abyss_core::api::HistoryDir::Tail,
                 messages: (1..=30).map(|id| message(chat, id)).collect(),
@@ -1234,7 +1247,7 @@ mod fake {
         harness
             .events
             .unbounded_send(Event::History {
-                chat,
+                thread: ThreadKey::whole(chat),
                 view: abyss_core::store::ViewGen(1),
                 dir: abyss_core::api::HistoryDir::Newer,
                 messages: vec![message(chat, 31)],
@@ -1290,7 +1303,7 @@ mod fake {
         harness
             .events
             .unbounded_send(Event::History {
-                chat: CHAT,
+                thread: ThreadKey::whole(CHAT),
                 view: abyss_core::store::ViewGen(1),
                 dir: abyss_core::api::HistoryDir::Tail,
                 messages: ids.map(|id| message(CHAT, id)).collect(),
@@ -1314,7 +1327,10 @@ mod fake {
         open_chat(&root, cx, &harness, 1..=30, More::Start);
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
-        assert_eq!(read(&root, cx, |s| s.shell.viewing()), Some(CHAT));
+        assert_eq!(
+            read(&root, cx, |s| s.shell.viewing()),
+            Some(ThreadKey::whole(CHAT))
+        );
         core_says(&harness, cx, AuthState::LogoutStarting);
         assert_eq!(read(&root, cx, |s| s.shell.viewing()), None, "hidden");
         core_says(
@@ -1339,7 +1355,10 @@ mod fake {
         cx.run_until_parked();
         let sent = commands_since(&harness, from);
         assert_eq!(count(&sent, "ViewingTail(Some"), 1, "{sent:?}");
-        assert_eq!(read(&root, cx, |s| s.shell.viewing()), Some(CHAT));
+        assert_eq!(
+            read(&root, cx, |s| s.shell.viewing()),
+            Some(ThreadKey::whole(CHAT))
+        );
     }
 
     /// Task 10c, finding 1 (HIGH), through the real window: a deactivation
@@ -1351,7 +1370,10 @@ mod fake {
         open_chat(&root, cx, &harness, 1..=30, More::Start);
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
-        assert_eq!(read(&root, cx, |s| s.shell.viewing()), Some(CHAT));
+        assert_eq!(
+            read(&root, cx, |s| s.shell.viewing()),
+            Some(ThreadKey::whole(CHAT))
+        );
         let from = harness.sent.borrow().commands.len();
         harness.sent.borrow_mut().full = true;
         cx.deactivate_window();
@@ -1359,7 +1381,7 @@ mod fake {
         harness
             .events
             .unbounded_send(Event::History {
-                chat: CHAT,
+                thread: ThreadKey::whole(CHAT),
                 view: abyss_core::store::ViewGen(1),
                 dir: abyss_core::api::HistoryDir::Newer,
                 messages: vec![message(CHAT, 31)],
@@ -1400,7 +1422,7 @@ mod fake {
         assert_eq!(count(&commands_since(&harness, from), "LoadOlder"), 1);
         let ended = Event::LoadEnded {
             target: abyss_core::api::LoadTarget::History {
-                chat: CHAT,
+                thread: ThreadKey::whole(CHAT),
                 dir: abyss_core::api::HistoryDir::Older,
             },
             error: Some(UserError::Busy),

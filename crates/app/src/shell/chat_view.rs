@@ -165,7 +165,7 @@ fn chat_rows(
         .map(|(chat, ix)| {
             let row = ChatRow {
                 chat,
-                selected: selected == Some(chat.id),
+                selected: selected.is_some_and(|t| t.chat == chat.id),
                 time: format::list_time(chat.last_date, now, &tz),
                 depth: depth_of(chat.last_date, now, &tz),
             };

@@ -90,7 +90,7 @@ pub(super) fn tail_diff(
 impl<B: Backend> Actor<B> {
     /// Applies a refresh tail to the open window (see the module docs).
     pub(super) async fn merge_tail(&mut self, p: HistoryReply) {
-        let Some(w) = self.windows.get(p.chat) else {
+        let Some(w) = self.windows.get(p.thread) else {
             return;
         };
         if w.has_newer() {
@@ -101,31 +101,32 @@ impl<B: Backend> Actor<B> {
         if diff.gap {
             return self.on_tail(p).await;
         }
-        let (chat, view) = (p.chat, p.view);
+        let (thread, view) = (p.thread, p.view);
         if let Some((lo, top)) = range {
-            self.reconcile(chat, lo, top, &p.page.messages).await;
+            self.reconcile(thread, lo, top, &p.page.messages).await;
         }
-        let removed = self.windows.delete(chat, &diff.deleted);
+        let removed = self.windows.delete(thread.chat, &diff.deleted);
         if !removed.is_empty() {
+            let chat = thread.chat;
             self.emit(Event::Deleted { chat, ids: removed }).await;
         }
         for m in diff.edited {
-            if self.windows.replace(m.clone()) {
+            if self.windows.replace(thread, m.clone()) {
                 self.emit(Event::Edited(m)).await;
             }
         }
         let mut change = Change::default();
         for m in diff.appended {
-            let c = self.windows.upsert(m);
+            let c = self.windows.upsert(thread, m);
             change.inserted.extend(c.inserted);
             change.removed.extend(c.removed);
         }
         if !change.inserted.is_empty() {
-            self.emit_history(chat, view, HistoryDir::Newer, change)
+            self.emit_history(thread, view, HistoryDir::Newer, change)
                 .await;
         }
-        self.emit_reconciled(chat, view).await;
-        self.tail_covers(chat, view, p.req, range.map(|(lo, _)| lo))
+        self.emit_reconciled(thread, view).await;
+        self.tail_covers(thread, view, p.req, range.map(|(lo, _)| lo))
             .await;
     }
 }
@@ -136,7 +137,7 @@ mod tests {
     use crate::actor::apply::{Coverage, MIN_ID, TailMode};
     use crate::backend::HistoryQuery;
     use crate::backend::fake::text_message;
-    use crate::model::{ChatId, PeerKind};
+    use crate::model::{ChatId, PeerKind, ThreadKey};
     use crate::store::ViewGen;
 
     const CHAT: ChatId = ChatId {
@@ -268,7 +269,7 @@ mod tests {
             has_more: true,
         };
         let mut reply = HistoryReply {
-            chat: CHAT,
+            thread: ThreadKey::whole(CHAT),
             view: ViewGen(1),
             req: crate::actor::jobs::ReqId(1),
             dir: crate::api::HistoryDir::Tail,

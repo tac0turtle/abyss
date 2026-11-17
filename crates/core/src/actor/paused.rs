@@ -51,14 +51,14 @@ impl<B: Backend> Actor<B> {
     /// A command `LogoutGate::refuses` while the account is hidden: a new
     /// send is kept `Failed`, a retry is answered with its send's state, and
     /// a tail report is dropped (the UI reports again once it shows the
-    /// chat).
+    /// thread).
     pub(super) async fn refused_behind_logout(&mut self, cmd: Command) {
         match cmd {
             Command::SendText {
-                chat,
+                thread,
                 text,
                 local_id,
-            } => self.hold_send(chat, text, local_id).await,
+            } => self.hold_send(thread, text, local_id).await,
             other => self.acknowledge_refused(other).await,
         }
     }
@@ -78,12 +78,12 @@ impl<B: Backend> Actor<B> {
                 self.load_ended(LoadTarget::Dialogs, Some(UserError::Busy))
                     .await;
             }
-            Command::LoadOlder(chat) => {
-                self.history_ended(chat, HistoryDir::Older, Some(UserError::Busy))
+            Command::LoadOlder(thread) => {
+                self.history_ended(thread, HistoryDir::Older, Some(UserError::Busy))
                     .await;
             }
-            Command::LoadNewer(chat) => {
-                self.history_ended(chat, HistoryDir::Newer, Some(UserError::Busy))
+            Command::LoadNewer(thread) => {
+                self.history_ended(thread, HistoryDir::Newer, Some(UserError::Busy))
                     .await;
             }
             // Nothing waits on these.

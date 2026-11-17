@@ -1,4 +1,4 @@
-use abyss_core::model::{Body, PeerKind, ThreadKey};
+use abyss_core::model::{Body, ChatId, PeerKind, ThreadKey};
 use abyss_core::rich_text::RichText;
 
 use super::super::retry::FIRST_DELAY;
@@ -68,7 +68,7 @@ fn assert_rows_track(rows: &[Option<i32>], w: &MessageWindow) {
 }
 
 fn loaded(tail: std::ops::RangeInclusive<i32>) -> (MessageWindow, Vec<Option<i32>>) {
-    let mut w = MessageWindow::new(CHAT);
+    let mut w = MessageWindow::new(ThreadKey::whole(CHAT));
     assert_eq!(
         w.apply(batch(1, HistoryDir::Tail, tail, More::Yes)),
         Applied::Reset
@@ -127,7 +127,7 @@ fn sliding_down_drops_the_oldest() {
 
 #[test]
 fn views_order_events() {
-    let mut w = MessageWindow::new(CHAT);
+    let mut w = MessageWindow::new(ThreadKey::whole(CHAT));
     assert_eq!(
         w.apply(batch(5, HistoryDir::Newer, [7], More::No)),
         Applied::Ignored,
@@ -189,7 +189,7 @@ fn live_message_appends_in_order() {
 #[test]
 fn scroll_loads_once_until_answered() {
     let now = Instant::now();
-    let mut w = MessageWindow::new(CHAT);
+    let mut w = MessageWindow::new(ThreadKey::whole(CHAT));
     assert!(!w.wants_older(0, now), "nothing loaded yet");
     w.apply(batch(1, HistoryDir::Tail, 51..=100, More::Yes));
     assert!(!w.wants_older(LOAD_MARGIN, now), "not near the top");

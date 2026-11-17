@@ -13,7 +13,9 @@ use crate::backend::grammers::map::peers::{
     Directory, MAX_DIRECTORY, chat_id, input_peer, user_chat,
 };
 use crate::backend::{HistoryQuery, Update};
-use crate::model::{Body, ChatId, ChatKind, MediaKind, MsgId, PeerKind, Preview};
+use crate::model::{
+    Body, ChatId, ChatKind, InvalidTopicId, MediaKind, MsgId, PeerKind, Preview, TopicId,
+};
 use crate::rich_text::{LinkTarget, MAX_ENTITIES, MAX_TEXT_BYTES, MAX_URL_BYTES, Style};
 use crate::sanitize::MAX_SERVICE_BYTES;
 
@@ -395,22 +397,25 @@ fn forum_topics_and_replies() {
     topic_root.forum_topic = true;
     assert_eq!(
         reply_and_topic(Some(&H::Header(topic_root))),
-        (None, Some(7))
+        Ok((None, Some(topic(7))))
     );
     let mut in_topic = reply_header(Some(9), Some(7));
     in_topic.forum_topic = true;
     assert_eq!(
         reply_and_topic(Some(&H::Header(in_topic))),
-        (Some(MsgId(9)), Some(7))
+        Ok((Some(MsgId(9)), Some(topic(7))))
     );
     assert_eq!(
         reply_and_topic(Some(&H::Header(reply_header(Some(9), None)))),
-        (Some(MsgId(9)), None)
+        Ok((Some(MsgId(9)), None))
     );
     let mut elsewhere = reply_header(Some(9), None);
     elsewhere.reply_to_peer_id = Some(peer_user(1));
-    assert_eq!(reply_and_topic(Some(&H::Header(elsewhere))), (None, None));
-    assert_eq!(reply_and_topic(None), (None, None));
+    assert_eq!(
+        reply_and_topic(Some(&H::Header(elsewhere))),
+        Ok((None, None))
+    );
+    assert_eq!(reply_and_topic(None), Ok((None, None)));
 
     let created = tl::enums::Message::Service(service(
         peer_channel(10),
@@ -424,7 +429,76 @@ fn forum_topics_and_replies() {
         }),
     ));
     let out = msg::message(&created, &Directory::default()).unwrap();
-    assert_eq!(out.thread.topic, Some(42));
+    assert_eq!(out.thread.topic, Some(topic(42)));
+}
+
+fn topic(id: i32) -> TopicId {
+    TopicId::try_from(id).unwrap()
+}
+
+/// A forum header naming a non-positive topic (as `reply_to_top_id`, or as
+/// the root `reply_to_msg_id` of a message without a top id) is malformed:
+/// the message is dropped, not filed under another topic. A non-forum
+/// header's ids are not topics and stay valid.
+#[test]
+fn malformed_forum_topic_headers_drop_the_message() {
+    use tl::enums::MessageReplyHeader as H;
+    let header = |msg: Option<i32>, top: Option<i32>| {
+        let mut h = reply_header(msg, top);
+        h.forum_topic = true;
+        h
+    };
+    let cases = [
+        (header(Some(9), Some(0)), 0),
+        (header(Some(9), Some(-5)), -5),
+        (header(Some(0), None), 0),
+        (header(Some(-1), None), -1),
+    ];
+    for (h, bad) in cases {
+        assert_eq!(
+            reply_and_topic(Some(&H::Header(h.clone()))),
+            Err(InvalidTopicId(bad))
+        );
+        let mut m = message(peer_channel(10), 50, "in a topic");
+        m.reply_to = Some(H::Header(h.clone()));
+        let raw = tl::enums::Message::Message(m);
+        assert!(msg::message(&raw, &Directory::default()).is_none());
+        let mut s = service(
+            peer_channel(10),
+            51,
+            None,
+            tl::enums::MessageAction::PinMessage,
+        );
+        s.reply_to = Some(H::Header(h));
+        let raw = tl::enums::Message::Service(s);
+        assert!(msg::message(&raw, &Directory::default()).is_none());
+    }
+
+    // A topic created by a message with a non-positive id names no topic.
+    for bad in [0, -1] {
+        let created = tl::enums::Message::Service(service(
+            peer_channel(10),
+            bad,
+            None,
+            tl::enums::MessageAction::TopicCreate(tl::types::MessageActionTopicCreate {
+                title_missing: false,
+                title: "News".into(),
+                icon_color: 0,
+                icon_emoji_id: None,
+            }),
+        ));
+        assert!(msg::message(&created, &Directory::default()).is_none());
+    }
+
+    let mut valid = message(peer_channel(10), 50, "in a topic");
+    valid.reply_to = Some(H::Header(header(Some(9), Some(7))));
+    let mapped = msg::message(&tl::enums::Message::Message(valid), &Directory::default());
+    assert_eq!(mapped.and_then(|m| m.thread.topic), Some(topic(7)));
+
+    let mut plain = message(peer_channel(10), 50, "a reply");
+    plain.reply_to = Some(H::Header(reply_header(Some(0), Some(-5))));
+    let mapped = msg::message(&tl::enums::Message::Message(plain), &Directory::default());
+    assert_eq!(mapped.map(|m| m.thread.topic), Some(None));
 }
 
 #[test]

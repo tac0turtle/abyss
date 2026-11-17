@@ -8,6 +8,7 @@ use super::{Harness, Setup, chat, harness_with, start};
 use crate::api::{AuthState, Command, ConnState, CredentialError, Event, PasswordBuf, UserError};
 use crate::backend::fake::{DEMO_PASSWORD, FAKE_CODE, FakeBackend, FakeScript, Fault, Op};
 use crate::backend::{AuthError, BackendError};
+use crate::model::ThreadKey;
 use crate::secret::{SecretItem, StoreOp};
 
 const PHONE: &str = "+44 7700 900123";
@@ -358,7 +359,7 @@ async fn second_migration_routes_to_sign_in_and_login_clears_the_halt() {
         h.online().await;
         h.fake
             .inject(Op::History, Fault::Error(BackendError::Migrated));
-        h.send(Command::OpenChat(chat(1))).await;
+        h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
         h.until(|e| matches!(e, Event::Error(UserError::AccountMigrated)))
             .await;
     }

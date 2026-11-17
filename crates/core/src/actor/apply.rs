@@ -12,7 +12,7 @@ use crate::backend::{
     Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, StreamError, Update,
 };
 use crate::cache::CacheCmd;
-use crate::model::{ChatId, ChatSummary, Message, MsgId};
+use crate::model::{ChatSummary, Message, MsgId, ThreadKey};
 use crate::store::{Bump, Change, Last, Rest, Unread, ViewGen, Window};
 
 pub(super) fn user_error(e: CallError) -> UserError {
@@ -40,6 +40,17 @@ fn call_error(outcome: &Outcome) -> Option<CallError> {
     }
 }
 
+/// The thread whose window shows `m`: its whole chat. Temporary (Stage 2
+/// task 1): forum chats are still shown as one stream, so every key is
+/// `topic: None` while `m.thread.topic` keeps the raw topic the server
+/// stated. A message's `thread` therefore need not equal its window's key
+/// yet. Task 7 replaces this with `route`, which normalizes the message's
+/// thread and enforces that equality for windows and events; task 5
+/// enforces it for cache rows.
+pub(super) fn shown_in(m: &Message) -> ThreadKey {
+    ThreadKey::whole(m.thread.chat)
+}
+
 pub(super) const MIN_ID: MsgId = MsgId(i32::MIN);
 pub(super) const MAX_ID: MsgId = MsgId(i32::MAX);
 
@@ -54,7 +65,7 @@ pub(super) enum TailMode {
 
 /// A history response, unpacked.
 pub(super) struct HistoryReply {
-    pub(super) chat: ChatId,
+    pub(super) thread: ThreadKey,
     pub(super) view: ViewGen,
     /// The load that asked for it (its order says what it can cover).
     pub(super) req: ReqId,
@@ -190,7 +201,7 @@ impl<B: Backend> Actor<B> {
         }
     }
 
-    /// A finished history call. A tail that is its chat's boot snapshot
+    /// A finished history call. A tail that is its thread's boot snapshot
     /// completes the snapshot whether or not its view is still current.
     async fn on_history_done(&mut self, load: Load, req: HistoryReq, res: CallResult<HistoryPage>) {
         let boot = self
@@ -203,7 +214,7 @@ impl<B: Backend> Actor<B> {
         // stale reply must not leave a covering fetch or an owed answer
         // behind (task 10f).
         let ended = LoadEnd {
-            cover_fetch: self.covers.fetch_ended(load.chat, load.req),
+            cover_fetch: self.covers.fetch_ended(load.thread, load.req),
             owed: self.take_owed(load),
         };
         match res {
@@ -214,7 +225,7 @@ impl<B: Backend> Actor<B> {
                     TailMode::Replace
                 };
                 let reply = HistoryReply {
-                    chat: load.chat,
+                    thread: load.thread,
                     view: load.view,
                     req: load.req,
                     dir: req.dir,
@@ -232,7 +243,7 @@ impl<B: Backend> Actor<B> {
                 // deferred behind it still runs), a background fetch, or a
                 // load of a view the UI no longer shows.
                 if ended.owed.is_some() {
-                    self.history_ended(load.chat, req.dir, Some(user_error(e)))
+                    self.history_ended(load.thread, req.dir, Some(user_error(e)))
                         .await;
                 }
             }
@@ -242,14 +253,14 @@ impl<B: Backend> Actor<B> {
         }
     }
 
-    /// Ends the single-flight history load of its chat if it is `load`.
+    /// Ends the single-flight history load of its thread if it is `load`.
     pub(super) fn release_history(&mut self, load: Load) {
         if self
             .history_busy
-            .get(&load.chat)
+            .get(&load.thread)
             .is_some_and(|l| l.req == load.req)
         {
-            self.history_busy.remove(&load.chat);
+            self.history_busy.remove(&load.thread);
         }
     }
 
@@ -330,12 +341,12 @@ impl<B: Backend> Actor<B> {
     /// store can never disagree about whether more history exists.
     pub(super) async fn emit_history(
         &self,
-        chat: ChatId,
+        thread: ThreadKey,
         view: ViewGen,
         dir: HistoryDir,
         change: Change,
     ) {
-        let Some(w) = self.windows.get(chat) else {
+        let Some(w) = self.windows.get(thread) else {
             return;
         };
         let has_more = match dir {
@@ -351,7 +362,7 @@ impl<B: Backend> Actor<B> {
             .cloned()
             .collect();
         self.emit(Event::History {
-            chat,
+            thread,
             view,
             dir,
             messages,
@@ -361,8 +372,10 @@ impl<B: Backend> Actor<B> {
         .await;
     }
 
-    fn is_current(&self, chat: ChatId, view: ViewGen) -> bool {
-        self.windows.get(chat).is_some_and(|w| w.view_gen() == view)
+    fn is_current(&self, thread: ThreadKey, view: ViewGen) -> bool {
+        self.windows
+            .get(thread)
+            .is_some_and(|w| w.view_gen() == view)
     }
 
     async fn on_cache_history(
@@ -378,15 +391,15 @@ impl<B: Backend> Actor<B> {
         }
         self.release_history(load);
         let owed = self.take_owed(load);
-        let Load { chat, view, .. } = load;
+        let Load { thread, view, .. } = load;
         let Some(anchor) = anchor else { return };
-        if !self.is_current(chat, view) {
+        if !self.is_current(thread, view) {
             return;
         }
         // The window's oldest end moved while the cache was read (see
         // `on_older`); a newer read needs no such check, since nothing but a
         // deletion changes a detached window's newest end.
-        if dir == HistoryDir::Older && !self.starts_at(chat, anchor) {
+        if dir == HistoryDir::Older && !self.starts_at(thread, anchor) {
             if let Some(owed) = owed {
                 self.restart_older(owed).await;
             }
@@ -406,14 +419,14 @@ impl<B: Backend> Actor<B> {
             has_more: true,
         };
         let res = match dir {
-            HistoryDir::Older => self.windows.prepend(chat, view, page),
-            _ => self.windows.append_newer(chat, view, page),
+            HistoryDir::Older => self.windows.prepend(thread, view, page),
+            _ => self.windows.append_newer(thread, view, page),
         };
         let mut owed = owed;
         if let Ok(change) = res
             && !(short && change.inserted.is_empty())
         {
-            self.emit_history(chat, view, dir, change).await;
+            self.emit_history(thread, view, dir, change).await;
             owed = None; // answered
         }
         if !short {
@@ -421,12 +434,12 @@ impl<B: Backend> Actor<B> {
         }
         // The cache ran out; continue from the server at the new edge. The
         // continuation answers the UI only if the cache page did not.
-        let edge = self.windows.get(chat).and_then(|w| match dir {
+        let edge = self.windows.get(thread).and_then(|w| match dir {
             HistoryDir::Older => w.messages().front(),
             _ => w.messages().back(),
         });
         let edge = edge.map_or(anchor, |m| m.id);
-        let load = self.begin_load(chat, view);
+        let load = self.begin_load(thread, view);
         if let Some(owed) = owed {
             self.owe(load, dir, owed.restarts);
         }
@@ -437,8 +450,8 @@ impl<B: Backend> Actor<B> {
     /// is chained after the cache read so `on_tail` always sees what the cache held.
     async fn on_cache_tail(&mut self, load: Load, messages: Vec<Message>) {
         let snapshot = self.is_tail_snapshot(load);
-        let Load { chat, view, .. } = load;
-        if !self.is_current(chat, view) {
+        let Load { thread, view, .. } = load;
+        if !self.is_current(thread, view) {
             self.release_history(load);
             if snapshot {
                 self.snapshot_done(Snapshot::Tail(load)).await;
@@ -450,10 +463,10 @@ impl<B: Backend> Actor<B> {
             has_more: true,
         };
         if !page.messages.is_empty()
-            && let Ok(change) = self.windows.prepend(chat, view, page)
+            && let Ok(change) = self.windows.prepend(thread, view, page)
             && !change.inserted.is_empty()
         {
-            self.emit_history(chat, view, HistoryDir::Tail, change)
+            self.emit_history(thread, view, HistoryDir::Tail, change)
                 .await;
         }
         self.start_tail(load, TailVia::Server).await;
@@ -464,14 +477,16 @@ impl<B: Backend> Actor<B> {
     async fn on_history(&mut self, mut p: HistoryReply, ended: LoadEnd) {
         if self
             .windows
-            .get(p.chat)
+            .get(p.thread)
             .is_none_or(|w| w.view_gen() != p.view)
         {
             return; // stale: closed, evicted or replaced
         }
         if let Some(boot) = &self.boot {
             // A page fetched while a deletion was buffered must not resurrect it.
-            p.page.messages.retain(|m| !boot.is_dead(p.chat, m.id));
+            p.page
+                .messages
+                .retain(|m| !boot.is_dead(p.thread.chat, m.id));
         }
         match p.dir {
             HistoryDir::Tail if p.mode == TailMode::Merge => self.merge_tail(p).await,
@@ -487,10 +502,10 @@ impl<B: Backend> Actor<B> {
                     (true, covered) => covered.map(|c| c.newest),
                 };
                 if let Some(hi) = hi {
-                    self.reconcile(p.chat, lo, hi, &p.page.messages).await;
+                    self.reconcile(p.thread, lo, hi, &p.page.messages).await;
                 }
-                if let Ok(change) = self.windows.append_newer(p.chat, p.view, p.page) {
-                    self.emit_history(p.chat, p.view, p.dir, change).await;
+                if let Ok(change) = self.windows.append_newer(p.thread, p.view, p.page) {
+                    self.emit_history(p.thread, p.view, p.dir, change).await;
                 }
             }
         }
@@ -517,13 +532,13 @@ impl<B: Backend> Actor<B> {
             (true, covered) => covered.map(|c| c.oldest),
         };
         if let Some(lo) = lo {
-            self.reconcile(p.chat, lo, hi, &p.page.messages).await;
+            self.reconcile(p.thread, lo, hi, &p.page.messages).await;
         }
         let edge = match p.query {
             HistoryQuery::Before(edge) => Some(edge),
             _ => None,
         };
-        if edge.is_some_and(|edge| !self.starts_at(p.chat, edge)) {
+        if edge.is_some_and(|edge| !self.starts_at(p.thread, edge)) {
             tracing::debug!("older page no longer continues the window");
             if let Some(owed) = ended.owed {
                 self.restart_older(owed).await;
@@ -532,32 +547,38 @@ impl<B: Backend> Actor<B> {
         }
         // A page core fetched on its own never drops a message.
         let applied = if ended.cover_fetch {
-            self.windows.prepend_fitting(p.chat, p.view, p.page)
+            self.windows.prepend_fitting(p.thread, p.view, p.page)
         } else {
-            self.windows.prepend(p.chat, p.view, p.page)
+            self.windows.prepend(p.thread, p.view, p.page)
         };
         if let Ok(change) = applied {
-            self.emit_history(p.chat, p.view, p.dir, change).await;
+            self.emit_history(p.thread, p.view, p.dir, change).await;
         }
         if let Some(edge) = edge {
-            self.older_covers(p.chat, p.view, edge, lo).await;
+            self.older_covers(p.thread, p.view, edge, lo).await;
         }
     }
 
-    /// Whether `chat`'s window still starts at `edge`, the oldest message
+    /// Whether `thread`'s window still starts at `edge`, the oldest message
     /// it held when an older page was asked for.
-    fn starts_at(&self, chat: ChatId, edge: MsgId) -> bool {
+    fn starts_at(&self, thread: ThreadKey, edge: MsgId) -> bool {
         self.windows
-            .get(chat)
+            .get(thread)
             .and_then(|w| w.messages().front())
             .is_some_and(|m| m.id == edge)
     }
 
     /// Writes a server page over `[lo, hi]` of a contiguous cache.
-    pub(super) async fn reconcile(&self, chat: ChatId, lo: MsgId, hi: MsgId, page: &[Message]) {
-        if self.windows.is_cache_contiguous(chat) && lo <= hi {
+    pub(super) async fn reconcile(
+        &self,
+        thread: ThreadKey,
+        lo: MsgId,
+        hi: MsgId,
+        page: &[Message],
+    ) {
+        if self.windows.is_cache_contiguous(thread) && lo <= hi {
             self.cache_write(CacheCmd::Reconcile {
-                chat,
+                thread,
                 lo,
                 hi,
                 messages: page.to_vec(),
@@ -569,7 +590,7 @@ impl<B: Backend> Actor<B> {
     /// The server tail replaces the window (which may hold cached history).
     ///
     /// If the page overlaps the cached history, the cache stays and only the
-    /// covered range is reconciled. Otherwise there may be a gap, so the chat's
+    /// covered range is reconciled. Otherwise there may be a gap, so the thread's
     /// cache is replaced by the page. The cache worker decides, against what the
     /// cache holds: a rebuild may have invalidated the window. Either way the
     /// cache is then contiguous with the live tail for the window's lifetime.
@@ -583,12 +604,12 @@ impl<B: Backend> Actor<B> {
         let top = p.authoritative_top();
         let range = p.authoritative_range();
         let HistoryReply {
-            chat,
+            thread,
             req,
             mut page,
             ..
         } = p;
-        let Some(w) = self.windows.get(chat) else {
+        let Some(w) = self.windows.get(thread) else {
             return;
         };
         let late = w
@@ -610,46 +631,51 @@ impl<B: Backend> Actor<B> {
             && let Some(from) = from
         {
             self.cache_write(CacheCmd::ReconcileTail {
-                chat,
+                thread,
                 messages: page.messages.clone(),
                 from,
             })
             .await;
         }
-        let Some(view) = self.windows.invalidate(chat) else {
+        let Some(view) = self.windows.invalidate(thread) else {
             return;
         };
         // Loads deferred for the replaced view are over with it: the UI
         // forgets them on the new view's `Tail` and asks again if needed.
-        self.deferred.retain(|d| d.chat != chat);
-        self.forget_owed(chat);
+        self.deferred.retain(|d| d.thread != thread);
+        self.forget_owed(thread);
         if self.cache.is_some() && from.is_some() {
-            self.windows.set_cache_contiguous(chat);
+            self.windows.set_cache_contiguous(thread);
         }
-        if let Ok(change) = self.windows.prepend(chat, view, page) {
-            self.emit_history(chat, view, HistoryDir::Tail, change)
+        if let Ok(change) = self.windows.prepend(thread, view, page) {
+            self.emit_history(thread, view, HistoryDir::Tail, change)
                 .await;
         }
-        self.emit_reconciled(chat, view).await;
-        self.tail_covers(chat, view, req, range.map(|(lo, _)| lo))
+        self.emit_reconciled(thread, view).await;
+        self.tail_covers(thread, view, req, range.map(|(lo, _)| lo))
             .await;
     }
 
-    /// Tells the UI that `view` of `chat` now matches the server's tail.
-    pub(super) async fn emit_reconciled(&self, chat: ChatId, view: ViewGen) {
+    /// Tells the UI that `view` of `thread` now matches the server's tail.
+    pub(super) async fn emit_reconciled(&self, thread: ThreadKey, view: ViewGen) {
         let newest = self
             .windows
-            .get(chat)
+            .get(thread)
             .and_then(|w| w.messages().back())
             .map(|m| m.id);
-        self.emit(Event::Reconciled { chat, view, newest }).await;
+        self.emit(Event::Reconciled {
+            thread,
+            view,
+            newest,
+        })
+        .await;
     }
 
-    /// Whether the window already holds a newer copy of `m` (a later edit), which
-    /// an older copy must not overwrite.
-    fn has_newer_copy(&self, m: &Message) -> bool {
+    /// Whether `thread`'s window already holds a newer copy of `m` (a later
+    /// edit), which an older copy must not overwrite.
+    fn has_newer_copy(&self, thread: ThreadKey, m: &Message) -> bool {
         self.windows
-            .get(m.thread.chat)
+            .get(thread)
             .and_then(|w| w.get(m.id))
             .is_some_and(|cur| cur.version() > m.version())
     }
@@ -686,30 +712,31 @@ impl<B: Backend> Actor<B> {
 
     /// Applies an edit unless the window holds a later edit of the message.
     pub(super) async fn on_edited(&mut self, m: Message) {
-        let chat = m.thread.chat;
-        if self.has_newer_copy(&m) || !self.windows.replace(m.clone()) {
+        let thread = shown_in(&m);
+        if self.has_newer_copy(thread, &m) || !self.windows.replace(thread, m.clone()) {
             return;
         }
-        if self.windows.is_cache_contiguous(chat) {
-            self.cache_write(CacheCmd::PutMessages(chat, vec![m.clone()]))
+        if self.windows.is_cache_contiguous(thread) {
+            self.cache_write(CacheCmd::PutMessages(thread, vec![m.clone()]))
                 .await;
         }
         self.emit(Event::Edited(m)).await;
     }
 
-    /// Whether the user is looking at `chat`'s live tail right now: the
-    /// window is active, the UI reports this chat's tail on screen, and the
+    /// Whether the user is looking at `thread`'s live tail right now: the
+    /// window is active, the UI reports this thread's tail on screen, and the
     /// window holds the tail. Only then does a new message not count as unread.
-    fn tail_visible(&self, chat: ChatId) -> bool {
+    fn tail_visible(&self, thread: ThreadKey) -> bool {
         self.window == WindowState::Active
-            && self.viewing == Some(chat)
-            && self.open == Some(chat)
-            && self.windows.get(chat).is_some_and(|w| !w.has_newer())
+            && self.viewing == Some(thread)
+            && self.open == Some(thread)
+            && self.windows.get(thread).is_some_and(|w| !w.has_newer())
     }
 
     async fn on_new_message(&mut self, m: Message, origin: Origin<'_>) {
-        let chat = m.thread.chat;
-        let unread = if m.outgoing || self.tail_visible(chat) {
+        let thread = shown_in(&m);
+        let chat = thread.chat;
+        let unread = if m.outgoing || self.tail_visible(thread) {
             Unread::Unchanged
         } else {
             Unread::Increment
@@ -725,22 +752,22 @@ impl<B: Backend> Actor<B> {
         {
             self.emit(Event::ChatBumped(summary)).await;
         }
-        let Some(view) = self.windows.get(chat).map(Window::view_gen) else {
+        let Some(view) = self.windows.get(thread).map(Window::view_gen) else {
             return;
         };
-        if self.has_newer_copy(&m) {
+        if self.has_newer_copy(thread, &m) {
             return;
         }
         // Written through even when a detached window does not take it, so a
         // contiguous cache keeps reaching the live tail.
-        if self.windows.is_cache_contiguous(chat) {
-            self.cache_write(CacheCmd::PutMessages(chat, vec![m.clone()]))
+        if self.windows.is_cache_contiguous(thread) {
+            self.cache_write(CacheCmd::PutMessages(thread, vec![m.clone()]))
                 .await;
         }
         let id = m.id;
-        let change = self.windows.upsert(m);
+        let change = self.windows.upsert(thread, m);
         if change.inserted.contains(&id) {
-            self.emit_history(chat, view, HistoryDir::Newer, change)
+            self.emit_history(thread, view, HistoryDir::Newer, change)
                 .await;
         }
     }

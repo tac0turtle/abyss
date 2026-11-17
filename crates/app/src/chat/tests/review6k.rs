@@ -41,7 +41,7 @@ fn a_core_stop_strands_only_what_waits_on_core() {
     let sent = send(&mut shell, &mut core, "sent");
     set(&mut shell, sent, SendState::SentUnconfirmed);
     let returned = shell
-        .submit(CHAT, "refused", 0, &mut core.admit())
+        .submit(THREAD, "refused", 0, &mut core.admit())
         .unwrap()
         .unwrap();
     shell.apply(Event::SendRefused { local_id: returned });

@@ -1,6 +1,6 @@
 //! Commands the UI sends to core and events core sends back.
 
-use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId};
+use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId, ThreadKey};
 use crate::store::ViewGen;
 
 pub use crate::auth_types::{
@@ -28,14 +28,14 @@ pub enum Command {
     RetryPasswordParams,
     /// Loads the first dialogs page, or the next page once one is loaded.
     LoadDialogs,
-    OpenChat(ChatId),
-    CloseChat(ChatId),
+    OpenThread(ThreadKey),
+    CloseThread(ThreadKey),
     /// Scrolls the open window up (older history).
-    LoadOlder(ChatId),
+    LoadOlder(ThreadKey),
     /// Scrolls a detached window back down (newer history).
-    LoadNewer(ChatId),
+    LoadNewer(ThreadKey),
     SendText {
-        chat: ChatId,
+        thread: ThreadKey,
         text: String,
         local_id: LocalId,
     },
@@ -50,15 +50,15 @@ pub enum Command {
     /// refresh; while active, one also runs every 5 minutes (plan section 2).
     Window(WindowState),
     MarkRead {
-        chat: ChatId,
+        thread: ThreadKey,
         max_id: MsgId,
     },
-    /// The chat whose live tail is on screen: the open chat, scrolled to its
-    /// newest message. `None` when scrolled up or no chat is shown. Together
+    /// The thread whose live tail is on screen: the open thread, scrolled to
+    /// its newest message. `None` when scrolled up or no thread is shown. Together
     /// with `Window(Active)`, this alone suppresses the unread increment for
     /// incoming messages; until the app sends it, every incoming message
     /// counts as unread and is cleared by `MarkRead`.
-    ViewingTail(Option<ChatId>),
+    ViewingTail(Option<ThreadKey>),
     /// Signs out: remote `auth.logOut`, then local deletion of the session
     /// item and the cache (plan sections 5, 16). While signed out, it retries
     /// the local deletion only.
@@ -100,24 +100,26 @@ impl std::fmt::Debug for Command {
             Self::ResendCode => f.write_str("ResendCode"),
             Self::RetryPasswordParams => f.write_str("RetryPasswordParams"),
             Self::LoadDialogs => f.write_str("LoadDialogs"),
-            Self::OpenChat(c) => f.debug_tuple("OpenChat").field(c).finish(),
-            Self::CloseChat(c) => f.debug_tuple("CloseChat").field(c).finish(),
-            Self::LoadOlder(c) => f.debug_tuple("LoadOlder").field(c).finish(),
-            Self::LoadNewer(c) => f.debug_tuple("LoadNewer").field(c).finish(),
-            Self::SendText { chat, local_id, .. } => f
+            Self::OpenThread(t) => f.debug_tuple("OpenThread").field(t).finish(),
+            Self::CloseThread(t) => f.debug_tuple("CloseThread").field(t).finish(),
+            Self::LoadOlder(t) => f.debug_tuple("LoadOlder").field(t).finish(),
+            Self::LoadNewer(t) => f.debug_tuple("LoadNewer").field(t).finish(),
+            Self::SendText {
+                thread, local_id, ..
+            } => f
                 .debug_struct("SendText")
-                .field("chat", chat)
+                .field("thread", thread)
                 .field("local_id", local_id)
                 .finish_non_exhaustive(),
             Self::RetrySend(id) => f.debug_tuple("RetrySend").field(id).finish(),
             Self::DiscardSend(id) => f.debug_tuple("DiscardSend").field(id).finish(),
             Self::Window(w) => f.debug_tuple("Window").field(w).finish(),
-            Self::MarkRead { chat, max_id } => f
+            Self::MarkRead { thread, max_id } => f
                 .debug_struct("MarkRead")
-                .field("chat", chat)
+                .field("thread", thread)
                 .field("max_id", max_id)
                 .finish(),
-            Self::ViewingTail(c) => f.debug_tuple("ViewingTail").field(c).finish(),
+            Self::ViewingTail(t) => f.debug_tuple("ViewingTail").field(t).finish(),
             Self::Logout => f.write_str("Logout"),
             Self::SubmitCredentials { .. } => f.write_str("SubmitCredentials(<redacted>)"),
             Self::ForgetStoredCredentials => f.write_str("ForgetStoredCredentials"),
@@ -227,8 +229,8 @@ pub enum UserError {
 pub enum LoadTarget {
     /// `LoadDialogs`.
     Dialogs,
-    /// `LoadOlder` (`dir: Older`) or `LoadNewer` (`dir: Newer`) of `chat`.
-    History { chat: ChatId, dir: HistoryDir },
+    /// `LoadOlder` (`dir: Older`) or `LoadNewer` (`dir: Newer`) of `thread`.
+    History { thread: ThreadKey, dir: HistoryDir },
 }
 
 /// Which part of a window a history event extends.
@@ -272,7 +274,7 @@ pub enum Event {
     /// `last_id` grew; read-state changes keep `last_id`.
     ChatBumped(ChatSummary),
     History {
-        chat: ChatId,
+        thread: ThreadKey,
         view: ViewGen,
         dir: HistoryDir,
         /// Messages added to the window, ascending.
@@ -282,37 +284,37 @@ pub enum Event {
         /// More history exists in `dir` (for `Tail`: older history).
         has_more: bool,
     },
-    ChatInvalidated(ChatId),
-    /// The server's tail of `chat` was applied to `view` (open, bootstrap,
+    ThreadInvalidated(ThreadKey),
+    /// The server's tail of `thread` was applied to `view` (open, bootstrap,
     /// gap or light refresh), after the `History`/`Deleted`/`Edited` events
     /// it caused. Everything in the window up to `newest` is now the server's
     /// truth: echoes of sends at or below `newest` are in it (or were
     /// deleted). It says nothing about `SentUnconfirmed` sends, whose ids
     /// are unknown (see `SendsCovered`).
     Reconciled {
-        chat: ChatId,
+        thread: ThreadKey,
         view: ViewGen,
         newest: Option<MsgId>,
     },
     /// A load the UI asked for ended without its answer (`DialogsPaging`,
     /// or `History` in that direction). `error: None`: there was nothing
-    /// to load (every dialogs page is loaded; the chat is not open, or has
+    /// to load (every dialogs page is loaded; the thread is not open, or has
     /// no more history that way). `Some`: it failed or was not queued; the
     /// error is also sent as `Error`. A `LoadOlder`/`LoadNewer` that arrives
-    /// while another history load of its chat runs is not dropped: it runs
+    /// while another history load of its thread runs is not dropped: it runs
     /// once that load ends, so it is always answered by one or the other.
     LoadEnded {
         target: LoadTarget,
         error: Option<UserError>,
     },
-    /// These `SentUnconfirmed` sends of `chat` are covered by server history
+    /// These `SentUnconfirmed` sends of `thread` are covered by server history
     /// requested after the server accepted them, and already applied to the
-    /// chat's window: their messages are shown (or were deleted), so their
+    /// thread's window: their messages are shown (or were deleted), so their
     /// echoes can go. Sent after the `History` events that showed them.
     /// Core fetches older pages (a few at most) when the tail alone does not
     /// reach back to a send; until this event, the echo stays.
     SendsCovered {
-        chat: ChatId,
+        thread: ThreadKey,
         sends: Vec<LocalId>,
     },
     Edited(Message),

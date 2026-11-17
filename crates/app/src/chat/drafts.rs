@@ -1,11 +1,11 @@
-//! Per-chat composer drafts (task 6k): the message box belongs to the open
-//! chat, so text typed or put back in chat A never goes to chat B. The
-//! shell stashes the box when it switches chats and restores the new
-//! chat's draft. Cleared with the account (`ChatShell::reset`).
+//! Per-thread composer drafts (task 6k): the message box belongs to the
+//! open thread, so text typed or put back in chat A never goes to chat B.
+//! The shell stashes the box when it switches threads and restores the new
+//! thread's draft. Cleared with the account (`ChatShell::reset`).
 
 use std::collections::VecDeque;
 
-use abyss_core::model::ChatId;
+use abyss_core::model::ThreadKey;
 
 /// Drafts kept at once: a bound on memory, far above how many chats a
 /// person drafts in at once. A draft is never dropped to make room (task
@@ -14,8 +14,8 @@ pub(crate) const MAX_DRAFTS: usize = 64;
 
 #[derive(Default)]
 pub(crate) struct Drafts {
-    /// Oldest stash first; at most one per chat, none empty.
-    list: VecDeque<(ChatId, String)>,
+    /// Oldest stash first; at most one per thread, none empty.
+    list: VecDeque<(ThreadKey, String)>,
 }
 
 /// Task 6c: no draft text reaches `Debug`.
@@ -28,17 +28,17 @@ impl std::fmt::Debug for Drafts {
 }
 
 impl Drafts {
-    /// Keeps `text` as `chat`'s draft, replacing an older one; an empty
+    /// Keeps `text` as `thread`'s draft, replacing an older one; an empty
     /// text clears it. Full: `Err` hands the text back, nothing dropped.
-    pub(crate) fn stash(&mut self, chat: ChatId, text: String) -> Result<(), String> {
-        self.list.retain(|(c, _)| *c != chat);
+    pub(crate) fn stash(&mut self, thread: ThreadKey, text: String) -> Result<(), String> {
+        self.list.retain(|(t, _)| *t != thread);
         if text.is_empty() {
             return Ok(());
         }
         if self.list.len() >= MAX_DRAFTS {
             return Err(text);
         }
-        self.list.push_back((chat, text));
+        self.list.push_back((thread, text));
         debug_assert!(self.list.len() <= MAX_DRAFTS);
         Ok(())
     }
@@ -46,36 +46,36 @@ impl Drafts {
     /// Whether switching from `from` (its box holding `text`) to `to` can
     /// keep every draft: `to`'s draft leaves first (freeing its slot), and
     /// `from`'s replaces its own; an empty box stashes nothing.
-    pub(crate) fn can_switch(&self, from: ChatId, to: ChatId, text: &str) -> bool {
+    pub(crate) fn can_switch(&self, from: ThreadKey, to: ThreadKey, text: &str) -> bool {
         if text.is_empty() {
             return true;
         }
         let freed = self
             .list
             .iter()
-            .filter(|(c, _)| *c == from || *c == to)
+            .filter(|(t, _)| *t == from || *t == to)
             .count();
         self.list.len() - freed < MAX_DRAFTS
     }
 
-    /// Takes `chat`'s draft out.
-    pub(crate) fn take(&mut self, chat: ChatId) -> Option<String> {
-        let at = self.list.iter().position(|(c, _)| *c == chat)?;
+    /// Takes `thread`'s draft out.
+    pub(crate) fn take(&mut self, thread: ThreadKey) -> Option<String> {
+        let at = self.list.iter().position(|(t, _)| *t == thread)?;
         self.list.remove(at).map(|(_, text)| text)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use abyss_core::model::PeerKind;
+    use abyss_core::model::{ChatId, PeerKind};
 
     use super::*;
 
-    fn chat(id: i64) -> ChatId {
-        ChatId {
+    fn chat(id: i64) -> ThreadKey {
+        ThreadKey::whole(ChatId {
             kind: PeerKind::User,
             id,
-        }
+        })
     }
 
     #[test]
