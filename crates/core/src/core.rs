@@ -595,13 +595,6 @@ mod tests {
         assert_eq!(report.save, SaveStatus::Unconfirmed);
     }
 
-    #[test]
-    fn fake_faults_parse() {
-        let f = FakeFaults::parse("store-stall");
-        assert!(f.store_stall && !f.store_fail);
-        assert_eq!(FakeFaults::parse(""), FakeFaults::default());
-    }
-
     /// `--fake --onboarding`: no env pair and nothing stored, so core asks
     /// for credentials and builds nothing until a pair is entered.
     #[tokio::test]

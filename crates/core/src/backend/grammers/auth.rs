@@ -47,16 +47,6 @@ impl std::fmt::Debug for GrammersLoginToken {
     }
 }
 
-#[cfg(test)]
-impl GrammersLoginToken {
-    pub(crate) fn for_test(phone: &str, hash: &str) -> Self {
-        Self {
-            phone: Zeroizing::new(phone.to_owned()),
-            hash: hash.to_owned(),
-        }
-    }
-}
-
 /// One SRP attempt: the `account.password` it was computed from.
 pub struct GrammersPasswordToken(Box<tl::types::account::Password>);
 

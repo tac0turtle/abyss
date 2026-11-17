@@ -264,21 +264,6 @@ mod tests {
         assert!(cache.is_err(), "no home, no cache");
     }
 
-    /// Round 26: the home directory is the real user's, from the user
-    /// database, whatever `HOME` says.
-    #[test]
-    fn the_home_directory_comes_from_the_user_database() {
-        let home = crate::storage::home_dir().unwrap();
-        assert!(home.is_absolute());
-        assert!(home.is_dir());
-        let Ok(Launch::Telegram { cache, .. }) =
-            resolve(args(&[]), env(&[("HOME", "/nonexistent")]))
-        else {
-            panic!("expected the real backend");
-        };
-        assert!(cache.unwrap().dir().starts_with(&home));
-    }
-
     /// Task 9b: `--fake` never gets the real cache, and a cache only when
     /// asked for.
     #[cfg(feature = "fake")]

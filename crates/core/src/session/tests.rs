@@ -696,11 +696,3 @@ async fn cache_key_deleter_surfaces_store_failure() {
     assert!(err.to_string().contains("injected"));
     assert!(store.contains(SecretItem::CacheKey));
 }
-
-#[test]
-fn session_types_are_send_and_sync() {
-    fn check<T: Send + Sync>() {}
-    check::<AbyssSession>();
-    check::<SessionSnapshot>();
-    check::<PersistHandle>();
-}

@@ -175,8 +175,6 @@ impl Open {
         let mut state = lock();
         // Reserve before checking (round 30): see the module docs.
         let reservation = Reservation::take();
-        #[cfg(test)]
-        tests::between_reserve_and_check();
         let closed = state.closed.iter().any(|(d, _)| d == dir);
         if EXITING.load(Ordering::SeqCst) || closed {
             return Err(Refused::Closing);
@@ -350,14 +348,10 @@ pub fn leak_lock_for_tests() {
 /// empty: any later `enter` reserves after that load, so its check comes
 /// after the store and refuses (round 30).
 fn drain_at_exit() -> bool {
-    #[cfg(test)]
-    tests::drain_started();
     let deadline = Instant::now() + EXIT_WAIT;
     begin_exit();
     for _ in 0..MAX_POLLS {
         let open = OPEN.load(Ordering::SeqCst);
-        #[cfg(test)]
-        tests::polled();
         if open == 0 {
             return true;
         }
@@ -393,16 +387,9 @@ fn drain_at_exit() -> bool {
 ///   stderr). SQLite durability is unaffected: committed transactions are
 ///   durable, and the WAL is recovered on the next open.
 extern "C" fn exit_hook() {
-    #[cfg(test)]
-    tests::forbid_allocation();
     let outcome = std::panic::catch_unwind(drain_at_exit);
-    #[cfg(test)]
-    tests::probe_at_exit();
     match outcome {
-        Ok(true) => {
-            #[cfg(test)]
-            tests::allow_allocation();
-        }
+        Ok(true) => {}
         Ok(false) => abandon_exit(),
         Err(payload) => {
             std::mem::forget(payload);
@@ -415,11 +402,6 @@ fn abandon_exit() -> ! {
     // SAFETY: `_exit` takes a plain status and never returns; it skips
     // exit handlers by design (see `exit_hook`).
     unsafe { libc::_exit(EXIT_CACHE_BUSY) }
-}
-
-#[cfg(test)]
-pub(crate) fn is_open(dir: &Path) -> bool {
-    any_open(&lock(), Some(dir))
 }
 
 #[cfg(test)]

@@ -54,10 +54,6 @@ pub(crate) struct CacheParts {
     /// The generation of the latest re-binding: its `CacheSettled` is the
     /// one that adopts it.
     pub(crate) rebind_gen: u64,
-    /// Tests: a re-binding waits for a permit after reporting, so its report
-    /// arrives before its task has finished.
-    #[cfg(test)]
-    pub(crate) hold_settle: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
 impl CacheParts {
@@ -69,8 +65,6 @@ impl CacheParts {
             quarantined: None,
             rebinding: None,
             rebind_gen: 0,
-            #[cfg(test)]
-            hold_settle: None,
         }
     }
 }

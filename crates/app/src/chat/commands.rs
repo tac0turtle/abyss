@@ -13,8 +13,6 @@ use gpui::FollowMode;
 use super::messages::MessageWindow;
 use super::retry::AUTO_RESTART_GAP;
 use super::sends::Echo;
-#[cfg(test)]
-use super::sends::Echoes;
 use super::viewport::Seen;
 use super::{ChatShell, CoreState};
 
@@ -451,12 +449,6 @@ impl ChatShell {
             Err(_) => self.focus_retry.failed(now),
         }
         res
-    }
-
-    /// The echo table, for tests.
-    #[cfg(test)]
-    pub(crate) fn echoes(&self) -> &Echoes {
-        &self.echoes
     }
 }
 

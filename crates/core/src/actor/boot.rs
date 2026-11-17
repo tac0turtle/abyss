@@ -150,20 +150,6 @@ impl Boot {
     fn snapshots_done(&self) -> bool {
         self.baseline_by.is_none() && !self.dialogs_pending && self.tails.is_empty()
     }
-
-    /// A boot of `kind` awaiting `tail` as its only snapshot, with `buffered`
-    /// already buffered. A full one never reaches its baseline, so it stays
-    /// pending; a refresh finishes (and replays) once the tail completes.
-    #[cfg(all(test, feature = "fake"))]
-    pub(super) fn awaiting_tail(kind: BootKind, tail: Load, buffered: Update) -> Option<Self> {
-        let mut boot = match kind {
-            BootKind::Full => Self::full(Instant::now()),
-            BootKind::Refresh => Self::refresh(),
-        };
-        boot.tails.insert(tail.thread, tail.req);
-        boot.push(buffered).ok()?;
-        Some(boot)
-    }
 }
 
 /// Where an update being applied comes from.

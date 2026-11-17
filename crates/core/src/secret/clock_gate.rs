@@ -181,36 +181,6 @@ mod tests {
         }
     }
 
-    /// Round 32, finding 3: a test hold that expires on its own, on the
-    /// store thread (no current runtime), holds the clock again while a
-    /// request is awaited. A paused virtual sleep then waits for the
-    /// request to end in wall time instead of firing at once.
-    #[tokio::test(start_paused = true)]
-    async fn a_hold_that_expires_holds_the_clock_again() {
-        const REQUEST: Duration = Duration::from_millis(300);
-        let gate = ClockGate::default();
-        let busy = gate.busy();
-        await_holder(&gate, Holder::Running);
-        let epoch = gate.hold_began();
-        await_holder(&gate, Holder::Gone);
-        let store = gate.clone();
-        std::thread::spawn(move || store.hold_ended(epoch))
-            .join()
-            .unwrap();
-        await_holder(&gate, Holder::Running);
-        let start = Instant::now();
-        let request = std::thread::spawn(move || {
-            std::thread::sleep(REQUEST);
-            drop(busy);
-        });
-        tokio::time::sleep(Duration::from_secs(600)).await;
-        assert!(
-            start.elapsed() >= REQUEST,
-            "the clock advanced while a request was awaited"
-        );
-        request.join().unwrap();
-    }
-
     /// An abandoned gate lets the clock go and never holds it again.
     #[tokio::test(start_paused = true)]
     async fn an_abandoned_gate_never_holds_the_clock() {

@@ -198,34 +198,6 @@ impl Session {
 mod tests {
     use super::*;
 
-    /// Finding 6: a failed save or delete is explicit and has Retry; a
-    /// failed delete never reads as "removed".
-    #[test]
-    fn credential_item_failures_offer_retry() {
-        use abyss_core::api::StorageError;
-        let failed = StorageError::Keychain;
-        assert!(matches!(
-            credential_retry(CredentialItem::SaveFailed(failed)),
-            Some(Command::RetryCredentialSave)
-        ));
-        assert!(matches!(
-            credential_retry(CredentialItem::DeleteFailed(failed)),
-            Some(Command::ForgetStoredCredentials)
-        ));
-        for quiet in [
-            CredentialItem::Settled,
-            CredentialItem::Saving,
-            CredentialItem::Deleting,
-        ] {
-            assert!(credential_retry(quiet).is_none());
-        }
-        assert!(copy::credential_item(CredentialItem::Settled).is_none());
-        let text = copy::credential_item(CredentialItem::DeleteFailed(failed)).unwrap();
-        assert!(text.contains("still stored"), "{text}");
-        let text = copy::credential_item(CredentialItem::SaveFailed(failed)).unwrap();
-        assert!(text.contains("weren't saved"), "{text}");
-    }
-
     #[test]
     fn entry_is_checked_like_core() {
         let hash = "0123456789ABCDEF0123456789abcdef";

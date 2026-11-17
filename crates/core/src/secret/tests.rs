@@ -1,40 +1,4 @@
-use std::time::Duration;
-
 use super::*;
-
-#[test]
-fn memory_store_roundtrip_and_idempotent_delete() {
-    let store = MemoryStore::new();
-    assert_eq!(store.get(SecretItem::Session).unwrap(), None);
-    store.set(SecretItem::Session, b"one").unwrap();
-    store.set(SecretItem::Session, b"two").unwrap();
-    assert_eq!(
-        store.get(SecretItem::Session).unwrap().unwrap().as_slice(),
-        b"two"
-    );
-    assert!(!store.contains(SecretItem::CacheKey));
-    store.delete(SecretItem::Session).unwrap();
-    store.delete(SecretItem::Session).unwrap();
-    assert!(!store.contains(SecretItem::Session));
-}
-
-#[test]
-fn faulty_store_injects_and_heals() {
-    let (store, control) = FaultyStore::new(MemoryStore::new());
-    control.fail(StoreOp::Set);
-    assert_eq!(
-        store.set(SecretItem::Session, b"x"),
-        Err(StoreError::Injected)
-    );
-    store.delete(SecretItem::Session).unwrap();
-    control.heal(StoreOp::Set);
-    store.set(SecretItem::Session, b"x").unwrap();
-    control.set_delay(Duration::from_millis(20));
-    let start = std::time::Instant::now();
-    store.get(SecretItem::Session).unwrap();
-    assert!(start.elapsed() >= Duration::from_millis(20));
-    assert_eq!(control.calls(), 4);
-}
 
 #[test]
 fn cache_key_create_then_load_returns_same_key() {

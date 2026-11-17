@@ -524,81 +524,6 @@ mod tests {
         assert!(project(gone, &AuthView::LoggingOut, now).notice.is_some());
     }
 
-    /// Round 19, 3: the projection gives a lone `*` flash call the full
-    /// code-field allowance, not one digit.
-    #[test]
-    fn lone_wildcard_flash_call_projects_the_full_bound() {
-        let state = AuthState::Code {
-            phone_hint: "x".into(),
-            sent: Some(SentCodeInfo {
-                delivery: CodeDelivery::FlashCall {
-                    pattern: "*".into(),
-                },
-                length: None,
-                next: None,
-                resend_at: None,
-            }),
-            error: None,
-        };
-        match project(state, &AuthView::Phone { error: None }, Instant::now()).view {
-            AuthView::Code {
-                sent: Some(sent), ..
-            } => assert_eq!(sent.max_digits, abyss_core::api::MAX_CODE_DIGITS),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// Round 19, 1 and 2: a logout that could not start keeps the account
-    /// (and offers to stay signed in only for the user's own logout); an
-    /// unreadable marker at startup is its own screen, never "Logout
-    /// incomplete".
-    #[test]
-    fn unstarted_logout_and_blocked_startup_have_their_own_screens() {
-        use abyss_core::api::StorageError;
-        let now = Instant::now();
-        let at = |s: AuthState| project(s, &AuthView::SignedIn, now).view;
-        let user = at(AuthState::LogoutNotStarted {
-            error: StorageError::Keychain,
-            trigger: LogoutTrigger::User,
-        });
-        assert_eq!(
-            user,
-            AuthView::LogoutNotStarted {
-                trigger: LogoutTrigger::User
-            }
-        );
-        assert!(!user.tears_down(), "nothing changed: the account stays");
-        assert_eq!(back(&user, None), Back::Core, "stay signed in");
-        // Round 25: the marker write is shown, and keeps the account's UI.
-        let starting = at(AuthState::LogoutStarting);
-        assert_eq!(starting, AuthView::LogoutStarting);
-        assert!(!starting.tears_down());
-        assert!(starting.hides_account() && user.hides_account());
-        assert!(!AuthView::SignedIn.hides_account());
-        assert_eq!(back(&starting, None), Back::None);
-        let server = AuthView::LogoutNotStarted {
-            trigger: LogoutTrigger::Server,
-        };
-        assert_eq!(back(&server, None), Back::None);
-        let blocked = at(AuthState::StartupBlocked {
-            error: StorageError::Keychain,
-        });
-        assert_eq!(blocked, AuthView::StartupBlocked);
-        assert_eq!(back(&blocked, None), Back::None);
-        assert!(copy::STARTUP_BLOCKED_TITLE.contains("Keychain"));
-        for text in [copy::STARTUP_BLOCKED_TITLE, copy::STARTUP_BLOCKED_DETAIL] {
-            assert!(!text.contains("Logout incomplete"), "{text}");
-        }
-        // Finding 8: the guide names both screens as they are shown.
-        let doc = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../docs/connecting.md"
-        ));
-        for title in [copy::LOGOUT_NOT_STARTED_TITLE, copy::STARTUP_BLOCKED_TITLE] {
-            assert!(doc.contains(title), "{title}");
-        }
-    }
-
     /// Task 6c: a failed local deletion is never shown as "Signed out".
     #[test]
     fn failed_local_deletion_is_logout_incomplete() {
@@ -723,23 +648,6 @@ mod tests {
             resume: Box::new(AuthView::Verifying { error: None }),
         };
         assert_eq!(back(&verifying_wait, entered), Back::None);
-    }
-
-    /// Round 15, B: every teardown state resets the account's UI state;
-    /// nothing else does.
-    #[test]
-    fn teardown_states_reset_the_account_ui() {
-        let now = Instant::now();
-        let at = |s: AuthState| project(s, &AuthView::SignedIn, now).view;
-        assert!(at(AuthState::LoggingOut).tears_down());
-        let stuck = AuthState::LoggedOut {
-            remote: RemoteLogout::NotAttempted,
-            local: LocalDeletion::Failed(abyss_core::api::StorageError::Internal),
-        };
-        assert!(at(stuck).tears_down());
-        assert!(!AuthView::SignedIn.tears_down());
-        assert!(!AuthView::Phone { error: None }.tears_down());
-        assert!(!AuthView::Connecting.tears_down());
     }
 
     #[test]

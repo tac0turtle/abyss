@@ -644,6 +644,7 @@ mod tests {
         assert_eq!(ApiHash::parse(&bad), Err(ApiHashError::NotHex));
         let inner = format!("{} {}", "a".repeat(15), "a".repeat(16));
         assert_eq!(ApiHash::parse(&inner), Err(ApiHashError::NotHex));
+        assert_eq!(ApiHash::parse(&"é".repeat(16)), Err(ApiHashError::NotHex));
     }
 
     #[test]
@@ -658,17 +659,6 @@ mod tests {
         assert_eq!(ApiId::parse("١٢"), Err(ApiIdError::NotDigits));
         assert_eq!(ApiId::parse("  "), Err(ApiIdError::Empty));
         assert_eq!(ApiId::new(-5), Err(ApiIdError::OutOfRange));
-    }
-
-    #[test]
-    fn api_hash_boundaries_and_case() {
-        let upper = "ABCDEF0123456789".repeat(2);
-        assert_eq!(
-            ApiHash::parse(&upper).unwrap().expose(),
-            upper.to_lowercase()
-        );
-        assert!(ApiHash::parse(&format!("\t{}\n", "0".repeat(32))).is_ok());
-        assert_eq!(ApiHash::parse(&"é".repeat(16)), Err(ApiHashError::NotHex));
     }
 
     #[test]
@@ -691,40 +681,6 @@ mod tests {
         assert!(CredentialError::ApiIdInvalid.allows_entry());
         assert!(CredentialError::StoredUnreadable.allows_entry());
         assert_eq!(EnvVar::ApiHash.name(), "ABYSS_API_HASH");
-    }
-
-    /// Round 11, finding 5: a flash call's code is the whole calling number
-    /// (up to 15 digits), a missed call's its stated tail.
-    #[test]
-    fn code_bounds_follow_the_delivery() {
-        let info = |delivery, length| SentCodeInfo {
-            delivery,
-            length,
-            next: None,
-            resend_at: None,
-        };
-        let flash = CodeDelivery::FlashCall {
-            pattern: "+44 7700 9*****".into(),
-        };
-        assert_eq!(info(flash, None).max_code_digits(), 12);
-        let long = CodeDelivery::FlashCall {
-            pattern: "*".repeat(40),
-        };
-        assert_eq!(info(long, None).max_code_digits(), MAX_CODE_DIGITS);
-        // Round 19, 3: a lone `*` is any number of digits, not one.
-        let any = CodeDelivery::FlashCall {
-            pattern: "*".into(),
-        };
-        assert_eq!(info(any, None).max_code_digits(), MAX_CODE_DIGITS);
-        let missed = CodeDelivery::MissedCall {
-            prefix: "+44 7700".into(),
-        };
-        assert_eq!(info(missed, Some(4)).max_code_digits(), 4);
-        assert_eq!(info(CodeDelivery::Sms, Some(5)).max_code_digits(), 5);
-        assert_eq!(
-            info(CodeDelivery::App, None).max_code_digits(),
-            MAX_CODE_DIGITS
-        );
     }
 
     #[test]

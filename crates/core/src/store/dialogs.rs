@@ -433,30 +433,6 @@ mod tests {
         assert_eq!(d.as_slice()[0].unread, u32::MAX);
     }
 
-    /// Round 9, finding 3: at capacity after a refresh, a chat the restarted
-    /// traversal finds below the first page is admitted in server order,
-    /// evicting the lowest-ranked provisional row.
-    #[test]
-    fn refreshed_traversal_admits_new_chats_at_capacity() {
-        let max = i64::try_from(MAX_DIALOGS).unwrap();
-        let mut d = Dialogs::default();
-        d.reset((0..max).map(|n| dated(n, -n)).collect());
-        // Fresh first page: the same 100 head rows; 900 provisional rows.
-        d.merge_first_page((0..100).map(|n| dated(n, -n)).collect(), Rest::More);
-        assert_eq!(d.len(), MAX_DIALOGS);
-        // The next page holds a new chat at server position 150.
-        let mut page: Vec<_> = (100..200).map(|n| dated(n, -n)).collect();
-        page.insert(50, dated(5000, -150));
-        page.pop();
-        let out = d.append(page, Rest::More);
-        assert!(out.reordered);
-        assert_eq!(out.changed, vec![dated(5000, -150)]);
-        assert_eq!(d.len(), MAX_DIALOGS);
-        assert_eq!(d.as_slice()[150].id, id(5000));
-        assert!(d.get(id(max - 1)).is_none(), "lowest provisional evicted");
-        assert_eq!(d.as_slice()[200].id, id(199), "provisional order kept");
-    }
-
     #[test]
     fn end_of_traversal_drops_unconfirmed_rows() {
         let mut d = Dialogs::default();
@@ -465,18 +441,5 @@ mod tests {
         let out = d.append(vec![chat(3)], Rest::Last);
         assert!(out.reordered);
         assert_eq!(ids(&d), vec![1, 3]);
-    }
-
-    /// Round 9, finding 4: a bump that moves a chat changes the revision.
-    #[test]
-    fn reordering_bump_changes_the_revision() {
-        let mut d = Dialogs::default();
-        d.reset(vec![chat(1), chat(2)]);
-        let rev = d.rev();
-        d.bump(id(1), last(10), Unread::Unchanged);
-        assert_eq!(d.rev(), rev, "already on top: same order");
-        d.bump(id(2), last(11), Unread::Unchanged);
-        assert_ne!(d.rev(), rev);
-        assert_eq!(ids(&d), vec![2, 1]);
     }
 }

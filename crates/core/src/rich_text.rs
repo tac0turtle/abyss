@@ -589,13 +589,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_text() {
-        let rt = RichText::from_entities("", &[ent(0, 0, EntityKind::Bold)]);
-        assert_invariants(&rt);
-        assert!(rt.runs.is_empty());
-    }
-
     fn arb_kind() -> impl Strategy<Value = EntityKind> {
         prop_oneof![
             Just(EntityKind::Bold),

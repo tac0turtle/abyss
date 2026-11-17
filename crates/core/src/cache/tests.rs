@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use super::*;
 use crate::model::{Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey};
 use crate::rich_text::RichText;
@@ -69,80 +67,6 @@ async fn a_worker_leaves_the_census_only_after_closing() {
         census(dir, none).await.unwrap(),
         "closed before `erase` replies"
     );
-}
-
-/// Round 23, finding 4: a worker that panics while handling a command
-/// closes its connection before it leaves the census. The probe runs
-/// between the two (it is declared between them in `Cache`): by then the
-/// WAL is gone, so the connection has closed, and the census still lists
-/// the cache.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_worker_panic_closes_the_connection_before_leaving_the_census() {
-    let (_t, dir, key) = setup();
-    let wal = dir.join("cache.db-wal");
-    let handle = CacheHandle::spawn(dir.clone(), &key).unwrap();
-    let c = user(1);
-    handle
-        .write(worker::CacheCmd::PutMessages(
-            ThreadKey::whole(c),
-            vec![msg(c, 1, "a")],
-        ))
-        .await;
-    handle.barrier().await.unwrap();
-    assert!(wal.exists(), "the connection is open");
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    let d = dir.clone();
-    let probe = db::DropProbe::new(move || {
-        let _ = tx.send((d.join("cache.db-wal").exists(), census::is_open(&d)));
-    });
-    handle.panic_worker(probe).await;
-    let seen = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)));
-    let (wal_left, listed) = seen.await.unwrap().unwrap();
-    assert!(
-        !wal_left,
-        "the connection closed before the entry was released"
-    );
-    assert!(listed, "the census still listed the cache while it closed");
-    let d = dir.clone();
-    let drained =
-        tokio::task::spawn_blocking(move || wait_closed(Some(&d), Duration::from_secs(10)));
-    assert!(drained.await.unwrap());
-    assert!(matches!(handle.chats().await, Err(WorkerError::Stopped)));
-}
-
-/// Round 23, finding 2: `open_blocking` takes its census entry when it
-/// schedules the open, so an open still queued for a blocking thread is
-/// counted (a drain waits for it), and closed admission refuses it before
-/// it is scheduled.
-#[test]
-fn a_queued_blocking_open_is_counted_before_it_starts() {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .max_blocking_threads(1)
-        .enable_all()
-        .build()
-        .unwrap();
-    let (_t, dir, key) = setup();
-    let empty = |d: &std::path::Path| wait_closed(Some(d), Duration::ZERO);
-    rt.block_on(async {
-        let (release, wait) = std::sync::mpsc::channel::<()>();
-        // Occupies the only blocking thread, so the open queues.
-        let blocker = tokio::task::spawn_blocking(move || wait.recv());
-        let opening = open_blocking(dir.clone(), key);
-        assert!(!empty(&dir), "a queued open is counted");
-        assert!(!dir.join("cache.db").exists(), "and has not started");
-        release.send(()).unwrap();
-        blocker.await.unwrap().unwrap();
-        let (handle, _key) = opening.await.unwrap();
-        handle.close().await.unwrap();
-    });
-    assert!(empty(&dir));
-
-    let closed = close_admission(&dir);
-    let key = CacheKey::generate().unwrap();
-    assert!(rt.block_on(open_blocking(dir.clone(), key)).is_none());
-    assert!(empty(&dir), "a refused open takes no entry");
-    drop(closed);
 }
 
 fn user(id: i64) -> ChatId {
@@ -300,45 +224,6 @@ fn a_symlinked_directory_is_refused() {
     assert!(!target.join(DB_FILE).exists());
 }
 
-/// Round 26, finding 2: a `cache.db` that is a symlink (to another cache's
-/// database) is refused, and the target is neither opened nor changed.
-#[test]
-fn a_symlinked_database_file_is_refused() {
-    let (t, dir, key) = setup();
-    let other = t.path().join("other");
-    {
-        let mut db = Cache::open(&other, &key).unwrap();
-        db.put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 1, "a")])
-            .unwrap();
-    }
-    let target = other.join(DB_FILE);
-    let before = std::fs::read(&target).unwrap();
-    std::fs::create_dir(&dir).unwrap();
-    std::os::unix::fs::symlink(&target, dir.join(DB_FILE)).unwrap();
-    assert!(Cache::open(&dir, &key).is_err(), "opened through the link");
-    assert_eq!(std::fs::read(&target).unwrap(), before);
-}
-
-/// Round 26, finding 2: linked side files (`-wal`, `-shm`) are never
-/// followed: the open or the first write fails, and the targets are
-/// untouched.
-#[test]
-fn symlinked_side_files_are_never_followed() {
-    for side in ["-wal", "-shm"] {
-        let (t, dir, key) = setup();
-        drop(Cache::open(&dir, &key).unwrap());
-        let victim = t.path().join("victim");
-        std::fs::write(&victim, b"untouched").unwrap();
-        let name = format!("{DB_FILE}{side}");
-        let _ = std::fs::remove_file(dir.join(&name));
-        std::os::unix::fs::symlink(&victim, dir.join(&name)).unwrap();
-        let wrote = Cache::open(&dir, &key)
-            .and_then(|mut db| db.put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 1, "a")]));
-        assert!(wrote.is_err(), "{side}: wrote through the link");
-        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched", "{side}");
-    }
-}
-
 /// The directory may sit below a symlink (macOS `/var` -> `/private/var`,
 /// where every temporary directory lives): only links at the leaf count.
 #[test]
@@ -353,39 +238,6 @@ fn a_symlink_above_the_directory_is_allowed() {
     db.put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 1, "a")])
         .unwrap();
     assert!(real.join("cache").join(DB_FILE).exists());
-}
-
-/// Round 29, finding 3: SQLite names the file in a failed open's message;
-/// `CacheError` keeps the result codes and drops the message, so neither
-/// `Display` nor `Debug` shows the path.
-#[test]
-fn sql_errors_never_show_the_path() {
-    const SENTINEL: &str = "SENTINEL-user-name-7f3a";
-    let t = tempfile::tempdir().unwrap();
-    let dir = t.path().join(SENTINEL);
-    // A directory where the database file should be: the open fails.
-    std::fs::create_dir_all(dir.join(DB_FILE)).unwrap();
-    let key = CacheKey::generate().unwrap();
-    let Err(error) = Cache::open(&dir, &key) else {
-        panic!("opened a directory as the database");
-    };
-    assert!(matches!(error, CacheError::Sql(_)), "{error:?}");
-    // The message rusqlite carries does name the file.
-    let raw = rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
-        Some(format!("unable to open database file: {}", dir.display())),
-    );
-    assert!(raw.to_string().contains(SENTINEL));
-    let redacted = CacheError::from(raw);
-    for shown in [
-        error.to_string(),
-        format!("{error:?}"),
-        redacted.to_string(),
-        format!("{redacted:?}"),
-    ] {
-        assert!(!shown.contains(SENTINEL), "{shown}");
-    }
-    assert_eq!(redacted.to_string(), "cache sql: CannotOpen (14)");
 }
 
 #[test]

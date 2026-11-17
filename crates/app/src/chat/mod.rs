@@ -242,12 +242,6 @@ impl ChatShell {
         }
     }
 
-    /// The thread core was last told shows its live tail.
-    #[cfg(test)]
-    pub(crate) fn viewing(&self) -> Option<ThreadKey> {
-        self.viewing
-    }
-
     /// Starts the flood-wait countdown ticker unless it runs. Returns
     /// whether the caller should start one.
     pub(crate) fn start_countdown(&mut self) -> bool {

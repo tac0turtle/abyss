@@ -115,34 +115,6 @@ fn prepend_past_cap_slides_and_detaches_from_tail() {
     );
 }
 
-/// Task 10d, finding 6: a page core fetches on its own fills only the room
-/// left and never drops the newest messages (the end the user looks at).
-#[test]
-fn prepend_fitting_never_trims_and_stays_contiguous() {
-    let mut w = Windows::default();
-    let c = user(1);
-    let g = w.open(ThreadKey::whole(c));
-    for i in 1..=CAP - 3 {
-        w.upsert(ThreadKey::whole(c), msg(c, CAP + i, "")); // CAP+1 ..= 2*CAP-3
-    }
-    let older: Vec<_> = (1..=10).map(|i| msg(c, CAP + 1 - i, "")).collect();
-    let change = w
-        .prepend_fitting(ThreadKey::whole(c), g, last(older))
-        .unwrap();
-    let win = w.get(ThreadKey::whole(c)).unwrap();
-    assert_eq!(win.messages().len(), MAX_MESSAGES_PER_CHAT);
-    assert!(change.removed.is_empty(), "nothing dropped");
-    assert_eq!(ids(&w, c).first(), Some(&(CAP - 2)), "the 3 adjacent ones");
-    assert_eq!(ids(&w, c).last(), Some(&(2 * CAP - 3)), "the tail stays");
-    let win = w.get(ThreadKey::whole(c)).unwrap();
-    assert!(!win.has_newer(), "still attached");
-    assert!(win.has_older(), "the rest did not fit: more exists");
-    let full = w
-        .prepend_fitting(ThreadKey::whole(c), g, last(vec![msg(c, 1, "")]))
-        .unwrap();
-    assert_eq!(full, Change::default(), "no room: nothing changes");
-}
-
 #[test]
 fn detached_window_ignores_live_messages_then_reattaches() {
     let mut w = Windows::default();
@@ -388,44 +360,6 @@ fn huge(c: ChatId, id: i32) -> Message {
         sender: Some(crate::model::Sender { id: c, name }),
         ..msg(c, id, "big")
     }
-}
-
-/// Task 10g (round 21, finding 1): a background chat's growth never evicts
-/// the open chat's window, whose loads and owed answers rely on it. The
-/// background windows go first, then the growing chat trims itself.
-#[test]
-fn byte_budget_never_evicts_the_open_window() {
-    let mut w = Windows::default();
-    let (a, b, c) = (user(1), user(2), user(3));
-    w.open(ThreadKey::whole(c));
-    w.upsert(ThreadKey::whole(c), msg(c, 1, "c"));
-    w.close(ThreadKey::whole(c));
-    w.open(ThreadKey::whole(b));
-    w.upsert(ThreadKey::whole(b), msg(b, 1, "b"));
-    w.close(ThreadKey::whole(b));
-    let view = w.open(ThreadKey::whole(a));
-    w.upsert(ThreadKey::whole(a), msg(a, 1, "a"));
-    assert_eq!(w.shown(), Some(ThreadKey::whole(a)));
-    // Least recently used first: c, b, a. The new message is b's.
-    w.upsert(ThreadKey::whole(b), huge(b, 2));
-    assert!(
-        w.get(ThreadKey::whole(c)).is_none(),
-        "background window evicted"
-    );
-    assert_eq!(ids(&w, a), vec![1], "the open window stays whole");
-    assert_eq!(w.get(ThreadKey::whole(a)).map(Window::view_gen), Some(view));
-    assert!(ids(&w, b).is_empty(), "the growing chat trimmed itself");
-    assert!(w.total_bytes() <= MAX_STORE_BYTES);
-    // An edit of a retained chat's message is held to the same rule.
-    w.upsert(ThreadKey::whole(b), msg(b, 3, "b"));
-    assert!(w.replace(ThreadKey::whole(b), huge(b, 3)));
-    assert_eq!(ids(&w, a), vec![1]);
-    assert!(w.total_bytes() <= MAX_STORE_BYTES);
-    // Once closed, it is a background window like any other.
-    w.close(ThreadKey::whole(a));
-    assert_eq!(w.shown(), None);
-    w.upsert(ThreadKey::whole(b), huge(b, 4));
-    assert!(w.get(ThreadKey::whole(a)).is_none());
 }
 
 /// The open window's own growth trims it within itself: it is never

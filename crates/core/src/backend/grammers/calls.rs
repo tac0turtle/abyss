@@ -283,12 +283,6 @@ impl<I: Invoke> Calls<I> {
         InFlight { calls: self, id }
     }
 
-    /// The first half of [`Self::resolve_used`], for interleaving tests.
-    #[cfg(test)]
-    pub(crate) async fn lookup(&self, chat: ChatId) -> Option<PeerInfo> {
-        self.info(chat).await
-    }
-
     pub(crate) async fn dialogs(
         &self,
         cursor: Option<DialogsCursor>,

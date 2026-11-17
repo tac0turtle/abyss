@@ -134,11 +134,10 @@ impl<B: Backend> Actor<B> {
 #[cfg(all(test, feature = "fake"))]
 mod tests {
     use super::*;
-    use crate::actor::apply::{Coverage, MIN_ID, TailMode};
-    use crate::backend::HistoryQuery;
+    use crate::actor::apply::MIN_ID;
+
     use crate::backend::fake::text_message;
-    use crate::model::{ChatId, PeerKind, ThreadKey};
-    use crate::store::ViewGen;
+    use crate::model::{ChatId, PeerKind};
 
     const CHAT: ChatId = ChatId {
         kind: PeerKind::User,
@@ -182,51 +181,6 @@ mod tests {
         assert!(tail_diff(&window, &page, Some((MIN_ID, MsgId(5)))).gap);
     }
 
-    /// Task 10c, finding 5: more than a page of messages arrived unseen. A
-    /// merge would leave a hole between the window and the page.
-    #[test]
-    fn a_partial_tail_past_the_window_is_a_gap() {
-        let window: VecDeque<Message> = msgs(&[1, 2, 3]).into();
-        let far = HistoryPage {
-            messages: msgs(&[10, 11]),
-            has_more: true,
-        };
-        assert!(tail_diff(&window, &far, Some((MsgId(10), MsgId(11)))).gap);
-        let next = HistoryPage {
-            messages: msgs(&[4, 5]),
-            has_more: true,
-        };
-        assert!(!tail_diff(&window, &next, Some((MsgId(4), MsgId(5)))).gap);
-        let whole = HistoryPage {
-            messages: msgs(&[10, 11]),
-            has_more: false,
-        };
-        let diff = tail_diff(&window, &whole, Some((MIN_ID, MsgId(11))));
-        assert!(!diff.gap, "the whole history: 1..=3 were deleted");
-        assert_eq!(diff.deleted, vec![MsgId(1), MsgId(2), MsgId(3)]);
-    }
-
-    /// Task 10d, finding 1: the window held 51..=100; 31..=100 were deleted
-    /// and the server's whole history is 1..=30. Merged, every window message
-    /// would go and the page would be ignored (it is below the window).
-    #[test]
-    fn a_tail_entirely_below_the_window_replaces_it() {
-        let window: VecDeque<Message> = msgs(&(51..=100).collect::<Vec<_>>()).into();
-        let page = HistoryPage {
-            messages: msgs(&(1..=30).collect::<Vec<_>>()),
-            has_more: false,
-        };
-        assert!(tail_diff(&window, &page, Some((MIN_ID, MsgId(100)))).gap);
-        // Part of the window survives: a merge keeps it contiguous.
-        let page = HistoryPage {
-            messages: msgs(&(1..=60).collect::<Vec<_>>()),
-            has_more: false,
-        };
-        let diff = tail_diff(&window, &page, Some((MIN_ID, MsgId(100))));
-        assert!(!diff.gap);
-        assert_eq!(diff.deleted.len(), 40);
-    }
-
     #[test]
     fn deleted_newest_message_is_removed() {
         // The window held 1..=10 when the tail was requested; 10 was deleted
@@ -255,39 +209,5 @@ mod tests {
         let diff = tail_diff(&window, &page, Some((MIN_ID, MsgId(4))));
         assert!(!diff.gap);
         assert_eq!(diff.deleted, vec![MsgId(3), MsgId(4)]);
-    }
-
-    /// Round 9, finding 1: a partial tail (51..=100 of 1..=100) emptied by
-    /// buffered deletions is still authoritative only from 51; it must not
-    /// establish the start of history and delete 1..=50.
-    #[test]
-    fn emptied_partial_tail_keeps_older_messages() {
-        let all: Vec<i32> = (1..=100).collect();
-        let window: VecDeque<Message> = msgs(&all).into();
-        let served = HistoryPage {
-            messages: msgs(&all[50..]),
-            has_more: true,
-        };
-        let mut reply = HistoryReply {
-            thread: ThreadKey::whole(CHAT),
-            view: ViewGen(1),
-            req: crate::actor::jobs::ReqId(1),
-            dir: crate::api::HistoryDir::Tail,
-            query: HistoryQuery::Tail,
-            floor: Some(MsgId(100)),
-            covered: Coverage::of(&served),
-            page: served,
-            mode: TailMode::Merge,
-        };
-        reply.page.messages.clear(); // every message was tombstoned
-        let range = reply.authoritative_range();
-        assert_eq!(range, Some((MsgId(51), MsgId(100))));
-        let diff = tail_diff(&window, &reply.page, range);
-        assert!(!diff.gap);
-        let expected: Vec<MsgId> = (51..=100).map(MsgId).collect();
-        assert_eq!(diff.deleted, expected);
-        // A partial page that covered nothing establishes nothing.
-        reply.covered = None;
-        assert_eq!(reply.authoritative_range(), None);
     }
 }

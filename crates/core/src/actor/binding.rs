@@ -243,19 +243,10 @@ impl<B: Backend> Actor<B> {
         let tx = self.auth.sender();
         parts.rebind_gen = parts.rebind_gen.wrapping_add(1);
         let generation = parts.rebind_gen;
-        #[cfg(test)]
-        let hold = parts.hold_settle.clone();
         parts.rebinding = Some(tokio::spawn(async move {
             let bound = settle(&persist, &dir, open, Some(owner)).await;
             // A closed channel means the actor is gone.
             let _ = tx.send(AuthMsg::CacheSettled(generation)).await;
-            #[cfg(test)]
-            if let Some(hold) = hold {
-                let _ = hold
-                    .acquire()
-                    .await
-                    .map(tokio::sync::SemaphorePermit::forget);
-            }
             bound
         }));
     }

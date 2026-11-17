@@ -35,13 +35,6 @@ fn c_path(path: &Path) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
 }
 
-/// Whether `path` has at least one extended ACL entry.
-#[cfg(test)]
-pub(super) fn has_entries(path: &Path) -> io::Result<bool> {
-    let path = c_path(path)?;
-    entries(&path)
-}
-
 fn entries(path: &CStr) -> io::Result<bool> {
     // SAFETY: `path` is a valid NUL-terminated string for the whole call.
     let acl = unsafe { acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED) };

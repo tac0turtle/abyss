@@ -96,11 +96,6 @@ impl Watchdog {
         }
     }
 
-    /// Sets the wall-clock bound of later waits.
-    pub(super) fn set_bound(&mut self, bound: Duration) {
-        self.bound = bound;
-    }
-
     /// Arms the watchdog for one wait of at most the bound.
     pub(super) fn arm(&self) -> Armed {
         self.shared.lock().deadline = Some(Instant::now() + self.bound);

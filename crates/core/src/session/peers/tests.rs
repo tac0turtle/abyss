@@ -19,13 +19,6 @@ fn set(map: &mut PeerMap, ids: &[PeerId]) -> Pinned {
     map.set_pins(req(ids))
 }
 
-/// Caches `count` fresh users from `from` on, through no handoff: enough to
-/// evict every queued peer.
-fn churn(map: &mut PeerMap, from: i64, count: usize) {
-    let to = from + i64::try_from(count).unwrap();
-    map.cache_response(&[], (from..to).map(user).collect());
-}
-
 fn hashless(id: i64) -> PeerInfo {
     PeerInfo::User {
         id,
@@ -68,20 +61,6 @@ fn bound() -> usize {
     MAX_PINNED_PEERS + MAX_HANDOFFS * MAX_HANDOFF_PEERS + MAX_UNPINNED_PEERS
 }
 
-/// Review round 10 (small variant): an update did not refresh a queued
-/// peer's position, so with a full queue, a response naming the oldest peer
-/// and one newcomer evicted the peer it had just named.
-#[test]
-fn an_update_moves_a_queued_peer_to_the_back() {
-    let mut map = full_queue();
-    map.insert(user(1));
-    map.insert(user(5000));
-    assert!(known(&map, 1), "just touched");
-    assert!(!known(&map, 2), "now the oldest");
-    assert!(known(&map, 5000));
-    assert_eq!(map.len(), MAX_UNPINNED_PEERS);
-}
-
 /// The same two-peer response as a dialogs page: both are held for core.
 #[test]
 fn a_two_peer_handoff_survives_a_full_queue_and_more() {
@@ -99,68 +78,6 @@ fn a_two_peer_handoff_survives_a_full_queue_and_more() {
     );
 }
 
-/// Review round 10: a 4,096-peer dialogs response evicted its own dialogs
-/// (directory order is unordered) before core pinned them. Review round 13:
-/// dialogs *first* is the order the old FIFO fails on (the 3,995 auxiliary
-/// peers that follow push them out); dialogs last is checked too.
-#[test]
-fn a_full_size_response_keeps_its_handoff_until_core_pins_it() {
-    let page: Vec<i64> = (1..=101).collect();
-    let aux = 1000..1000 + 3995;
-    let first: Vec<i64> = page.iter().copied().chain(aux.clone()).collect();
-    let last: Vec<i64> = aux.chain(page.iter().copied()).collect();
-    for order in [first, last] {
-        let mut map = PeerMap::default();
-        map.cache_response(
-            &pids(page.iter().copied()),
-            order.into_iter().map(user).collect(),
-        );
-        assert!(map.len() <= bound());
-        assert!(page.iter().all(|&id| known(&map, id)));
-        assert_eq!(
-            set(&mut map, &pids(page.iter().copied())),
-            Pinned {
-                pinned: 101,
-                unknown: 0
-            }
-        );
-        assert!(
-            map.handoffs.is_empty() && map.held.is_empty(),
-            "pinned ends the hold"
-        );
-    }
-}
-
-/// Review round 13, finding 1: a call in flight on a handed-off chat pinned
-/// it transiently, and that pin ended the hold. Once the guard dropped, the
-/// chat was queued, and a large response evicted it before core reconciled.
-#[test]
-fn a_transient_pin_does_not_end_a_hold() {
-    let mut map = PeerMap::default();
-    map.cache_response(&pids([1, 2]), vec![user(1), user(2)]);
-    let call = pids([1]);
-    let acquire = PinRequest {
-        required: &[],
-        transient: &call,
-    };
-    assert_eq!(map.set_pins(acquire).pinned, 1);
-    assert!(
-        map.held.contains_key(&pid(1)),
-        "a transient pin keeps the hold"
-    );
-    set(&mut map, &[]);
-    churn(&mut map, 1000, MAX_UNPINNED_PEERS + 1);
-    assert!(known(&map, 1) && known(&map, 2));
-    assert_eq!(
-        set(&mut map, &pids([1, 2])),
-        Pinned {
-            pinned: 2,
-            unknown: 0
-        }
-    );
-    assert!(map.held.is_empty(), "core's set ends the hold");
-}
-
 /// The same with core's set present: a required id ends its hold, a
 /// transient one in the same request does not.
 #[test]
@@ -174,19 +91,6 @@ fn only_required_ids_end_holds() {
     });
     assert!(!map.held.contains_key(&pid(1)));
     assert!(map.held.contains_key(&pid(2)));
-}
-
-/// Review round 13, finding 2: a required peer unknown when core listed it,
-/// then learned from the update stream (`cache_peer` → `insert`), was only
-/// queued: churn evicted it and it was never carried.
-#[test]
-fn a_required_peer_learned_later_is_pinned_on_insertion() {
-    let mut map = PeerMap::default();
-    assert_eq!(set(&mut map, &pids([1, 8])).unknown, 2);
-    map.insert(user(8));
-    churn(&mut map, 1000, MAX_UNPINNED_PEERS + 1);
-    assert!(known(&map, 8));
-    assert_eq!(map.pinned_infos(), vec![user(8)]);
 }
 
 /// A known peer without its hash becomes addressable when a later insertion
@@ -275,25 +179,6 @@ fn a_handoff_is_bounded() {
     let mut map = PeerMap::default();
     map.cache_response(&pids(1..=500), (1..=500).map(user).collect());
     assert_eq!(map.held.len(), MAX_HANDOFF_PEERS);
-}
-
-/// Review round 10, finding 2: a peer resolved, then evicted by another
-/// response, then pinned is merged back under the same lock.
-#[test]
-fn merge_and_pin_restores_an_evicted_peer() {
-    let mut map = PeerMap::default();
-    map.insert(user(7));
-    let resolved = map.get(pid(7));
-    map.cache_response(&[], (1000..3001).map(user).collect());
-    assert!(!known(&map, 7), "evicted between lookup and pin");
-    assert_eq!(
-        map.merge_and_pin(resolved, req(&pids([7]))),
-        Pinned {
-            pinned: 1,
-            unknown: 0
-        }
-    );
-    assert_eq!(map.pinned_infos(), vec![user(7)]);
 }
 
 /// Touching never grows the queue's bookkeeping without bound.

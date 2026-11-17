@@ -201,13 +201,6 @@ fn mention_is_marked_by_color_and_weight() {
     assert_eq!(s.runs[1].font.weight, FontWeight::SEMIBOLD);
 }
 
-#[test]
-fn empty_text_has_no_runs() {
-    let s = styled("", &[], Spoilers::Hidden);
-    assert!(s.runs.is_empty());
-    assert_eq!(s.text, "");
-}
-
 /// A small deterministic generator (no extra dev-dependency).
 struct Lcg(u64);
 

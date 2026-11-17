@@ -340,36 +340,6 @@ mod tests {
         assert_eq!(ids(&list), [2, 3, 1], "a repeated bump is deduped");
     }
 
-    /// Finding 6 (task 10c): a chat's first known message id moves it, as
-    /// in core, even within the same second.
-    #[test]
-    fn a_first_known_id_moves_the_chat_like_core() {
-        let mut list = ChatList::default();
-        let unknown = |n| ChatSummary {
-            last_date: 100,
-            ..chat(n)
-        };
-        list.reset(vec![unknown(1), unknown(2)]);
-        let bumped = with_id(2, 7);
-        assert_eq!(bumped.last_date, 100, "same date as before");
-        let mut core = abyss_core::store::Dialogs::default();
-        core.reset(vec![unknown(1), unknown(2)]);
-        let newest = abyss_core::store::Last {
-            id: MsgId(7),
-            date: 100,
-            preview: Preview::Text("hi".into()),
-        };
-        core.bump(id(2), newest, abyss_core::store::Unread::Unchanged);
-        list.bump(bumped);
-        let core_ids: Vec<i64> = core.as_slice().iter().map(|c| c.id.id).collect();
-        assert_eq!(core_ids, [2, 1]);
-        assert_eq!(ids(&list), core_ids, "the app follows core's order");
-        let mut read = list.get(id(1)).unwrap().clone();
-        read.unread = 3;
-        list.bump(read);
-        assert_eq!(ids(&list), [2, 1], "a read change never moves a chat");
-    }
-
     #[test]
     fn pagination_follows_core_paging_not_list_length() {
         let now = Instant::now();

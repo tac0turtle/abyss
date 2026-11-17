@@ -63,38 +63,8 @@ pub struct Cache {
     /// Sum of `messages.size`, as committed.
     bytes: u64,
     budget: u64,
-    /// Tests: runs between the connection's close and the entry's release.
-    #[cfg(test)]
-    probe: Option<DropProbe>,
     /// Census entry (see `census`). Must stay the last field.
     _entry: Open,
-}
-
-/// Tests: a callback run when it is dropped.
-#[cfg(test)]
-pub(crate) struct DropProbe(Option<Box<dyn FnOnce() + Send>>);
-
-#[cfg(test)]
-impl DropProbe {
-    pub(crate) fn new(f: impl FnOnce() + Send + 'static) -> Self {
-        Self(Some(Box::new(f)))
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for DropProbe {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("DropProbe")
-    }
-}
-
-#[cfg(test)]
-impl Drop for DropProbe {
-    fn drop(&mut self) {
-        if let Some(f) = self.0.take() {
-            f();
-        }
-    }
 }
 
 fn kind_code(kind: PeerKind) -> i64 {
@@ -169,8 +139,6 @@ impl Cache {
             conn,
             bytes: to_u64(bytes),
             budget: MAX_CACHE_BYTES,
-            #[cfg(test)]
-            probe: None,
             _entry: entry,
         })
     }
@@ -272,13 +240,6 @@ impl Cache {
         drop(key);
         delete_key().map_err(EraseError::DeleteKey)?;
         super::remove_files(dir).map_err(EraseError::Files)
-    }
-
-    /// Tests: runs `probe` after the connection closes, before the census
-    /// entry is released.
-    #[cfg(test)]
-    pub(crate) fn set_drop_probe(&mut self, probe: DropProbe) {
-        self.probe = Some(probe);
     }
 
     #[cfg(test)]

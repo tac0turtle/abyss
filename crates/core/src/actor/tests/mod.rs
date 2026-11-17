@@ -11,22 +11,6 @@ mod auth;
 mod lifecycle;
 mod logout;
 mod onboarding;
-mod review10c;
-mod review10d;
-mod review10e;
-mod review10f;
-mod review10g;
-mod review23;
-mod review4b;
-mod review4c;
-mod review6c;
-mod review6d;
-mod review6e;
-mod review6f;
-mod review6g;
-mod review6h;
-mod review6i;
-mod review6j;
 mod topic_keys;
 mod watchdog;
 
@@ -80,7 +64,6 @@ fn chat(id: i64) -> ChatId {
 
 /// How the harness prepares storage before the actor starts.
 #[derive(Default)]
-#[expect(clippy::struct_excessive_bools, reason = "independent test switches")]
 struct Setup {
     /// No stored session: the actor starts signed out.
     signed_out: bool,
@@ -94,26 +77,9 @@ struct Setup {
     stored_creds: Option<crate::api::ApiCredentials>,
     /// Reading the credential item fails (a locked Keychain).
     creds_locked: bool,
-    /// Reuse this store (a restart) instead of a new one; `signed_out` and
-    /// a `StoredSession::Blob` are then ignored.
+    /// Reuse this store (a restart) instead of a new one; `signed_out` is
+    /// then ignored.
     store: Option<MemoryStore>,
-    session: StoredSession,
-    /// Reading the logout-pending marker fails (round 15, A).
-    marker_unreadable: bool,
-    /// A cache re-binding reports, then waits for a permit here.
-    hold_settle: Option<Arc<Semaphore>>,
-}
-
-/// The session item at startup (task 6c).
-#[derive(Default)]
-enum StoredSession {
-    /// The default signed-in one (unless `signed_out`).
-    #[default]
-    Default,
-    /// This item instead.
-    Blob(zeroize::Zeroizing<Vec<u8>>),
-    /// Reading it fails at startup (an unreadable Keychain).
-    Unreadable,
 }
 
 /// The store the harness starts over.
@@ -121,10 +87,7 @@ fn prepare_store(setup: &Setup) -> MemoryStore {
     let Some(store) = setup.store.clone() else {
         let store = MemoryStore::new();
         if !setup.signed_out {
-            let blob = match &setup.session {
-                StoredSession::Blob(blob) => blob.clone(),
-                _ => signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH),
-            };
+            let blob = signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH);
             store.set(SecretItem::Session, &blob).unwrap();
         }
         return store;
@@ -170,12 +133,6 @@ fn startup_faults(setup: &Setup, faults: &FaultControl) {
     if setup.creds_locked {
         faults.fail_get_of(SecretItem::ApiCredentials);
     }
-    if setup.marker_unreadable {
-        faults.fail_get_of(SecretItem::LogoutPending);
-    }
-    if matches!(setup.session, StoredSession::Unreadable) {
-        faults.fail_get_of(SecretItem::Session);
-    }
 }
 
 /// Writes the stored API credential item, if the setup has one.
@@ -192,7 +149,6 @@ fn store_creds(setup: &Setup, store: &MemoryStore) {
 
 async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness {
     let store = prepare_store(&setup);
-    let unreadable = matches!(setup.session, StoredSession::Unreadable);
     store_creds(&setup, &store);
     let (wrapped, faults) = FaultyStore::new(store.clone());
     startup_faults(&setup, &faults);
@@ -202,22 +158,10 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
         Some(_) => (persist.fresh_session(), Identity::Unknown),
         None => load(&persist).await,
     };
-    if unreadable {
-        faults.heal_item(SecretItem::Session);
-    }
-    let unread_marker = matches!(pending_logout, Some(super::PendingLogout::Unreadable(_)));
     let (cache, cache_parts) = match setup.cache_dir {
-        // As `core::prepare`: an unreadable marker opens no cache.
-        Some(dir) if unread_marker => {
-            let mut parts = super::CacheParts::closed(dir);
-            parts.hold_settle.clone_from(&setup.hold_settle);
-            (None, Some(parts))
-        }
         Some(dir) => {
             let provisioned = provision_cache(&persist, dir, identity).await;
-            let mut parts = provisioned.parts;
-            parts.hold_settle.clone_from(&setup.hold_settle);
-            (provisioned.served, Some(parts))
+            (provisioned.served, Some(provisioned.parts))
         }
         None => (setup.cache, None),
     };

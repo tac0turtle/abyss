@@ -76,9 +76,6 @@ pub(crate) enum CacheCmd {
     /// Closes the database after all queued commands, then stops the worker;
     /// replies once the connection is closed.
     Close(oneshot::Sender<()>),
-    /// Tests: installs the probe on the cache, then panics on the worker.
-    #[cfg(test)]
-    Panic(super::db::DropProbe),
 }
 
 /// Async handle to the worker. Cloneable; the worker exits when all handles drop
@@ -89,39 +86,6 @@ pub struct CacheHandle {
     /// The worker thread, joined by `close` and `erase` once it has
     /// replied, so the thread has ended before shutdown carries on.
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    /// Tests: older-history reads wait here for a permit.
-    #[cfg(all(test, feature = "fake"))]
-    gate: Option<std::sync::Arc<ReadGate>>,
-}
-
-/// Holds older-history reads (`CacheHandle::before`) until a test lets
-/// each one through, so a test can change the window while one is out.
-#[cfg(all(test, feature = "fake"))]
-#[derive(Debug)]
-pub(crate) struct ReadGate {
-    permits: tokio::sync::Semaphore,
-    entered: std::sync::atomic::AtomicUsize,
-}
-
-#[cfg(all(test, feature = "fake"))]
-impl ReadGate {
-    /// Lets one waiting (or the next) read through.
-    pub(crate) fn release(&self) {
-        self.permits.add_permits(1);
-    }
-
-    /// Reads that reached the gate so far.
-    pub(crate) fn entered(&self) -> usize {
-        self.entered.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    async fn pass(&self) {
-        self.entered
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(permit) = self.permits.acquire().await {
-            permit.forget();
-        }
-    }
 }
 
 impl std::fmt::Debug for CacheCmd {
@@ -155,21 +119,7 @@ impl CacheHandle {
         Ok(CacheHandle {
             tx,
             worker: Arc::new(Mutex::new(Some(worker))),
-            #[cfg(all(test, feature = "fake"))]
-            gate: None,
         })
-    }
-
-    /// Tests: holds this handle's (and its later clones') older-history
-    /// reads at the returned gate.
-    #[cfg(all(test, feature = "fake"))]
-    pub(crate) fn gate_older_reads(&mut self) -> std::sync::Arc<ReadGate> {
-        let gate = std::sync::Arc::new(ReadGate {
-            permits: tokio::sync::Semaphore::new(0),
-            entered: std::sync::atomic::AtomicUsize::new(0),
-        });
-        self.gate = Some(std::sync::Arc::clone(&gate));
-        gate
     }
 
     async fn send(&self, cmd: CacheCmd) -> Result<(), WorkerError> {
@@ -209,10 +159,6 @@ impl CacheHandle {
         id: MsgId,
         limit: u32,
     ) -> Result<Vec<Message>, WorkerError> {
-        #[cfg(all(test, feature = "fake"))]
-        if let Some(gate) = &self.gate {
-            gate.pass().await;
-        }
         self.ask(|reply| CacheCmd::Before {
             thread,
             id,
@@ -272,12 +218,6 @@ impl CacheHandle {
             // A worker that panicked has nothing left to report.
             let _ = tokio::task::spawn_blocking(move || worker.join()).await;
         }
-    }
-
-    /// Tests: makes the worker panic while it handles a command.
-    #[cfg(test)]
-    pub(crate) async fn panic_worker(&self, probe: super::db::DropProbe) {
-        let _ = self.send(CacheCmd::Panic(probe)).await;
     }
 
     /// Crypto-erases the cache after all queued commands, then stops the worker.
@@ -436,11 +376,6 @@ fn handle(cache: &mut Cache, cmd: CacheCmd) {
         CacheCmd::Erase { reply, .. } => drop(reply.send(Err(EraseFailure::Stopped))),
         // Unreachable: `run` intercepts Close. Dropping the reply says "stopped".
         CacheCmd::Close(reply) => drop(reply),
-        #[cfg(test)]
-        CacheCmd::Panic(probe) => {
-            cache.set_drop_probe(probe);
-            panic!("injected cache worker panic");
-        }
     }
 }
 

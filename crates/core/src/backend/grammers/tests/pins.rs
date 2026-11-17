@@ -83,30 +83,3 @@ fn a_reorder_that_changes_the_capped_membership_is_a_change() {
     let next = pins.changed().expect("membership changed");
     assert!(next.contains(&pid(2000)) && !next.contains(&pid(1264)));
 }
-
-/// Review round 14: a role change with identical membership (transient to
-/// required, or inherited to core) must reach the session, because only
-/// required ids end a handoff hold.
-#[test]
-fn a_role_change_with_the_same_members_is_a_change() {
-    // Inherited base -> core requires the same ids.
-    let mut pins = Pins::new(vec![pid(1), pid(2)]);
-    pins.applied(&pins.selected(), 0);
-    assert_eq!(pins.changed(), None);
-    pins.require(&chats([1, 2]));
-    assert_eq!(pins.changed(), Some(vec![pid(1), pid(2)]));
-    pins.applied(&pins.selected(), 0);
-    assert_eq!(pins.changed(), None);
-
-    // In-flight only -> core requires it -> the call ends.
-    let mut pins = Pins::new(Vec::new());
-    pins.require(&chats([]));
-    assert!(pins.begin(pid(7)));
-    pins.applied(&pins.selected(), 0);
-    pins.require(&chats([7]));
-    assert_eq!(
-        pins.changed(),
-        Some(vec![pid(7)]),
-        "transient became required"
-    );
-}

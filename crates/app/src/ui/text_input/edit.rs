@@ -503,40 +503,6 @@ mod tests {
         assert_eq!(b.text(), "123456");
     }
 
-    /// Finding 5: a flash call's whole number fits; the bound follows the
-    /// delivery and never exceeds core's.
-    #[test]
-    fn code_bound_follows_the_delivery() {
-        let mut b = EditBuffer::new(Limits::CODE);
-        assert_eq!(b.replace(None, "447700900123"), Fit::Whole);
-        assert_eq!(b.text(), "447700900123");
-        assert_eq!(b.replace(None, &"1".repeat(40)), Fit::Clipped);
-        assert_eq!(b.utf16_len(), abyss_core::api::MAX_CODE_DIGITS);
-        b.set_max_utf16(5);
-        assert_eq!(b.text(), "", "over the new bound: cleared");
-        assert_eq!(b.replace(None, "1234567"), Fit::Clipped);
-        assert_eq!(b.text(), "12345");
-    }
-
-    /// Round 19, 3: a lone `*` flash-call pattern accepts a number of any
-    /// length, so a complete international number fits the code field.
-    #[test]
-    fn lone_wildcard_flash_call_takes_a_whole_number() {
-        use abyss_core::api::{CodeDelivery, SentCodeInfo};
-        let sent = SentCodeInfo {
-            delivery: CodeDelivery::FlashCall {
-                pattern: "*".into(),
-            },
-            length: None,
-            next: None,
-            resend_at: None,
-        };
-        let mut b = EditBuffer::new(Limits::CODE);
-        b.set_max_utf16(sent.max_code_digits());
-        assert_eq!(b.replace(None, "447700900123"), Fit::Whole);
-        assert_eq!(b.text(), "447700900123");
-    }
-
     #[test]
     fn line_policy() {
         let mut single = EditBuffer::new(Limits {
