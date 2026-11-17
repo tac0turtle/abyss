@@ -41,6 +41,9 @@ pub(crate) enum CacheCmd {
         from: Option<MsgId>,
     },
     Delete(ChatId, Vec<MsgId>),
+    /// Every cached message of a chat (its forum flag changed, so its
+    /// thread keys changed meaning).
+    DeleteChat(ChatId),
     DeleteUnscoped(Vec<MsgId>),
     Touch(ChatId),
     Chats(Reply<Vec<ChatSummary>>),
@@ -354,6 +357,7 @@ fn handle(cache: &mut Cache, cmd: CacheCmd) {
         }
         CacheCmd::Delete(chat, ids) => drop(cache.delete_messages(chat, &ids)),
         CacheCmd::DeleteUnscoped(ids) => drop(cache.delete_unscoped(&ids)),
+        CacheCmd::DeleteChat(chat) => drop(cache.delete_chat_messages(chat)),
         CacheCmd::Touch(chat) => drop(cache.touch(chat)),
         CacheCmd::Chats(reply) => drop(reply.send(cache.chats())),
         CacheCmd::Tail {

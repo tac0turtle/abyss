@@ -52,6 +52,19 @@ fn required(
 }
 
 impl<B: Backend> Actor<B> {
+    /// The required peer set now: pending sends, windows (most recent
+    /// first), retained dialogs; deduplicated, at most `MAX_PINNED_PEERS`.
+    /// It also bounds the kind checks (`fences`).
+    pub(super) fn required_peers(&self) -> Vec<ChatId> {
+        let mut windows: Vec<ChatId> = self.windows.threads().map(|t| t.chat).collect();
+        windows.reverse();
+        required(
+            self.sends.chats(),
+            windows.into_iter(),
+            self.dialogs.as_slice().iter().map(|c| c.id),
+        )
+    }
+
     /// Hands the live instance the current required peer set if it changed.
     pub(super) fn sync_peers(&mut self) {
         let Some(live) = self.live.as_ref() else {
@@ -68,13 +81,7 @@ impl<B: Backend> Actor<B> {
         }
         let new_instance = self.peers.inputs.is_none_or(|i| i.cgen != inputs.cgen);
         self.peers.inputs = Some(inputs);
-        let mut windows: Vec<ChatId> = self.windows.threads().map(|t| t.chat).collect();
-        windows.reverse();
-        let set = required(
-            self.sends.chats(),
-            windows.into_iter(),
-            self.dialogs.as_slice().iter().map(|c| c.id),
-        );
+        let set = self.required_peers();
         if new_instance || set != self.peers.last {
             live.client.retain_peers(&set);
             self.peers.last = set;

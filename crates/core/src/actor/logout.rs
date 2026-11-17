@@ -515,6 +515,10 @@ impl<B: Backend> Actor<B> {
         self.dialogs = crate::store::Dialogs::default();
         self.windows = crate::store::Windows::default();
         self.topics = super::topics::TopicLists::default();
+        self.badges = crate::store::Badges::default();
+        self.peer = crate::store::PeerScheduler::default();
+        self.fences.clear();
+        self.members = None;
         self.open = None;
         self.viewing = None;
         // Loads of the old account's views owe the UI nothing (round 20).

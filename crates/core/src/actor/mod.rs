@@ -6,9 +6,11 @@ mod admission;
 mod apply;
 mod auth;
 mod auth_outcome;
+mod badges;
 mod binding;
 mod boot;
 mod covered;
+mod fences;
 mod folder_writes;
 mod jobs;
 mod lifecycle;
@@ -53,9 +55,11 @@ use crate::backend::{Backend, DialogsCursor, HistoryQuery, StreamItem};
 use crate::cache::CacheHandle;
 use crate::core::ShutdownReport;
 use crate::events::EventSender;
-use crate::model::{FolderEdit, MsgId, ThreadKey};
+use crate::model::{ChatId, FolderEdit, MsgId, ThreadKey};
 use crate::session::{PersistHandle, SessionSnapshot};
-use crate::store::{Dialogs, DialogsSeq, MAX_DIALOGS, ViewGen, Window, Windows};
+use crate::store::{
+    Badges, Dialogs, KindChecks, MAX_DIALOGS, PeerScheduler, ViewGen, Window, Windows,
+};
 
 /// Shutdown's deadline for retirement and the persistence seal, counted from
 /// its start (plan section 5).
@@ -171,6 +175,14 @@ pub(crate) struct Actor<B: Backend> {
     topics: topics::TopicLists,
     /// The kind last stated for each chat with a retained view (`threads`).
     forum_kinds: threads::KnownKinds,
+    /// Forum badge stamps and dirty bits, one per retained dialog (`badges`).
+    badges: Badges,
+    /// The account's `peer_dialogs` scheduler (`badges`).
+    peer: PeerScheduler,
+    /// The kind-check FIFO and the fenced chats (`fences`).
+    fences: KindChecks,
+    /// The revisions the last membership pass saw (`fences`).
+    members: Option<fences::Members>,
     /// Highest displayed id per thread, flushed every `READ_FLUSH`.
     reads: HashMap<ThreadKey, MsgId>,
     sends: sends::PendingSends,
@@ -261,6 +273,10 @@ impl<B: Backend> Actor<B> {
             peers: peers::PeerSync::default(),
             topics: topics::TopicLists::default(),
             forum_kinds: threads::KnownKinds::default(),
+            badges: Badges::default(),
+            peer: PeerScheduler::default(),
+            fences: KindChecks::default(),
+            members: None,
             reads: HashMap::new(),
             sends: sends::PendingSends::default(),
             deadline: CALL_DEADLINE,
@@ -294,6 +310,7 @@ impl<B: Backend> Actor<B> {
             let refresh_at = self.refresh_due();
             let flood_over = self.auth.flood_deadline();
             let topics_at = self.topics_wake();
+            let peer_at = self.peer_wake();
             // Paused while a logout hides the account (`paused`).
             let send_due = self
                 .sends
@@ -324,6 +341,8 @@ impl<B: Backend> Actor<B> {
                 () = sleep_until(send_due) => self.resume_flooded_sends().await,
                 // `pump_topics` below dispatches what became due.
                 () = sleep_until(topics_at) => {}
+                // So does `pump_peer_dialogs`.
+                () = sleep_until(peer_at) => {}
                 _ = flush.tick() => self.flush_reads().await,
             }
             // User loads first; background coverage only when idle.
@@ -332,6 +351,13 @@ impl<B: Backend> Actor<B> {
             debug_assert!(self.owed_is_current(), "owed load of an old view");
             debug_assert!(self.open_is_retained(), "open chat without its window");
             self.pump_topics().await;
+            self.sync_members().await;
+            #[cfg(test)]
+            debug_assert!(
+                self.kind_checks_within_required(),
+                "kind checks outside the required peers"
+            );
+            self.pump_peer_dialogs();
             self.pump();
             self.sync_peers();
         }
@@ -456,7 +482,14 @@ impl<B: Backend> Actor<B> {
         // queued before it began stays queued (in order, the queue still
         // bounded) while other jobs pass it.
         let held = self.topics.flooded();
-        let admissible = |job: &Job| !(held && job.is_topics());
+        // Work of a fenced chat waits too (its fence purged what was queued
+        // when it started; this holds anything since, without blocking
+        // other jobs).
+        // Usually empty; at most the required peers.
+        let fenced: Vec<ChatId> = self.fences.fenced().collect();
+        let admissible = |job: &Job| {
+            !(held && job.is_topics()) && job.fenced_chat().is_none_or(|c| !fenced.contains(&c))
+        };
         loop {
             let first = |q: &VecDeque<Job>| q.iter().position(admissible);
             let (queue, at) = match (first(&self.priority), first(&self.queue)) {
@@ -470,8 +503,16 @@ impl<B: Backend> Actor<B> {
             let Some(mut job) = queue.remove(at) else {
                 return;
             };
-            if let Job::Dialogs { seq, .. } = &mut job {
-                *seq = self.dialogs.dispatch();
+            match &mut job {
+                Job::Dialogs { stamps, .. } => stamps.badge = self.badges.dispatch(),
+                // Its dispatch: the badge stamp and the call interval count
+                // from admission, not from planning.
+                Job::PeerDialogs { chats, stamps } => {
+                    let now = Instant::now().into_std();
+                    stamps.badge = self.peer.dispatched(now, chats, &mut self.badges);
+                    self.fences.stamp_flight(stamps.badge);
+                }
+                _ => {}
             }
             let ctx = CallCtx {
                 client: Arc::clone(&live.client),
@@ -514,6 +555,7 @@ impl<B: Backend> Actor<B> {
                 Job::TopicsPage { call, .. } | Job::TopicsById { call, .. } => {
                     self.topics_job_purged(call);
                 }
+                Job::PeerDialogs { .. } => self.peer_job_dropped(),
                 Job::Send { .. } | Job::Read { .. } | Job::Folders(_) => {}
             }
         }
@@ -600,6 +642,7 @@ impl<B: Backend> Actor<B> {
             Some(TaskKind::TopicsById(call)) => {
                 self.topics_call_panicked(call, topics::Fetch::ById).await;
             }
+            Some(TaskKind::PeerDialogs(stamp)) => self.peer_call_panicked(stamp).await,
             Some(TaskKind::Updates) => {
                 self.error(UserError::Internal).await;
                 return self.rebuild(Reason::StreamFailed).await;
@@ -730,8 +773,8 @@ impl<B: Backend> Actor<B> {
         } else {
             None
         };
-        let seq = DialogsSeq::default();
-        if self.enqueue(Job::Dialogs { cursor, seq }).await {
+        let stamps = jobs::Stamps::default();
+        if self.enqueue(Job::Dialogs { cursor, stamps }).await {
             self.dialogs_busy = true;
         } else {
             self.load_ended(LoadTarget::Dialogs, Some(UserError::Busy))
@@ -761,6 +804,10 @@ impl<B: Backend> Actor<B> {
         let prev = self.open.replace(thread);
         self.follow_open_thread(prev).await;
         self.seed_view(thread, view).await;
+        if self.is_fenced(thread.chat) {
+            // The fence's lift loads the open thread's tail (`fences`).
+            return;
+        }
         let load = self.begin_load(thread, view);
         self.claim_if_booting(load);
         if let Some(cache) = &self.cache {
@@ -851,6 +898,9 @@ impl<B: Backend> Actor<B> {
         if self.open != Some(thread) {
             return self.history_ended(thread, dir, None).await;
         }
+        if self.is_fenced(thread.chat) {
+            return self.defer_fenced(asked).await;
+        }
         if dir == HistoryDir::Older && self.absorb_older(thread, restarts) {
             return; // the covering fetch running answers it
         }
@@ -915,7 +965,12 @@ impl<B: Backend> Actor<B> {
         }
         let entry = self.reads.entry(thread).or_insert(max_id);
         *entry = (*entry).max(max_id);
-        if let Some(summary) = self.dialogs.set_unread(thread.chat, 0).cloned() {
+        // A forum's badge is the server's only (plan section 7).
+        if self.is_forum(thread.chat) {
+            return;
+        }
+        let now = self.badges.now();
+        if let Some(summary) = self.dialogs.set_unread(thread.chat, 0, now).cloned() {
             self.emit(Event::ChatBumped(summary)).await;
         }
     }

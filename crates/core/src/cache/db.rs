@@ -628,6 +628,21 @@ impl Cache {
         self.write(|tx, bytes| Ok(((), delete_ids(tx, chat, ids, bytes)?)))
     }
 
+    /// Deletes every cached message of `chat`, whatever its thread.
+    pub fn delete_chat_messages(&mut self, chat: ChatId) -> Result<(), CacheError> {
+        self.write(|tx, bytes| {
+            let mut stmt = tx.prepare_cached(
+                "DELETE FROM messages WHERE kind = ?1 AND chat = ?2 RETURNING size",
+            )?;
+            let mut rows = stmt.query(params![kind_code(chat.kind), chat.id])?;
+            let mut bytes = bytes;
+            while let Some(row) = rows.next()? {
+                bytes = bytes.saturating_sub(to_u64(row.get(0)?));
+            }
+            Ok(((), bytes))
+        })
+    }
+
     /// Deletion without a chat (private chats and basic groups, whose ids are
     /// account-unique). Returns what was deleted, grouped by chat.
     pub fn delete_unscoped(

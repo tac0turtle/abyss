@@ -27,6 +27,35 @@ impl FakeHandle {
         });
     }
 
+    /// `peer_dialogs` calls as they reached the server, oldest first.
+    pub fn peer_calls(&self) -> Vec<super::super::PeerCallRecord> {
+        self.shared.with(|s| s.peer_log.clone())
+    }
+
+    /// The topic is read up to `max_id` on another device: the server's
+    /// read mark moves, and `ReadTopicMax` is emitted
+    /// (`updateReadChannelDiscussionInbox`).
+    pub async fn read_remotely(
+        &self,
+        thread: ThreadKey,
+        max_id: MsgId,
+    ) -> Result<(), BackendError> {
+        let topic = thread.topic.ok_or(rejected(RejectReason::Other))?;
+        self.shared.with(|s| {
+            let snap =
+                stored_mut(s, thread.chat, topic).ok_or(rejected(RejectReason::TopicDeleted))?;
+            snap.topic.read_inbox_max = snap.topic.read_inbox_max.max(max_id);
+            Ok::<(), BackendError>(())
+        })?;
+        self.push_update(Update::ReadTopicMax {
+            chat: thread.chat,
+            topic,
+            max_id,
+        })
+        .await;
+        Ok(())
+    }
+
     /// Topics calls as they reached the server, oldest first.
     pub fn topics_calls(&self) -> Vec<super::super::TopicsCallRecord> {
         self.shared.with(|s| s.topics_log.clone())

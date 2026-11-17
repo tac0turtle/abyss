@@ -1,6 +1,7 @@
-//! The forum badge (plan section 7): set only from authoritative sources,
-//! ordered by one actor-wide dispatch clock, refreshed through dirty stamps
-//! that are never dropped.
+//! The forum badge (plan section 7): the actor-wide dispatch clock and the
+//! dirty stamps that refresh a forum's count, which are never dropped. The
+//! count itself is a dialog row field, ordered by the same clock
+//! (`dialogs::fields`).
 
 mod batch;
 #[cfg(test)]
@@ -11,33 +12,21 @@ use std::time::Instant;
 
 pub use batch::{
     CURSOR_SLOTS, KIND_SLOTS, MAX_PEER_DIALOGS, PEER_CALL_INTERVAL, PEER_REFRESH_INTERVAL,
-    PeerBatch, PeerScheduler, SHOWN_SLOTS,
+    PeerBatch, PeerScheduler, Reserved, SHOWN_SLOTS,
 };
 
 use crate::model::ChatId;
 
-/// The badge clock: advanced at every dialogs or `peer_dialogs` dispatch and
-/// at every chat-level read update applied.
+/// The badge clock: advanced at every dialogs or `peer_dialogs` dispatch.
+/// Dialog row fields are stamped on it too.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BadgeSeq(u64);
 
-/// Where a badge value came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BadgeSource {
-    /// A dialogs page containing the chat, or a `peer_dialogs` result:
-    /// stamped with its dispatch. Clears a dirty stamp older than it.
-    Fetched(BadgeSeq),
-    /// A chat-level read update (`ReadInbox { topic: None }`), stamped when
-    /// applied. Doesn't clear a dirty stamp.
-    ChatRead,
-}
-
-/// Whether to show a source's value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Offer {
-    Apply,
-    /// The shown value comes from a source dispatched later.
-    Ignore,
+#[cfg(test)]
+impl BadgeSeq {
+    pub(crate) fn at(n: u64) -> Self {
+        Self(n)
+    }
 }
 
 /// Inline bytes of one chat's badge state, for the memory-bound test.
@@ -46,8 +35,6 @@ pub(crate) const CHAT_BADGE_BYTES: usize = std::mem::size_of::<ChatBadge>();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ChatBadge {
-    /// The stamp of the source of the value shown.
-    shown: BadgeSeq,
     /// Set by a trigger to the clock's value then; `None` when clean.
     dirty: Option<BadgeSeq>,
     /// When the chat last went out in a `peer_dialogs` call.
@@ -81,6 +68,27 @@ impl Badges {
         self.chats.is_empty()
     }
 
+    /// The clock's value now: what a trigger made now records.
+    pub fn now(&self) -> BadgeSeq {
+        self.seq
+    }
+
+    /// Whether `chat` is tracked (a retained dialog).
+    pub fn tracks(&self, chat: ChatId) -> bool {
+        self.chats.contains_key(&chat)
+    }
+
+    /// A fetched result for `chat` dispatched at `stamp` (whatever it said,
+    /// and whether its value was taken): it clears a dirty stamp older than
+    /// it.
+    pub fn settle(&mut self, chat: ChatId, stamp: BadgeSeq) {
+        if let Some(badge) = self.chats.get_mut(&chat)
+            && badge.dirty.is_some_and(|d| stamp > d)
+        {
+            badge.dirty = None;
+        }
+    }
+
     /// Stamps a dialogs or `peer_dialogs` dispatch.
     pub fn dispatch(&mut self) -> BadgeSeq {
         self.seq = BadgeSeq(self.seq.0.saturating_add(1));
@@ -107,28 +115,6 @@ impl Badges {
             .iter()
             .filter(|(_, b)| b.dirty.is_some())
             .map(|(c, _)| *c)
-    }
-
-    /// Offers a value for a tracked chat's badge. It is shown only if its
-    /// stamp is newer than the shown value's. A fetched result dispatched
-    /// after the dirty stamp also clears it.
-    pub fn offer(&mut self, chat: ChatId, source: BadgeSource) -> Offer {
-        let stamp = match source {
-            BadgeSource::Fetched(stamp) => stamp,
-            BadgeSource::ChatRead => self.dispatch(),
-        };
-        let Some(badge) = self.chats.get_mut(&chat) else {
-            return Offer::Ignore;
-        };
-        if matches!(source, BadgeSource::Fetched(_)) && badge.dirty.is_some_and(|d| stamp > d) {
-            badge.dirty = None;
-        }
-        if stamp > badge.shown {
-            badge.shown = stamp;
-            Offer::Apply
-        } else {
-            Offer::Ignore
-        }
     }
 
     /// Whether `chat` may go out in a call now: dirty, and not sent within

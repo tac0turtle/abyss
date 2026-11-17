@@ -19,9 +19,7 @@ use crate::model::{
     ChatFolder, ChatId, ChatSummary, FolderEdit, LocalId, Message, MsgId, PeerFolder, ThreadKey,
     TopicId,
 };
-use crate::store::{
-    ContinuityMark, DialogsSeq, FetchSeq, PageKind, TOPICS_PAGE, TopicsGen, ViewGen,
-};
+use crate::store::{BadgeSeq, ContinuityMark, FetchSeq, PageKind, TOPICS_PAGE, TopicsGen, ViewGen};
 
 /// Messages per history page (server and cache).
 pub(super) const PAGE: u32 = 50;
@@ -60,13 +58,29 @@ pub(super) struct TopicsCall {
     pub(super) seq: FetchSeq,
 }
 
+/// A dialog snapshot's dispatch stamp (dialogs pages and `peer_dialogs`)
+/// on the badge clock, taken at admission; default until then. Dialog row
+/// fields and badge dirty stamps are ordered by it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Stamps {
+    pub(super) badge: BadgeSeq,
+}
+
 /// A backend call waiting for admission.
 #[derive(Debug)]
 pub(super) enum Job {
     Dialogs {
         cursor: Option<DialogsCursor>,
-        /// Taken at dispatch (`Dialogs::dispatch`); the default until then.
-        seq: DialogsSeq,
+        /// Taken at admission (`Badges::dispatch`).
+        stamps: Stamps,
+    },
+    /// One `peer_dialogs` call: kind checks and badge refreshes (plan
+    /// sections 6.6, 7). At most `MAX_PEER_DIALOGS` chats.
+    PeerDialogs {
+        chats: Vec<ChatId>,
+        /// The badge stamp is the scheduler's; the folder stamp is taken at
+        /// admission.
+        stamps: Stamps,
     },
     History {
         load: Load,
@@ -133,6 +147,16 @@ impl FolderJob {
 }
 
 impl Job {
+    /// The chat whose fence holds this job: a history load or a send
+    /// (plan section 6.6).
+    pub(super) fn fenced_chat(&self) -> Option<ChatId> {
+        match self {
+            Job::History { load, .. } => Some(load.thread.chat),
+            Job::Send { thread, .. } => Some(thread.chat),
+            _ => None,
+        }
+    }
+
     /// A topics call, which waits out a topics flood wait.
     pub(super) fn is_topics(&self) -> bool {
         matches!(self, Job::TopicsPage { .. } | Job::TopicsById { .. })
@@ -171,8 +195,13 @@ pub(super) enum StreamEnd {
 pub(super) enum Outcome {
     Dialogs {
         step: DialogsStep,
-        seq: DialogsSeq,
+        stamps: Stamps,
         res: CallResult<DialogsPage>,
+    },
+    PeerDialogs {
+        chats: Vec<ChatId>,
+        stamps: Stamps,
+        res: CallResult<Vec<ChatSummary>>,
     },
     History {
         load: Load,
@@ -238,6 +267,8 @@ pub(super) enum TaskKind {
     Read,
     TopicsPage(TopicsCall),
     TopicsById(TopicsCall),
+    /// A `peer_dialogs` call, by its badge stamp.
+    PeerDialogs(BadgeSeq),
     ChatFolders,
     /// An archive move or a folder change, by write id.
     FolderWrite(u64),
@@ -323,7 +354,8 @@ pub(super) fn job_future<C: Client>(
         cancel,
     };
     match job {
-        Job::Dialogs { cursor, seq } => dialogs(client, admitted, cursor, seq),
+        Job::Dialogs { cursor, stamps } => dialogs(client, admitted, cursor, stamps),
+        Job::PeerDialogs { chats, stamps } => peer_dialogs(client, admitted, chats, stamps),
         Job::History {
             load,
             dir,
@@ -442,11 +474,25 @@ fn topics_by_id<C: Client>(
     (TaskKind::TopicsById(call), Box::pin(fut))
 }
 
+fn peer_dialogs<C: Client>(
+    client: Arc<C>,
+    admitted: Admitted,
+    chats: Vec<ChatId>,
+    stamps: Stamps,
+) -> (TaskKind, DoneFuture) {
+    // At most `MAX_PEER_DIALOGS` ids: the call borrows its own copy, and
+    // the outcome carries the list back.
+    let asked = chats.clone();
+    let call = async move { client.peer_dialogs(&asked).await };
+    let fut = admitted.run(call, move |res| Outcome::PeerDialogs { chats, stamps, res });
+    (TaskKind::PeerDialogs(stamps.badge), Box::pin(fut))
+}
+
 fn dialogs<C: Client>(
     client: Arc<C>,
     admitted: Admitted,
     cursor: Option<DialogsCursor>,
-    seq: DialogsSeq,
+    stamps: Stamps,
 ) -> (TaskKind, DoneFuture) {
     let step = if cursor.is_none() {
         DialogsStep::First
@@ -454,7 +500,7 @@ fn dialogs<C: Client>(
         DialogsStep::Next
     };
     let call = async move { client.dialogs(cursor, DIALOGS_PAGE).await };
-    let fut = admitted.run(call, move |res| Outcome::Dialogs { step, seq, res });
+    let fut = admitted.run(call, move |res| Outcome::Dialogs { step, stamps, res });
     (TaskKind::Dialogs, Box::pin(fut))
 }
 

@@ -394,7 +394,7 @@ For every `NewMessage` and `Edited`, core runs `route` first (section 3). New me
 
 **Edit** (`Route::Thread(key)`):
 - **Window and cache.** The Stage 1 replacement-only path, re-keyed. The message replaces its copy only if it is in a window and is not older than the stored copy (`has_newer_copy`, the `Message::version` check). It is written to the cache under the continuity gate. An edit never inserts a message.
-- **Topic list.** An edit never touches unread or order, and never touches the chat summary. It updates the topic's preview only when the edited message is the topic's current top message (`id == last_id`) and its version is newer than `last_version` (a live activity change). An edit of any older message leaves the topic alone.
+- **Topic list.** An edit never touches unread or order, and never touches the chat summary. It updates the topic's preview only when the edited message is the topic's current top message (`id == last_id`) and its version is newer than `last_version` (a live activity change). An edit of any older message leaves the topic alone, except while the topic's activity is unsettled (a live change, such as its top message's deletion, waits for a refetch): the client doesn't know the real top message then, so an edit of another message is a live activity change too (the preview is untouched), and a snapshot dispatched before it conflicts instead of settling a stale preview (task 8 review).
 
 **Deletions.**
 - `Deleted { chat, ids }` removes the ids from every window and the cache (section 6.2).
@@ -1109,3 +1109,14 @@ Follow-ups (not Stage 2 tasks):
 | 2 (pass) | P3: the continuity clock could wrap | Saturating clock; restoration refused once exhausted |
 
 **Dependency for task 8 (from this review):** after a loss of continuity nothing re-requests the tail, so an open window can stay non-contiguous and live messages stay uncached until the next tail. Task 8's fence lift must invalidate and reload the affected open windows (already in its spec); its tests must assert continuity is restored afterwards.
+
+### Task 8: live routing, forum badge, forum flag (6 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 | P2: `peer_dialogs` interval started at planning, not admission; retired-check results still applied; a provisional kind survived abandonment; queued history/sends bypassed a new fence | Reserve vs dispatch split; retired chats filtered from results; kind committed only at settlement; fence entry unqueues history (answered) and holds sends; admission skips fenced jobs |
+| 2 | P2: a kind stated during a check was discarded; settled kind not persisted; non-forum summaries never cleared badge dirty stamps | Fence keeps the newest authoritative statement; `PutChats` after a changed commit; non-forum results settle dirty stamps |
+| 3 | P2 (one class): older snapshots from one source overwrote newer ones from another (kind after settlement, folder via a cleared move record, unread via a non-forum snapshot) | Per-field accepted stamps (kind, folder, unread) on each row on one shared dispatch clock; every snapshot source passes `Dialogs::guard`; replaced `DialogsSeq`, the move-record map, `Badges::offer` and `keep_fenced_kind` |
+| 4 | P2: unlisted chats kept a stamp without its value | Unlisted records keep (value, stamp) pairs until admission; independent source-log reference model with membership transitions |
+| 5 | P2: eviction during `guard()` bypassed the cutoff; `commit_kind` stamped only listed chats | Room made before checking, never evicting chats the response lists; unlisted records carry committed kinds |
+| 6 | Pass | Also fixed: a task 2 store bug found by `merge_policy` (an edit while a topic's activity is unsettled now counts as a live change; §6.3 amended; seed kept in proptest-regressions). Notes: `guard()` relies on callers' input bounds (≤ 1,000); continuous edits can keep a topic due with 30 s backoff |

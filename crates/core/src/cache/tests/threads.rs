@@ -163,6 +163,21 @@ fn reconcile_range_spares_sibling_topics() {
     );
 }
 
+/// Section 6.6: a forum flag change deletes every cached message of the
+/// chat, whatever its thread, and no other chat's.
+#[test]
+fn deleting_a_chat_takes_every_thread_and_spares_other_chats() {
+    let (_t, dir, key_) = setup();
+    let mut db = Cache::open(&dir, &key_).unwrap();
+    db.put_messages(key(forum(), 2), &posts(2, [1, 3])).unwrap();
+    db.put_messages(key(forum(), 3), &posts(3, [2])).unwrap();
+    db.put_messages(ThreadKey::whole(user(1)), &[msg(user(1), 5, "kept")])
+        .unwrap();
+    db.delete_chat_messages(forum()).unwrap();
+    assert!(stored(&mut db).is_empty());
+    assert_eq!(row_count(&db), 1);
+}
+
 /// Section 11: a `ReconcileTail` that overlaps its thread's cache reconciles
 /// only that thread's ids in the tail's range.
 #[tokio::test]

@@ -22,10 +22,20 @@ pub const PEER_CALL_INTERVAL: Duration = Duration::from_secs(3);
 /// Least time between two refreshes of one chat's badge.
 pub const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
-/// One `peer_dialogs` call to dispatch.
+/// One `peer_dialogs` call reserved: its slots are taken, and it is
+/// [`PeerScheduler::dispatched`] when it gets its admission permit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reserved {
+    /// How many chats it took from the head of the kind-check FIFO.
+    pub kind_checks: usize,
+    /// Every chat in the call, without duplicates.
+    pub chats: Vec<ChatId>,
+}
+
+/// One `peer_dialogs` call reserved and dispatched at once (tests).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerBatch {
-    /// Its dispatch stamp, for [`super::BadgeSource::Fetched`].
+    /// Its dispatch stamp on the badge clock.
     pub stamp: BadgeSeq,
     /// How many chats it took from the head of the kind-check FIFO.
     pub kind_checks: usize,
@@ -33,9 +43,18 @@ pub struct PeerBatch {
     pub chats: Vec<ChatId>,
 }
 
+/// The one call the scheduler has out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flight {
+    /// Planned and queued, waiting for admission.
+    Reserved,
+    /// Admitted at the badge stamp it carries.
+    Dispatched(BadgeSeq),
+}
+
 #[derive(Debug, Default)]
 pub struct PeerScheduler {
-    in_flight: Option<BadgeSeq>,
+    in_flight: Option<Flight>,
     last_call: Option<Instant>,
     not_before: NotBefore,
     /// The last chat the badge cursor took.
@@ -43,9 +62,9 @@ pub struct PeerScheduler {
 }
 
 impl PeerScheduler {
-    /// The call to dispatch now, if any: none while one is in flight, within
-    /// [`PEER_CALL_INTERVAL`] of the last, or before a flood-wait deadline.
-    /// `kinds` is the kind-check FIFO; the caller pops `kind_checks` from it.
+    /// Reserves and dispatches a call at once (what [`Self::reserve`] and
+    /// [`Self::dispatched`] do when admission is immediate).
+    #[cfg(test)]
     pub fn plan(
         &mut self,
         now: Instant,
@@ -53,6 +72,27 @@ impl PeerScheduler {
         shown: Option<ChatId>,
         badges: &mut Badges,
     ) -> Option<PeerBatch> {
+        let Reserved { kind_checks, chats } = self.reserve(now, kinds, shown, badges)?;
+        let stamp = self.dispatched(now, &chats, badges);
+        Some(PeerBatch {
+            stamp,
+            kind_checks,
+            chats,
+        })
+    }
+
+    /// The call to reserve now, if any: none while one is reserved or in
+    /// flight, within [`PEER_CALL_INTERVAL`] of the last dispatch, or before
+    /// a flood-wait deadline. `kinds` is the kind-check FIFO; the caller pops
+    /// `kind_checks` from it. The interval, the badge stamp and the chats'
+    /// refresh times count from [`Self::dispatched`], not from here.
+    pub fn reserve(
+        &mut self,
+        now: Instant,
+        kinds: &[ChatId],
+        shown: Option<ChatId>,
+        badges: &Badges,
+    ) -> Option<Reserved> {
         let spaced = self
             .last_call
             .is_none_or(|at| now.saturating_duration_since(at) >= PEER_CALL_INTERVAL);
@@ -75,27 +115,44 @@ impl PeerScheduler {
         if chats.is_empty() {
             return None;
         }
+        self.in_flight = Some(Flight::Reserved);
+        Some(Reserved { kind_checks, chats })
+    }
+
+    /// The reserved call got its admission permit at `now`: it is stamped
+    /// on the badge clock, the interval counts from here, and its chats
+    /// were last sent now.
+    pub fn dispatched(&mut self, now: Instant, chats: &[ChatId], badges: &mut Badges) -> BadgeSeq {
         let stamp = badges.dispatch();
-        for chat in &chats {
+        for chat in chats {
             badges.sent(*chat, now);
         }
-        self.in_flight = Some(stamp);
+        self.in_flight = Some(Flight::Dispatched(stamp));
         self.last_call = Some(now);
-        Some(PeerBatch {
-            stamp,
-            kind_checks,
-            chats,
-        })
+        stamp
+    }
+
+    /// When the next call may be dispatched: `None` while one is in
+    /// flight (its completion comes first), else the later of the call
+    /// interval's end and the flood-wait deadline (`now` if neither holds
+    /// it back).
+    pub fn ready_at(&self, now: Instant) -> Option<Instant> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let spaced = self.last_call.map_or(now, |at| at + PEER_CALL_INTERVAL);
+        Some(self.not_before.deadline().map_or(spaced, |d| d.max(spaced)))
     }
 
     /// The call stamped `stamp` ended (with a result or an error).
     pub fn complete(&mut self, stamp: BadgeSeq) {
-        if self.in_flight == Some(stamp) {
+        if self.in_flight == Some(Flight::Dispatched(stamp)) {
             self.in_flight = None;
         }
     }
 
-    /// A rebuild dropped the call in flight.
+    /// The call reserved or in flight was dropped (a rebuild, a purged
+    /// job).
     pub fn drop_in_flight(&mut self) {
         self.in_flight = None;
     }

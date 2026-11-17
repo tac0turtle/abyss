@@ -1,25 +1,31 @@
-//! Stage 2 tasks 6 and 7: forum topic lists and topic threads in the
-//! actor, against the fake's forums (plan section 11, "Actor against the
-//! fake").
+//! Stage 2 tasks 6 to 8: forum topic lists, topic threads, live routing,
+//! the forum badge and the forum flag in the actor, against the fake's
+//! forums (plan section 11, "Actor against the fake").
 
 mod admission;
+mod badge;
 mod bootstrap;
 mod continuity;
 mod crossing;
 mod deletion;
+mod deletion_counts;
 mod drain;
+mod fence;
+mod fence_gap;
+mod fence_load;
 mod flood;
 mod kinds;
 mod open_topic;
 mod opening;
 mod overflow;
+mod routing;
 mod threads;
 
 use std::time::Duration;
 
 use super::{Harness, harness};
 use crate::api::{Command, ConnState, Event, HistoryDir, LoadTarget};
-use crate::backend::fake::{FakeScript, TopicsCallRecord, TopicsRequest, summary};
+use crate::backend::fake::{FakeScript, PeerCallRecord, TopicsCallRecord, TopicsRequest, summary};
 use crate::model::{
     Body, ChatId, ChatKind, ChatSummary, Freshness, Message, MsgId, PeerKind, ThreadKey, Topic,
     TopicId, TopicOrder, TopicSnapshot, Visibility,
@@ -328,3 +334,106 @@ fn assert_keyed(events: &[Event]) {
 fn ids(messages: &[Message]) -> Vec<i32> {
     messages.iter().map(|m| m.id.0).collect()
 }
+
+/// A plain supergroup (a channel that isn't a forum).
+fn group(id: i64) -> ChatId {
+    forum(id)
+}
+
+/// Adds forum `chat` with General and topic 2, whose post 10 is unread:
+/// the server's badge (unread topics) is 1.
+fn add_unread_forum(script: &mut FakeScript, chat: ChatId) {
+    add_big_forum(script, chat, 1);
+    let history = script.history.entry(chat).or_default();
+    history.push(message_in(topic_key(chat, 2), 10, "unread"));
+}
+
+/// Adds plain supergroup `chat` with posts 1..=`n`.
+fn add_group(script: &mut FakeScript, chat: ChatId, n: i32) {
+    script.dialogs.push(summary(chat, "Group"));
+    let history = (1..=n)
+        .map(|id| crate::backend::fake::text_message(chat, id, "post"))
+        .collect();
+    script.history.insert(chat, history);
+}
+
+/// Loads every dialogs page after the first.
+async fn load_all_dialogs(h: &mut Harness) {
+    loop {
+        h.send(Command::LoadDialogs).await;
+        let (ev, _) = h
+            .until(|e| {
+                matches!(
+                    e,
+                    Event::DialogsPaging { .. }
+                        | Event::LoadEnded {
+                            target: LoadTarget::Dialogs,
+                            ..
+                        }
+                )
+            })
+            .await;
+        if !matches!(ev, Event::DialogsPaging { has_more: true }) {
+            return;
+        }
+    }
+}
+
+/// The `peer_dialogs` calls the server saw, oldest first.
+fn peer_calls(h: &Harness) -> Vec<PeerCallRecord> {
+    h.fake.peer_calls()
+}
+
+/// When each `peer_dialogs` call that asked for `chat` reached the server.
+fn peer_calls_with(h: &Harness, chat: ChatId) -> Vec<tokio::time::Instant> {
+    peer_calls(h)
+        .into_iter()
+        .filter(|r| r.chats.contains(&chat))
+        .map(|r| r.at)
+        .collect()
+}
+
+/// Waits (collecting events) until the server has seen `n` `peer_dialogs`
+/// calls in all.
+async fn peer_calls_reached(h: &mut Harness, n: usize) -> Vec<Event> {
+    let mut seen = Vec::new();
+    for _ in 0..2000 {
+        if peer_calls(h).len() >= n {
+            return seen;
+        }
+        seen.extend(events_for(h, Duration::from_millis(100)).await);
+    }
+    panic!(
+        "the server never saw peer_dialogs call #{n}; calls: {:?}; seen: {seen:?}",
+        peer_calls(h)
+    );
+}
+
+/// Consecutive calls are never closer than the scheduler's interval.
+fn assert_spaced(h: &Harness) {
+    let calls = peer_calls(h);
+    for (earlier, later) in calls.iter().zip(calls.iter().skip(1)) {
+        assert!(
+            later.at - earlier.at >= crate::store::PEER_CALL_INTERVAL,
+            "peer_dialogs calls too close: {calls:?}"
+        );
+    }
+}
+
+/// The kind a summary event states for `chat`'s last `ChatBumped`.
+fn last_bump(events: &[Event], chat: ChatId) -> Option<ChatSummary> {
+    events.iter().rev().find_map(|e| match e {
+        Event::ChatBumped(s) if s.id == chat => Some(s.clone()),
+        _ => None,
+    })
+}
+
+const FORUM_KIND: ChatKind = ChatKind::Supergroup {
+    forum: true,
+    gigagroup: false,
+};
+
+const GROUP_KIND: ChatKind = ChatKind::Supergroup {
+    forum: false,
+    gigagroup: false,
+};

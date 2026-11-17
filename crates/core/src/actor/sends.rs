@@ -220,6 +220,19 @@ impl PendingSends {
         ids
     }
 
+    /// `chat`'s sends waiting to go (`Sending`, not queued): held while
+    /// its fence stood. In id order.
+    fn held(&self, chat: ChatId) -> Vec<LocalId> {
+        let mut ids: Vec<LocalId> = self
+            .map
+            .iter()
+            .filter(|(_, p)| p.thread.chat == chat && !p.in_flight && p.state == SendState::Sending)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// When the earliest flood wait ends, if any send is waiting.
     pub(super) fn next_due(&self) -> Option<Instant> {
         self.map.values().filter_map(|p| p.retry_at).min()
@@ -463,9 +476,15 @@ impl<B: Backend> Actor<B> {
     }
 
     /// Queues an attempt on the live instance. Without one, the send stays
-    /// `Sending` and is replayed once an instance is online.
+    /// `Sending` and is replayed once an instance is online; to a fenced
+    /// chat, it stays `Sending` until the fence lifts (plan section 6.6).
     async fn dispatch_send(&mut self, local_id: LocalId) {
-        let live = self.life.phase == Phase::Live;
+        let fenced = self
+            .sends
+            .map
+            .get(&local_id)
+            .is_some_and(|p| self.fences.is_fenced(p.thread.chat));
+        let live = self.life.phase == Phase::Live && !fenced;
         let Some(p) = self.sends.map.get_mut(&local_id) else {
             return;
         };
@@ -492,6 +511,13 @@ impl<B: Backend> Actor<B> {
             p.in_flight = false;
         }
         self.send_state(local_id, state).await;
+    }
+
+    /// A fence on `chat` lifted (or was released): its held sends go.
+    pub(super) async fn release_held_sends(&mut self, chat: ChatId) {
+        for local_id in self.sends.held(chat) {
+            self.dispatch_auto(local_id).await;
+        }
     }
 
     /// Replays unresolved sends with their original `random_id`s (after `Online`).

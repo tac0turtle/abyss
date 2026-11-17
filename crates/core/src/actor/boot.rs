@@ -23,7 +23,7 @@ use super::lifecycle::{Phase, Reason};
 use crate::api::{Event, HistoryDir, WindowState};
 use crate::backend::{Backend, HistoryQuery, StreamItem, Update};
 use crate::model::{ChatId, ChatSummary, MsgId, ThreadKey};
-use crate::store::{DialogsSeq, MAX_WINDOWS};
+use crate::store::MAX_WINDOWS;
 
 /// How long a new instance may take to establish its update baseline.
 pub(super) const BASELINE_WAIT: Duration = Duration::from_secs(10);
@@ -231,12 +231,15 @@ impl<B: Backend> Actor<B> {
             }
         }
         self.topics_snapshots(kind).await;
+        if kind == BootKind::Refresh {
+            self.refresh_badges_and_kinds().await;
+        }
         let dialogs = !self.dialogs_busy;
         if dialogs {
             self.dialogs_busy = true;
             self.priority.push_back(Job::Dialogs {
                 cursor: None,
-                seq: DialogsSeq::default(),
+                stamps: super::jobs::Stamps::default(),
             });
         }
         if let Some(boot) = self.boot.as_mut() {
@@ -244,9 +247,12 @@ impl<B: Backend> Actor<B> {
         }
         // A full bootstrap always refetches the open tail (any older load was
         // for a window that is now invalidated); a refresh never doubles a load.
+        // A fenced open thread's tail is left out: the boot never waits on a
+        // fence, and the fence's lift reloads it (plan section 6.5).
         let tail = self
             .open
             .filter(|t| kind == BootKind::Full || !self.history_busy.contains_key(t))
+            .filter(|t| !self.fences.is_fenced(t.chat))
             .and_then(|t| Some((t, self.windows.get(t)?.view_gen())));
         if let Some((thread, view)) = tail {
             let load = self.begin_load(thread, view);
@@ -260,6 +266,24 @@ impl<B: Backend> Actor<B> {
             self.start_tail(load, via).await;
         }
         self.maybe_finish_boot().await;
+    }
+
+    /// The light refresh's share of section 7 and 6.6: the shown forum's
+    /// badge when it isn't on the first dialogs page, and a new check of
+    /// every suspect chat.
+    async fn refresh_badges_and_kinds(&mut self) {
+        if let Some(shown) = self.topics.lists.shown() {
+            let first_page = self
+                .dialogs
+                .as_slice()
+                .iter()
+                .take(usize::try_from(jobs::DIALOGS_PAGE).unwrap_or(usize::MAX))
+                .any(|c| c.id == shown);
+            if !first_page {
+                self.badge_trigger(shown);
+            }
+        }
+        self.recheck_suspects().await;
     }
 
     /// Makes `load` the running boot's tail snapshot of its thread. A

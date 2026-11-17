@@ -2,7 +2,7 @@
 //! continuity"): live messages are written only through a contiguous
 //! window of their own thread, a thread's tail reconcile decides overlap
 //! against that thread's cached tail and replaces only its rows, and a gap
-//! is never bridged. (The fence gap is task 8's.)
+//! is never bridged. (The fence gap is in `fence_gap`.)
 
 use super::super::{CacheDir, Harness, cache_at, harness};
 use super::{forum_with, history_of, ids, reconciled, topic_key};

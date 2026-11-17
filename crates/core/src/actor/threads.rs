@@ -15,8 +15,8 @@
 //!   message routed elsewhere than a thread ([`Route::ChatOnly`],
 //!   [`Route::ForumSuspected`]) reaches no window and no cache, and every
 //!   window of its chat loses cache continuity, since that window's cache
-//!   may now miss it (section 6.6, general rule). Fencing and the
-//!   forum-change path for a suspected forum are task 8's.
+//!   may now miss it (section 6.6, general rule). A fenced chat routes as
+//!   unknown, and a suspected forum is fenced (`fences`).
 
 use std::collections::HashMap;
 
@@ -27,7 +27,7 @@ use crate::model::{ChatId, ChatKind, Message, PeerKind, ThreadKey};
 use crate::store::{ForumStatus, MAX_TOPIC_LISTS, MAX_WINDOWS, Route, normalize};
 
 /// The forum status a chat's kind states.
-fn kind_status(kind: ChatKind) -> ForumStatus {
+pub(super) fn kind_status(kind: ChatKind) -> ForumStatus {
     match kind {
         ChatKind::Supergroup { forum: true, .. } => ForumStatus::Forum,
         ChatKind::Private { .. }
@@ -48,15 +48,31 @@ impl KnownKinds {
     fn get(&self, chat: ChatId) -> Option<ForumStatus> {
         self.0.get(&chat).copied()
     }
+
+    /// Records a kind an authoritative summary stated for a chat with a
+    /// view (the caller checks; [`Actor::note_kinds`] prunes).
+    pub(super) fn set(&mut self, chat: ChatId, status: ForumStatus) {
+        self.0.insert(chat, status);
+    }
 }
 
 impl<B: Backend> Actor<B> {
-    /// What core knows about whether `chat` is a forum. Only channels can
-    /// be forums. Otherwise: the chat list's kind, else the kind last stated
-    /// for the chat's retained views, else a retained topic list or topic
-    /// window (core opened them for a forum). A chat none of these
-    /// describes is [`ForumStatus::Unknown`].
+    /// What routing may assume about whether `chat` is a forum: nothing
+    /// while it is fenced (its kind is being re-checked, plan section 6.6),
+    /// otherwise [`Self::known_status`].
     pub(super) fn forum_status(&self, chat: ChatId) -> ForumStatus {
+        if self.fences.is_fenced(chat) {
+            return ForumStatus::Unknown;
+        }
+        self.known_status(chat)
+    }
+
+    /// What core knows about whether `chat` is a forum, a fence aside. Only
+    /// channels can be forums. Otherwise: the chat list's kind, else the
+    /// kind last stated for the chat's retained views, else a retained
+    /// topic list or topic window (core opened them for a forum). A chat
+    /// none of these describes is [`ForumStatus::Unknown`].
+    pub(super) fn known_status(&self, chat: ChatId) -> ForumStatus {
         if chat.kind != PeerKind::Channel {
             return ForumStatus::NotForum;
         }
@@ -105,7 +121,7 @@ impl<B: Backend> Actor<B> {
     /// history. Answered `Error(Rejected)`; nothing else changes.
     pub(super) async fn refuse_open(&self, thread: ThreadKey) -> bool {
         let refused =
-            thread.topic.is_none() && self.forum_status(thread.chat) == ForumStatus::Forum;
+            thread.topic.is_none() && self.known_status(thread.chat) == ForumStatus::Forum;
         if refused {
             tracing::debug!("a forum's whole-chat key refused");
             self.error(UserError::Rejected).await;
@@ -139,10 +155,18 @@ impl<B: Backend> Actor<B> {
 
     /// Routes a live message or edit. For [`Route::Thread`] the message
     /// comes back normalized; otherwise unchanged, and the chat's windows
-    /// lose cache continuity (see the module docs).
+    /// lose cache continuity (see the module docs). A suspect chat (its
+    /// kind check was abandoned) is not suspected again until the next
+    /// light refresh re-checks it: its topic-headed messages are only
+    /// `ChatOnly`.
     pub(super) fn route_live(&mut self, m: Message) -> (Route, Message) {
         let status = self.forum_status(m.thread.chat);
-        let (route, m) = normalize(m, status);
+        let (mut route, m) = normalize(m, status);
+        if let Route::ForumSuspected(chat) = route
+            && self.fences.is_suspect(chat)
+        {
+            route = Route::ChatOnly(chat);
+        }
         if let Route::ChatOnly(chat) | Route::ForumSuspected(chat) = route {
             self.windows.lose_continuity(chat);
         }

@@ -205,6 +205,13 @@ impl TopicList {
         self.first_page == FirstPage::Needed
     }
 
+    /// The pinned topics changed (`TopicsPinned`): the list wants its first
+    /// page again, which the automatic limiter fetches for the shown forum
+    /// and the next open fetches for any other.
+    pub fn want_first_page(&mut self) {
+        self.first_page = FirstPage::Needed;
+    }
+
     /// Whether a page is in flight or queued.
     pub fn page_pending(&self) -> bool {
         self.page.is_some() || self.queued_page.is_some()

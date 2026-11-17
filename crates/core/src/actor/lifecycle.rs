@@ -558,6 +558,10 @@ impl<B: Backend> Actor<B> {
         self.dialogs_busy = false;
         self.dialogs_queued = false;
         self.purge_queued();
+        // The `peer_dialogs` call in flight is stale now: its kind checks go
+        // back to the head of the FIFO, unspent (plan section 6.6).
+        self.peer.drop_in_flight();
+        self.fences.return_flight();
         let mut waiting = Vec::with_capacity(self.deferred.len().saturating_add(1));
         let owed = self.owed.take().map(|o| (o.load.thread, o.dir));
         let deferred = self.deferred.drain(..).map(|d| (d.thread, d.dir));

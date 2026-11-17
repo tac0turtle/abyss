@@ -121,6 +121,15 @@ pub struct TopicsCallRecord {
     pub at: tokio::time::Instant,
 }
 
+/// One `peer_dialogs` call as it reached the fake server
+/// ([`FakeHandle::peer_calls`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerCallRecord {
+    pub chats: Vec<ChatId>,
+    /// When the call reached the server (the runtime's clock).
+    pub at: tokio::time::Instant,
+}
+
 /// A fault applied to the next build.
 #[derive(Clone, Copy, Debug)]
 pub enum BuildFault {
@@ -461,6 +470,8 @@ struct State {
     post_closed: HashMap<ChatId, PostClosed>,
     /// Topics calls in arrival order (capped).
     topics_log: Vec<TopicsCallRecord>,
+    /// `peer_dialogs` calls in arrival order (capped).
+    peer_log: Vec<PeerCallRecord>,
     /// Forums whose later pages repeat the first page (`repeat_topic_pages`).
     repeat_pages: Vec<ChatId>,
     /// Updates still to be dropped instead of delivered (`drop_next_update`).
@@ -1337,6 +1348,11 @@ impl Client for FakeClient {
     }
 
     async fn peer_dialogs(&self, chats: &[ChatId]) -> Result<Vec<ChatSummary>, BackendError> {
+        let record = PeerCallRecord {
+            chats: chats.to_vec(),
+            at: tokio::time::Instant::now(),
+        };
+        self.shared.with(|s| push_capped(&mut s.peer_log, record));
         self.snapshot(Op::PeerDialogs, |s| topics::peer_dialogs(s, chats))
             .await
     }

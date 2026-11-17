@@ -182,6 +182,7 @@ impl<B: Backend> Actor<B> {
             return;
         };
         if cover.fetches >= MAX_COVER_FETCHES
+            || self.fences.is_fenced(thread.chat)
             || self.history_busy.contains_key(&thread)
             || self.deferred.iter().any(|d| d.thread == thread)
             || !self.sends.awaits_cover(thread)

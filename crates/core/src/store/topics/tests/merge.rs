@@ -210,9 +210,14 @@ impl Oracle {
                 m.meta.changed = now;
             }),
             Event::MessageEdit(t, id, version) => touch(self, *t, &mut |m| {
-                if m.want.last_id == Some(MsgId(*id)) && *version > m.want.last_version {
+                let is_top = m.want.last_id == Some(MsgId(*id));
+                let unsettled = m.activity.changed >= m.activity.seen;
+                if is_top && *version > m.want.last_version {
                     m.want.last = Some(preview(*version));
                     m.want.last_version = *version;
+                    m.activity.changed = now;
+                } else if !is_top && unsettled {
+                    // The real top isn't known yet: this may be it.
                     m.activity.changed = now;
                 }
             }),

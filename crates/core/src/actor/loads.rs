@@ -95,10 +95,12 @@ impl<B: Backend> Actor<B> {
             return;
         }
         let busy = &self.history_busy;
+        let fences = &self.fences;
+        // A fenced chat's loads wait for its fence to lift.
         let (ready, waiting): (Vec<_>, Vec<_>) = self
             .deferred
             .drain(..)
-            .partition(|d| !busy.contains_key(&d.thread));
+            .partition(|d| !busy.contains_key(&d.thread) && !fences.is_fenced(d.thread.chat));
         self.deferred = waiting;
         for load in ready {
             self.load_more(load).await;

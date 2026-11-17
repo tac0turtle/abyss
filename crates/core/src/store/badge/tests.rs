@@ -1,5 +1,5 @@
-//! Badge stamps, dirty bits and the `peer_dialogs` slot split (plan sections
-//! 7, 11).
+//! Badge dirty bits, the `peer_dialogs` slot split, and the dialog rows'
+//! per-field ordering across every snapshot source (plan sections 7, 11).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use proptest::prelude::*;
 
 use super::*;
-use crate::model::PeerKind;
+use crate::model::{ChatKind, ChatSummary, PeerFolder, PeerKind};
+use crate::store::Dialogs;
 
 fn chat(id: i64) -> ChatId {
     ChatId {
@@ -29,38 +30,20 @@ fn a_bit_is_cleared_only_by_a_result_dispatched_after_it() {
     let mut b = tracked([1]);
     let before = b.dispatch();
     b.trigger(chat(1));
-    assert_eq!(b.offer(chat(1), BadgeSource::Fetched(before)), Offer::Apply);
+    b.settle(chat(1), before);
     assert!(b.is_dirty(chat(1)), "dispatched before the trigger");
     let after = b.dispatch();
     // A trigger crossing the in-flight call: its result can't clear it.
     b.trigger(chat(1));
-    b.offer(chat(1), BadgeSource::Fetched(after));
+    b.settle(chat(1), after);
     assert!(b.is_dirty(chat(1)));
     let again = b.dispatch();
-    b.offer(chat(1), BadgeSource::Fetched(again));
+    b.settle(chat(1), again);
     assert!(!b.is_dirty(chat(1)));
-}
-
-#[test]
-fn sources_apply_in_dispatch_order() {
-    let mut b = tracked([1]);
-    let early = b.dispatch();
-    let late = b.dispatch();
-    assert_eq!(b.offer(chat(1), BadgeSource::Fetched(late)), Offer::Apply);
-    assert_eq!(b.offer(chat(1), BadgeSource::Fetched(early)), Offer::Ignore);
-    // A chat-level read is newer than every dispatch before it.
-    assert_eq!(b.offer(chat(1), BadgeSource::ChatRead), Offer::Apply);
-    assert_eq!(
-        b.offer(chat(1), BadgeSource::Fetched(late)),
-        Offer::Ignore,
-        "a peer_dialogs dispatched before the read"
-    );
-    // A chat-level read doesn't clear a dirty bit.
+    // Untracked (not a retained dialog): nothing; leaving drops state.
+    b.trigger(chat(2));
+    assert!(!b.is_dirty(chat(2)));
     b.trigger(chat(1));
-    b.offer(chat(1), BadgeSource::ChatRead);
-    assert!(b.is_dirty(chat(1)));
-    // Untracked (not a retained dialog): ignored, and leaving drops state.
-    assert_eq!(b.offer(chat(2), BadgeSource::ChatRead), Offer::Ignore);
     b.retain(|_| false);
     assert!(b.is_empty() && !b.is_dirty(chat(1)));
 }
@@ -93,7 +76,7 @@ fn drain(
             if badges.is_dirty(*c) {
                 badge_at.entry(*c).or_insert(call);
             }
-            badges.offer(*c, BadgeSource::Fetched(batch.stamp));
+            badges.settle(*c, batch.stamp);
         }
         assert!(
             scheduler.plan(now, &kinds, shown, badges).is_none(),
@@ -226,12 +209,27 @@ fn a_flood_wait_pauses_the_scheduler_and_only_extends() {
     );
 }
 
+/// What the server says about one chat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Server {
+    unread: u32,
+    folder: PeerFolder,
+    forum: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Op {
     /// The server count changes (a message, a topic read, a deletion): a trigger.
     Change(i64, u32),
     /// A chat-level read update carrying the server's count.
     ChatRead(i64, u32),
+    /// The chat moves in or out of the archive: a live folder update.
+    Move(i64, bool),
+    /// The forum flag changes, silently: only snapshots tell.
+    Kind(i64, bool),
+    /// The chat leaves the list (a newer page no longer lists it); a later
+    /// page lists it again.
+    Leave(i64),
     Deliver(usize),
     DialogsPage,
     Peer,
@@ -239,12 +237,18 @@ enum Op {
     Tick(u64),
 }
 
-const CHATS: i64 = 4;
+/// Chats `0..LISTED` start listed; the rest start unlisted (a window, a
+/// move elsewhere) until a page lists them.
+const CHATS: i64 = 5;
+const LISTED: i64 = 4;
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => (0..CHATS, 0u32..9).prop_map(|(c, v)| Op::Change(c, v)),
         1 => (0..CHATS, 0u32..9).prop_map(|(c, v)| Op::ChatRead(c, v)),
+        1 => (0..CHATS, any::<bool>()).prop_map(|(c, a)| Op::Move(c, a)),
+        1 => (0..CHATS, any::<bool>()).prop_map(|(c, f)| Op::Kind(c, f)),
+        1 => (0..CHATS).prop_map(Op::Leave),
         3 => (0usize..3).prop_map(Op::Deliver),
         1 => Just(Op::DialogsPage),
         3 => Just(Op::Peer),
@@ -257,6 +261,7 @@ fn op() -> impl Strategy<Value = Op> {
 enum Event {
     Trigger(ChatId),
     Read(ChatId, u32),
+    Move(ChatId, PeerFolder),
 }
 
 #[derive(Debug)]
@@ -267,102 +272,273 @@ struct Flight {
     peer: bool,
 }
 
+/// The row as a dialog snapshot of `server` states it.
+fn summary(c: ChatId, server: Server) -> ChatSummary {
+    ChatSummary {
+        unread: server.unread,
+        folder: server.folder,
+        kind: ChatKind::Supergroup {
+            forum: server.forum,
+            gigagroup: false,
+        },
+        id: c,
+        title: "chat".into(),
+        pinned: false,
+        unread_mentions: 0,
+        last: None,
+        last_date: 0,
+        last_id: None,
+        can_send: true,
+        muted_until: 0,
+    }
+}
+
+/// A row's guarded fields: unread, archived, forum.
+fn fields(s: &ChatSummary) -> [u64; 3] {
+    [
+        u64::from(s.unread),
+        u64::from(s.folder == PeerFolder::Archive),
+        u64::from(matches!(s.kind, ChatKind::Supergroup { forum: true, .. })),
+    ]
+}
+
+/// Where a source came from. A live change outranks a snapshot dispatched
+/// at the same stamp (that snapshot was sent before it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Origin {
+    Snapshot,
+    Live,
+}
+
+/// One delivered source of a field's value, for the reference model.
+#[derive(Clone, Copy, Debug)]
+struct Source {
+    /// A snapshot's dispatch stamp, or the clock when a live change landed.
+    stamp: BadgeSeq,
+    origin: Origin,
+    /// Delivery order: between live changes at one stamp, the later wins.
+    order: u64,
+    value: u64,
+}
+
+/// The reference model, kept from the delivery history alone: for every
+/// chat and field, every source delivered since the chat was last
+/// forgotten (it left the list), and which chats are listed. A field
+/// should show the value of its newest source.
+#[derive(Debug, Default)]
+struct Model {
+    log: BTreeMap<(ChatId, usize), Vec<Source>>,
+    listed: BTreeSet<ChatId>,
+    order: u64,
+}
+
+impl Model {
+    fn deliver(&mut self, c: ChatId, field: usize, stamp: BadgeSeq, origin: Origin, value: u64) {
+        self.order += 1;
+        let source = Source {
+            stamp,
+            origin,
+            order: self.order,
+            value,
+        };
+        self.log.entry((c, field)).or_default().push(source);
+    }
+
+    fn expected(&self, c: ChatId) -> Option<[u64; 3]> {
+        let mut out = [0; 3];
+        for (field, slot) in out.iter_mut().enumerate() {
+            let newest = self
+                .log
+                .get(&(c, field))?
+                .iter()
+                .max_by_key(|s| (s.stamp, s.origin, s.order))?;
+            *slot = newest.value;
+        }
+        Some(out)
+    }
+
+    /// A chat that leaves the list is forgotten, its sources with it.
+    fn forget(&mut self, c: ChatId) {
+        self.listed.remove(&c);
+        self.log.retain(|(chat, _), _| *chat != c);
+    }
+}
+
 struct Sim {
+    dialogs: Dialogs,
     badges: Badges,
     scheduler: PeerScheduler,
-    history: Vec<BTreeMap<ChatId, u32>>,
+    history: Vec<BTreeMap<ChatId, Server>>,
     events: VecDeque<Event>,
     flights: Vec<Flight>,
     now: Instant,
-    shown: BTreeMap<ChatId, u32>,
-    sent: BTreeMap<ChatId, BTreeSet<u32>>,
+    model: Model,
 }
 
 impl Sim {
     fn new() -> Self {
-        let server: BTreeMap<ChatId, u32> = (0..CHATS).map(|c| (chat(c), 0)).collect();
+        let start = Server {
+            unread: 0,
+            folder: PeerFolder::Main,
+            forum: false,
+        };
+        let server: BTreeMap<ChatId, Server> = (0..CHATS).map(|c| (chat(c), start)).collect();
+        let mut dialogs = Dialogs::default();
+        let listed: Vec<ChatSummary> = (0..LISTED).map(|c| summary(chat(c), start)).collect();
+        let mut model = Model::default();
+        for row in &listed {
+            model.listed.insert(row.id);
+            for (field, value) in fields(row).into_iter().enumerate() {
+                model.deliver(row.id, field, BadgeSeq::default(), Origin::Snapshot, value);
+            }
+        }
+        dialogs.reset(listed);
         Self {
+            dialogs,
             badges: tracked(0..CHATS),
             scheduler: PeerScheduler::default(),
-            shown: server.clone(),
-            sent: server.keys().map(|c| (*c, BTreeSet::from([0]))).collect(),
             history: vec![server],
             events: VecDeque::new(),
             flights: Vec::new(),
             now: Instant::now(),
+            model,
         }
     }
 
-    fn set(&mut self, c: ChatId, v: u32, event: Event) {
+    fn set(&mut self, c: ChatId, change: impl FnOnce(&mut Server), event: Option<Event>) {
         let mut state = self.history.last().unwrap().clone();
-        state.insert(c, v);
+        change(state.get_mut(&c).unwrap());
         self.history.push(state);
-        self.events.push_back(event);
+        self.events.extend(event);
     }
 
-    fn offer(&mut self, c: ChatId, source: BadgeSource, value: u32) -> Result<(), TestCaseError> {
-        let shown_stamp = self.badges.chats[&c].shown;
-        let offer = self.badges.offer(c, source);
-        if let BadgeSource::Fetched(stamp) = source {
+    /// Every listed row shows what the model expects, and the store lists
+    /// exactly the model's chats.
+    fn check(&self) -> Result<(), TestCaseError> {
+        let listed: BTreeSet<ChatId> = self.dialogs.as_slice().iter().map(|c| c.id).collect();
+        prop_assert_eq!(&listed, &self.model.listed);
+        for row in self.dialogs.as_slice() {
+            let expected = self.model.expected(row.id);
             prop_assert_eq!(
-                offer == Offer::Apply,
-                stamp > shown_stamp,
-                "dispatch order decides"
+                Some(fields(row)),
+                expected,
+                "{:?} shows its newest source",
+                row.id
             );
         }
-        self.sent.get_mut(&c).unwrap().insert(value);
-        if offer == Offer::Apply {
-            self.shown.insert(c, value);
-        }
-        prop_assert!(
-            self.sent[&c].contains(&self.shown[&c]),
-            "only server values"
-        );
         Ok(())
     }
 
     fn deliver(&mut self) -> Result<(), TestCaseError> {
+        let now = self.badges.now();
         match self.events.pop_front() {
             Some(Event::Trigger(c)) => {
                 self.badges.trigger(c);
                 prop_assert!(self.badges.is_dirty(c), "every trigger leads to a refresh");
             }
-            Some(Event::Read(c, v)) => self.offer(c, BadgeSource::ChatRead, v)?,
+            // A read of a chat that isn't listed has no row to change.
+            Some(Event::Read(c, v)) => {
+                if self.dialogs.set_unread(c, v, now).is_some() {
+                    self.model.deliver(c, 0, now, Origin::Live, u64::from(v));
+                }
+            }
+            // A move is remembered, listed or not.
+            Some(Event::Move(c, folder)) => {
+                self.dialogs.set_folder(c, folder, now);
+                let archived = u64::from(folder == PeerFolder::Archive);
+                self.model.deliver(c, 1, now, Origin::Live, archived);
+            }
             None => {}
         }
-        Ok(())
+        self.check()
     }
 
+    /// A snapshot dispatched at `stamp` lands with the server state at
+    /// `at`. A page lists every chat it holds (admitting unlisted ones); a
+    /// `peer_dialogs` result only refreshes listed rows.
     fn complete(&mut self, flight: &Flight, at: usize) -> Result<(), TestCaseError> {
         let state = self.history[at].clone();
-        for c in &flight.chats {
-            self.offer(*c, BadgeSource::Fetched(flight.stamp), state[c])?;
+        let mut page: Vec<ChatSummary> =
+            flight.chats.iter().map(|c| summary(*c, state[c])).collect();
+        for row in &page {
+            for (field, value) in fields(row).into_iter().enumerate() {
+                self.model
+                    .deliver(row.id, field, flight.stamp, Origin::Snapshot, value);
+            }
+        }
+        prop_assert_ne!(
+            self.dialogs.guard(&mut page, flight.stamp, |_| None),
+            crate::store::Guarded::Discard
+        );
+        for fresh in page {
+            let c = fresh.id;
+            if self.model.listed.contains(&c) {
+                self.dialogs.refresh(fresh);
+            } else if !flight.peer {
+                self.model.listed.insert(c);
+                self.dialogs.append(vec![fresh], crate::store::Rest::More);
+            }
+            self.badges.settle(c, flight.stamp);
         }
         if flight.peer {
             self.scheduler.complete(flight.stamp);
         }
-        Ok(())
+        self.check()
+    }
+
+    fn leave(&mut self, c: ChatId) -> Result<(), TestCaseError> {
+        if !self.model.listed.contains(&c) || self.model.listed.len() == 1 {
+            return Ok(());
+        }
+        let rest: Vec<ChatSummary> = self
+            .dialogs
+            .as_slice()
+            .iter()
+            .filter(|r| r.id != c)
+            .cloned()
+            .collect();
+        self.dialogs.reset(rest);
+        self.model.forget(c);
+        self.check()
+    }
+
+    fn page(&mut self) {
+        let stamp = self.badges.dispatch();
+        let chats = (0..CHATS).map(chat).collect();
+        self.flights.push(Flight {
+            stamp,
+            chats,
+            from: self.history.len() - 1,
+            peer: false,
+        });
     }
 
     fn run(&mut self, op: Op) -> Result<(), TestCaseError> {
         match op {
-            Op::Change(c, v) => self.set(chat(c), v, Event::Trigger(chat(c))),
-            Op::ChatRead(c, v) => self.set(chat(c), v, Event::Read(chat(c), v)),
+            Op::Change(c, v) => self.set(chat(c), |s| s.unread = v, Some(Event::Trigger(chat(c)))),
+            Op::ChatRead(c, v) => {
+                self.set(chat(c), |s| s.unread = v, Some(Event::Read(chat(c), v)));
+            }
+            Op::Move(c, archive) => {
+                let folder = if archive {
+                    PeerFolder::Archive
+                } else {
+                    PeerFolder::Main
+                };
+                self.set(
+                    chat(c),
+                    |s| s.folder = folder,
+                    Some(Event::Move(chat(c), folder)),
+                );
+            }
+            Op::Kind(c, forum) => self.set(chat(c), |s| s.forum = forum, None),
+            Op::Leave(c) => self.leave(chat(c))?,
             Op::Deliver(n) => {
                 for _ in 0..=n {
                     self.deliver()?;
                 }
             }
-            Op::DialogsPage => {
-                let stamp = self.badges.dispatch();
-                let chats = (0..CHATS).map(chat).collect();
-                self.flights.push(Flight {
-                    stamp,
-                    chats,
-                    from: self.history.len() - 1,
-                    peer: false,
-                });
-            }
+            Op::DialogsPage => self.page(),
             Op::Peer => {
                 if let Some(batch) =
                     self.scheduler
@@ -389,6 +565,8 @@ impl Sim {
         Ok(())
     }
 
+    /// Everything delivered and answered, then the drain runs dry and one
+    /// last page is fetched: every chat is listed and equals the server's.
     fn settle(&mut self) -> Result<(), TestCaseError> {
         while !self.events.is_empty() {
             self.deliver()?;
@@ -413,11 +591,15 @@ impl Sim {
             });
         }
         prop_assert_eq!(self.badges.dirty().count(), 0);
-        prop_assert_eq!(
-            &self.shown,
-            &self.history[last],
-            "the badge equals the server's"
-        );
+        self.page();
+        while let Some(flight) = self.flights.pop() {
+            self.complete(&flight, last)?;
+        }
+        prop_assert_eq!(self.dialogs.len(), usize::try_from(CHATS).unwrap());
+        for (c, server) in &self.history[last] {
+            let row = self.dialogs.get(*c).unwrap();
+            prop_assert_eq!(fields(row), fields(&summary(*c, *server)), "converged");
+        }
         Ok(())
     }
 }
@@ -425,13 +607,18 @@ impl Sim {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
-    /// Messages, reads, chat-level reads, dialogs pages and `peer_dialogs`
-    /// results in random order with crossing completions: the badge only
-    /// holds server values, an earlier-dispatched source never replaces a
-    /// later one, every trigger is followed by a refresh, and after the last
-    /// refresh the badge equals the server's value.
+    /// Dialog snapshots from every source (dialogs pages, `peer_dialogs`
+    /// results) and live changes (counted triggers, chat-level reads,
+    /// folder moves; silent kind changes) in random order with crossing
+    /// completions, while chats leave the list and come back and unlisted
+    /// chats are moved and refreshed. After every step each listed row
+    /// shows, field by field (unread, folder, kind), the value of the
+    /// newest source the model logged for it, so an older source never
+    /// replaces a newer one, also across a chat's admission; every trigger
+    /// is followed by a refresh; and once everything is answered every row
+    /// equals the server's.
     #[test]
-    fn forum_badge(ops in proptest::collection::vec(op(), 1..100)) {
+    fn dialog_rows_follow_the_newest_source(ops in proptest::collection::vec(op(), 1..100)) {
         let mut sim = Sim::new();
         for op in ops {
             sim.run(op)?;

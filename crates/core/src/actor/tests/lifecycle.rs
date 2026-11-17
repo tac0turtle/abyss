@@ -327,7 +327,7 @@ async fn stale_generation_completions_are_dropped() {
             parked: None,
             outcome: Outcome::Dialogs {
                 step: DialogsStep::First,
-                seq: crate::store::DialogsSeq::default(),
+                stamps: super::super::jobs::Stamps::default(),
                 res: Ok(page),
             },
         })

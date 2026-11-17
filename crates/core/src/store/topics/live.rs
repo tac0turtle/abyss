@@ -99,6 +99,12 @@ impl TopicList {
     /// it edits the current top message with a newer version. It never
     /// inserts, moves, or touches unread. An edit in a topic the list
     /// doesn't hold may postdate a page in flight that adds it.
+    ///
+    /// While the topic's activity is unsettled (a live change, such as its
+    /// top message's deletion, waits for a refetch), the list doesn't know
+    /// the real top message: an edit of any other message may be an edit of
+    /// it. That is a live activity change too (no preview changes), so a
+    /// snapshot dispatched before it conflicts and a refetch settles it.
     pub fn on_edit(&mut self, msg: &Message, now: Instant) -> Vec<ListChange> {
         let seq = self.seq;
         let Some(topic) = msg.thread.topic else {
@@ -111,10 +117,13 @@ impl TopicList {
         let Some(entry) = self.entries.get_mut(at) else {
             return Vec::new();
         };
-        let newer = entry.topic.last_id == Some(msg.id) && msg.version() > entry.last_version;
+        let is_top = entry.topic.last_id == Some(msg.id);
+        let newer = is_top && msg.version() > entry.last_version;
         if newer {
             entry.topic.last = Some(Preview::of(msg));
             entry.last_version = msg.version();
+        }
+        if newer || (!is_top && !entry.activity.settled()) {
             entry.activity.set_changed(seq);
             entry.owe(now);
         }

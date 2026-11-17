@@ -1,7 +1,7 @@
 //! Thread normalization: the one place where the topic the server stated
 //! becomes a canonical [`ThreadKey`] (plan section 3).
 
-use crate::model::{ChatId, Message, ThreadKey, TopicId};
+use crate::model::{ChatId, ChatKind, Message, ThreadKey, TopicId};
 
 /// What core knows about whether a chat is a forum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +22,20 @@ pub enum Route {
     /// A topic-headed message in a chat core thinks is not a forum: run the
     /// forum-change path, otherwise as [`Route::ChatOnly`].
     ForumSuspected(ChatId),
+}
+
+/// `kind` with its forum flag set to what `status` says (only a supergroup
+/// has one; an unknown status changes nothing).
+pub fn with_status(kind: ChatKind, status: ForumStatus) -> ChatKind {
+    match (kind, status) {
+        (ChatKind::Supergroup { gigagroup, .. }, ForumStatus::Forum | ForumStatus::NotForum) => {
+            ChatKind::Supergroup {
+                forum: status == ForumStatus::Forum,
+                gigagroup,
+            }
+        }
+        _ => kind,
+    }
 }
 
 /// Routes a message of `chat` whose forum header named `raw` (`None` when it

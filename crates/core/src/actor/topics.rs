@@ -40,7 +40,7 @@ use crate::model::{ChatId, Message, MsgId, ThreadKey, TopicId};
 use crate::store::{
     AutoRefresh, ByIdCall, ByIdSnapshot, ForumStatus, ListChange, NotBefore, PageCall, PageKind,
     PageSnapshot, Paging, PostClosed, Refresh, Rest, TOPICS_CALL_INTERVAL, Tail, TopicEdit, Topics,
-    normalize,
+    UnreadTrigger, normalize,
 };
 
 /// Most topics jobs queued at once: a page and a by-id call per retained
@@ -218,7 +218,7 @@ impl<B: Backend> Actor<B> {
     /// Whether automatic topics calls may be dispatched: on a live instance
     /// whose update baseline is established (topic snapshots are taken only
     /// after it, plan section 1).
-    fn topics_ready(&self) -> bool {
+    pub(super) fn topics_ready(&self) -> bool {
         self.live.is_some()
             && match self.life.phase {
                 Phase::Live => true,
@@ -417,7 +417,7 @@ impl<B: Backend> Actor<B> {
                     self.load_ended(target, Some(super::apply::user_error(e)))
                         .await;
                 }
-                return;
+                return self.topics_refused(call.chat, e).await;
             }
         };
         let TopicsPage {
@@ -473,7 +473,8 @@ impl<B: Backend> Actor<B> {
             Ok(found) => found,
             Err(e) => {
                 self.topics.note_flood(e, now);
-                return self.fail_call(call, now);
+                self.fail_call(call, now);
+                return self.topics_refused(call.chat, e).await;
             }
         };
         let TopicsById {
@@ -546,7 +547,14 @@ impl<B: Backend> Actor<B> {
             Update::Deleted {
                 chat: Some(chat), ..
             }
-            | Update::TopicEdited { chat, .. } => *chat,
+            | Update::TopicEdited { chat, .. }
+            | Update::TopicsPinned { chat }
+            | Update::ReadInbox {
+                chat,
+                topic: Some(_),
+                ..
+            }
+            | Update::ReadTopicMax { chat, .. } => *chat,
             _ => return,
         };
         if self.topics.lists.get(chat).is_none() {
@@ -583,9 +591,42 @@ impl<B: Backend> Actor<B> {
                 };
                 list.on_topic_edited(*topic, edit, now)
             }
+            // A read on another device: the count is the server's to say.
+            Update::ReadInbox {
+                topic: Some(topic), ..
+            }
+            | Update::ReadTopicMax { topic, .. } => {
+                list.trigger_unread(*topic, UnreadTrigger::ReadRemotely, now)
+            }
+            // The pinned set changed: the first page again, through the
+            // automatic limiter (shown forum) or the next open (any other).
+            Update::TopicsPinned { .. } => {
+                list.want_first_page();
+                Vec::new()
+            }
             _ => return,
         };
         self.emit_list_changes(chat, changes).await;
+    }
+
+    /// `chat`'s forum flag changed (plan section 6.6): its list goes. A
+    /// shown forum that is still one starts again from its first page; one
+    /// that no longer is stops being shown.
+    pub(super) fn forum_kind_changed(&mut self, chat: ChatId, after: ForumStatus) {
+        let shown = self.topics.lists.shown() == Some(chat);
+        self.topics.lists.invalidate(chat);
+        if shown {
+            match after {
+                ForumStatus::Forum => {
+                    let open = self.open_topic(chat);
+                    let list = self.topics.lists.open(chat);
+                    list.set_open(open);
+                    list.request_page(PageKind::First);
+                }
+                ForumStatus::NotForum | ForumStatus::Unknown => self.close_forum(chat),
+            }
+        }
+        self.topics.prune_cursors();
     }
 
     /// The topic of each of `ids` a window of `chat` holds.

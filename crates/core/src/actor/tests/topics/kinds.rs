@@ -1,8 +1,8 @@
 //! Forum knowledge outlives the chat list (plan section 3): the retained
 //! views remember the kind a summary last stated for their chat, so a chat
 //! that leaves the dialogs keeps it, and a view's shape never overrides it.
-//! The memory goes with the views. (Fencing and cleanup after a kind
-//! change are task 8's.)
+//! The memory goes with the views. (Fencing and kind changes are in
+//! `fence`.)
 
 use std::time::Duration;
 
