@@ -46,7 +46,8 @@ async fn settled() -> (Harness, CacheHandle, CacheDir) {
     let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     let cache = cache_at(dir.path(), &key);
-    let mut h = harness(FakeScript::demo(1, 10), Some(cache.clone())).await;
+    // Two chats: the second is the closed-window test's command barrier.
+    let mut h = harness(FakeScript::demo(2, 10), Some(cache.clone())).await;
     open_settled(&mut h, &cache).await;
     (h, cache, dir)
 }
@@ -95,6 +96,12 @@ async fn a_closed_window_writes_no_topic_tagged_message_through() {
     let before = cached(&cache, 10).await.expect("the tail was cached");
     h.send(Command::CloseThread(ThreadKey::whole(chat(1))))
         .await;
+    // Commands and updates reach the actor on separate channels. Opening
+    // chat 2 and waiting for its history proves the close was handled
+    // before the update below is pushed; otherwise the message can land in
+    // the still-open, contiguous window and be written through.
+    h.send(Command::OpenThread(ThreadKey::whole(chat(2)))).await;
+    h.history(chat(2), HistoryDir::Tail).await;
 
     h.fake
         .push_update(Update::NewMessage(tagged(11, "while closed")))

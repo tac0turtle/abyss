@@ -157,6 +157,84 @@ pub struct ChatSummary {
     pub can_send: bool,
 }
 
+/// How the server ordered a forum's topic list
+/// (`messages.forumTopics.order_by_create_date`).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TopicOrder {
+    /// By last activity: a topic's newest message ranks it.
+    LastActivity,
+    /// By creation date, newest first. Live messages never move a topic.
+    Created,
+}
+
+/// How a topic's unread count relates to what happened since the server sent
+/// it. A display hint only: the count itself is always the server's (plan
+/// section 6.4).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    /// The count came from the newest snapshot, and nothing happened since.
+    Current,
+    /// An incoming message arrived after the count was taken.
+    NewSince,
+    /// The user read the topic after the count was taken.
+    ReadSince,
+    /// Something else changed the count (a remote read, a deletion).
+    Stale,
+}
+
+/// Whether a topic is listed (`forumTopic.hidden`, General only). Hidden
+/// topics are kept for routing but never emitted.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    Shown,
+    Hidden,
+}
+
+/// One forum topic, as the UI shows it.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Topic {
+    pub id: TopicId,
+    /// Sanitized via [`crate::sanitize::display_name`].
+    pub title: String,
+    /// The topic's creation date (`forumTopic.date`), Unix seconds.
+    pub created: i64,
+    pub closed: bool,
+    pub pinned: bool,
+    /// The server's count only; never changed locally (plan section 6.4).
+    pub unread: u32,
+    pub unread_mentions: u32,
+    pub freshness: Freshness,
+    pub read_inbox_max: MsgId,
+    pub last: Option<Preview>,
+    /// Unix seconds.
+    pub last_date: i64,
+    /// The topic's top (newest) message.
+    pub last_id: Option<MsgId>,
+}
+
+impl Topic {
+    pub fn is_valid(&self) -> bool {
+        is_clean(&self.title, MAX_NAME_BYTES) && self.last.as_ref().is_none_or(Preview::is_valid)
+    }
+
+    /// Heap bytes retained beyond the inline struct (title and preview), for byte budgets.
+    pub fn retained_bytes(&self) -> usize {
+        self.title.capacity() + self.last.as_ref().map_or(0, Preview::retained_bytes)
+    }
+}
+
+/// A topic as the backend reports it: the public [`Topic`] plus what core
+/// applies but never emits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopicSnapshot {
+    pub topic: Topic,
+    pub visibility: Visibility,
+    /// [`Message::version`] of the top message (`i64::MIN` when it was never
+    /// edited, or there is none). Orders a live edit of the top message
+    /// against this snapshot's preview.
+    pub top_version: i64,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Sender {
     pub id: ChatId,
@@ -225,13 +303,17 @@ impl Message {
 impl ChatSummary {
     /// Heap bytes retained beyond the inline struct (title and preview), for byte budgets.
     pub fn retained_bytes(&self) -> usize {
-        let preview = match &self.last {
-            Some(Preview::Text(s) | Preview::Media(MediaKind::Document { name: s, .. })) => {
-                s.capacity()
-            }
+        self.title.capacity() + self.last.as_ref().map_or(0, Preview::retained_bytes)
+    }
+}
+
+impl Preview {
+    /// Heap bytes retained beyond the inline value, for byte budgets.
+    pub fn retained_bytes(&self) -> usize {
+        match self {
+            Preview::Text(s) | Preview::Media(MediaKind::Document { name: s, .. }) => s.capacity(),
             _ => 0,
-        };
-        self.title.capacity() + preview
+        }
     }
 }
 

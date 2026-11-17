@@ -171,7 +171,7 @@ pub struct Topic {
 - `title_missing` topics and empty sanitized titles get a fixed fallback: "General" for id 1, "Topic" otherwise (app copy, in `chat/copy.rs`).
 - `icon_color` and `icon_emoji_id` are not in the model (D3).
 - Visibility (`hidden`, General only) is the public `Visibility` enum below, carried only by the backend's `TopicSnapshot`. Deletion suspicion is a core-internal enum (section 6.4). Hidden topics are never emitted, so the public `Topic` (what events carry to the UI) doesn't carry either.
-- **`TopicSnapshot`** is what the backend returns: `pub struct TopicSnapshot { pub topic: Topic, pub visibility: Visibility }`, with `pub enum Visibility { Shown, Hidden }` mapped from `forumTopic.hidden`. Core applies `visibility` under the merge rules of section 6.4 and emits only `Topic`. This is the only path by which a cold load, or a refresh after a missed hide/unhide, learns visibility.
+- **`TopicSnapshot`** is what the backend returns: `pub struct TopicSnapshot { pub topic: Topic, pub visibility: Visibility, pub top_version: i64 }`, with `pub enum Visibility { Shown, Hidden }` mapped from `forumTopic.hidden`. `top_version` is the top message's `Message::version()` (`i64::MIN` when unedited or absent). It is the snapshot's `last_version`, so a stale live edit of the top message can't overwrite a newer snapshot preview (task 2 review). Core applies `visibility` under the merge rules of section 6.4 and emits only `Topic`. This is the only path by which a cold load, or a refresh after a missed hide/unhide, learns visibility.
 
 **Thread normalization: one function, at core's ingress.** The backend reports the topic as the server stated it: `Message.thread.topic` from `reply_and_topic`, `None` when there was no forum header. Core turns that into a canonical key in exactly one place:
 
@@ -279,7 +279,7 @@ enum Update {
 **Grammers (task 4).** Raw calls, retry class `Read` for everything except `send_text` (`Never`, S1 §9).
 - **`topics`:** `messages.GetForumTopics { q: None, .. }`.
   - The response is size-checked before mapping, like `dialogs_parts` (`map/lists.rs`): `topics ≤ limit + RESPONSE_SLACK`, `messages ≤ 2 ×` that, peers `≤ MAX_RESPONSE_PEERS`. Otherwise the call fails as `Oversized`.
-  - Each topic is mapped with its top message from `messages` (preview, date). `order` comes from `order_by_create_date`. `forumTopicDeleted` entries are skipped.
+  - Each topic is mapped with its top message from `messages` (preview, date, and `top_version` from its `edit_date`; section 3). `order` comes from `order_by_create_date`. `forumTopicDeleted` entries are skipped.
   - `next` is `None` when the page had fewer than `limit` topics, or when `count` is reached.
 - **`topics_by_id`:** `messages.GetForumTopicsByID`, at most `MAX_TOPICS_BY_ID` ids, same size checks. `forumTopicDeleted { id }` goes to `deleted`.
 - **`peer_dialogs`:** `messages.GetPeerDialogs`, at most `MAX_PEER_DIALOGS` peers, size-checked like a dialogs page. The dialogs are mapped with the existing dialog mapping (kind from `chats`, unread, top message). Broadcasts are excluded as in Stage 1.
@@ -341,7 +341,7 @@ struct TopicEntry {
 pub struct Topics { by_chat: HashMap<ChatId, TopicList>, lru: Vec<ChatId>, shown: Option<ChatId>, next_gen: u64 }
 ```
 
-- **Caps.** At most `MAX_TOPIC_LISTS = 8` lists (LRU, like `Windows`). The shown forum is never evicted. A list holds at most `MAX_TOPICS_PER_FORUM = 500` topics, plus the open topic if it would otherwise be cut. Past the cap, paging stops and the UI shows "topic limit for this view" (the Stage 1 history-limit pattern).
+- **Caps.** At most `MAX_TOPIC_LISTS = 6` lists (LRU, like `Windows`; 6, not 8, keeps the section 9 budget's margin). The shown forum is never evicted. A list holds at most `MAX_TOPICS_PER_FORUM = 500` topics, plus the open topic if it would otherwise be cut. Past the cap, paging stops and the UI shows "topic limit for this view" (the Stage 1 history-limit pattern).
 - **Order.** Pinned topics come first, in server order. The rest depend on the list's `order`:
   - **`LastActivity`:** server order on load. A live message moves its topic to the top of the unpinned part exactly when `last_id` grows (Stage 1's `bump_moves`). An applied snapshot that lowers `last_id` (the top message was deleted) moves the topic down to where its new `last_id` ranks. A topic learned by id goes where its `last_id` ranks among the loaded unpinned topics. When the list is incomplete and it ranks below the last loaded topic, it goes at the end, and a later page that contains it updates it in place (ids are deduplicated).
   - **`Created`:** server order on load (newest created first). Live messages update `last`, `last_date`, `last_id` and unread, but **never move** a topic. A topic learned by id is inserted by `created` (descending, ties by id descending). A new topic therefore appears at the top of the unpinned part.
@@ -441,6 +441,9 @@ One rule covers every topic snapshot: first pages, later pages, by-id results, a
 - **Stale** (`S <= seen`): skip it.
 - **Conflict** (`seen < S <= changed`): skip it and keep the current state. The topic stays (or becomes) due, so a later-dispatched refetch settles it.
 - A topic new to the list is applied as is. Live events for topics not in the list aren't stored, but each one adds the topic to discovery.
+- **Unlisted changes (task 2 review).** Each list keeps one stamp, `unlisted_change`: the clock's value at the last live event that touched a topic the list doesn't hold (a message, an edit, a read, a topic edit), and at every deletion (any id may belong to such a topic). A topic that a result dispatched at or before that stamp adds to the list starts with every group `changed = unlisted_change`, and it is due. This is conservative: it costs a refetch, never a value. It protects eventual correction, because otherwise a page in flight across a dropped event (for example a root deletion, or an edit of the top message) could insert stale state that nothing refetches.
+- **Settling a due topic (task 2 review).** A by-id result clears a topic's due state only when the topic is fully settled afterwards: every group's last applied snapshot postdates its last live change (`seen > changed`), and no deletion is suspected. Otherwise the topic stays due and backs off, even when the result was merely stale. Pages never settle due state.
+- Every live change of a group (activity growth from any message, an edit of the top message, a topic edit, a trigger) makes its topic due. The posting permission (`can_post_closed`) has its own dispatch stamp and follows the same "newer dispatch wins" rule; a discarded page changes nothing.
 
 **Example (finding 1).** A by-id snapshot for topic T is dispatched at seq 5, and the server already has message 101. The result applies `unread = 1`. Then the delayed live 101 arrives. It is a trigger, not an increment: `freshness = NewSince`, `changed = 5`, T is due. The next refetch is dispatched at seq 6 or later and gives the server's count again (1). No count ever reads 2.
 
@@ -469,7 +472,7 @@ enum Deletion { None, Suspected }           // core-internal; a local suspicion 
 - **Cap:** `MAX_TOMBSTONES = 64` per list. Before one is discarded for room, every in-flight fetch older than it is invalidated (its result is dropped on arrival) and re-queued.
 
 **Refetch scheduling (required vs. disposable; fixes finding 3).**
-- **Required work lives on the entries themselves.** A topic is *due* when any group has a live change newer than its `seen`, when it is `Suspected`, or when a page missed it. Each due entry carries `next_try: Instant` and a backoff step: 0 s, then 1 s, 2 s, 4 s, … up to 30 s after each conflict. Due state can't overflow, because it costs no extra storage beyond the ≤ 501 entries.
+- **Required work lives on the entries themselves** (the implementation keeps the due record inline on each entry, with no separate map). A topic is *due* when any group has a live change newer than its `seen`, when it is `Suspected`, or when a page missed it. Each due entry carries `next_try: Instant` and a backoff step: 0 s, then 1 s, 2 s, 4 s, … up to 30 s after each conflict. Due state can't overflow, because it costs no extra storage beyond the ≤ 501 entries.
 - **Draining** is fair and independent of display order. Due topics live in `due`, a map keyed by `TopicId`, not in the display-ordered vector. Live bumps, pins and snapshots reorder the display, but never the drain.
   - Each by-id call reserves **one slot for the open topic** when it is due.
   - The other **19** slots (20 when the open topic isn't due) take eligible due ids in ascending id order, starting after `cursor` and wrapping around. `cursor` becomes the last id taken.
@@ -670,7 +673,7 @@ enum Pane { Empty, Thread(ThreadKey), Forum { chat: ChatId, open: Option<TopicId
 
 | What | Cap | On overflow |
 |---|---|---|
-| Retained topic lists | `MAX_TOPIC_LISTS = 8` (LRU; the shown one is never evicted) | evict the least recently used |
+| Retained topic lists | `MAX_TOPIC_LISTS = 6` (LRU; the shown one is never evicted) | evict the least recently used |
 | Topics per forum | `MAX_TOPICS_PER_FORUM = 500` (+ the open topic) | stop paging, show "topic limit for this view" |
 | Topics page | `TOPICS_PAGE = 50` (`limit`) | — |
 | Topics / peer-dialogs response | `limit + RESPONSE_SLACK` items, `2 ×` that messages, `MAX_RESPONSE_PEERS` peers | call fails `Oversized` |
@@ -693,7 +696,7 @@ enum Pane { Empty, Thread(ThreadKey), Forum { chat: ChatId, open: Option<TopicId
 | Cache | per-chat `MAX_CACHED_PER_CHAT` and the global budget, counted across all topics of a forum | Stage 1 eviction |
 | Event bytes | `Topic::retained_bytes` counted in `Event::retained_bytes` | sender waits (S1 §6) |
 
-Topic lists are not counted in `MAX_STORE_BYTES`. A unit test asserts the bound from the constants: 8 lists × (501 entries × (title ≤ 256 B + preview ≤ 512 B + inline entry with stamps and due state) + 64 tombstones + 64 discovery ids + 2 in-flight records × 20 ids), plus the `due` maps (≤ 501 each), the badge dirty stamps (≤ 1,000) and the kind-check FIFO with its marks (≤ 1,264 chats), comes to under 4 MiB.
+Topic lists are not counted in `MAX_STORE_BYTES`. The budget is **retained payload capacity**: every container's allocated capacity (not its length), B-tree storage at its worst-case node count, 32 bytes of allocator overhead per heap allocation, and the outer `Topics` map and LRU. Allocator fragmentation and transient peaks inside one operation are not counted. A unit test asserts the bound from the constants: 6 lists × (501 entries × (inline entry with stamps and inline due state + title ≤ 256 B + preview ≤ 512 B + two allocations) + 64 tombstones + 64 discovery ids + 20 in-flight ids), plus the outer containers, the badge dirty stamps (≤ 1,000) and the kind-check FIFO with its marks (≤ 1,264 chats), comes to about 3.48 MB, at least 10% under 4 MiB. A second test drives full lists through paging, refreshes, discovery and open-topic churn, and checks their measured capacities against that bound. Capacity growth is released after each change (the entries vector is shrunk back to 501, strings to their length).
 
 ## 10. Encrypted cache
 
@@ -1053,3 +1056,12 @@ Follow-ups (not Stage 2 tasks):
 |---|---|---|
 | 1 | P3: "topic is always `None`" was false for message payloads; the key-equality invariant doesn't hold yet | Task 1 text says `None` applies to keys only; normalization and window/event equality deferred to task 7, cache enforcement to task 5; `shown_in` documents the hand-off |
 | 2 | P3: no regression test for a topic-tagged message in a whole-chat window | `actor/tests/topic_keys.rs` (deliver and edit into an open window; no cache write-through for a closed one) and an invalid `TopicCreate` id case in `map.rs` |
+
+### Task 2: topic model, ordering and merge policy (4 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 (ready after fixes) | P2: unlisted edits bypassed `unlisted_change`; page placement undid newer activity; cap evictions not emitted and not enforced on `set_open`; posting permission followed completion order; live changes didn't make topics due; memory test didn't prove the bound | `note_unlisted` for edits; rank kept/repositioned; evictions emitted as `Removed`, consumer contract on `ListChange`; `post_closed_seen` stamp; live changes mark due; measured capacities, inline due state |
+| 2 (ready after fixes) | P2: a refresh demoted omitted topics with newer live activity; replay divergence hidden by a `Reset` fallback. P3: budget was an estimate. Flaky closed-window test | Omitted topics keep earned rank; shown-only placement, `debug_assert` on replay, deliberate `ServerOrder` reset only for later pages; "retained payload capacity" budget with 17% margin, `MAX_TOPIC_LISTS` 6; command-ordering barrier in the test |
+| 3 (ready after fixes) | P2: omitted topics with a newer applied snapshot were demoted | `keep_rank` filters on `activity.judge(seq) != Apply`; cap-case regression |
+| 4 | Pass | — |

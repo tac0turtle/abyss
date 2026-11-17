@@ -450,6 +450,12 @@ impl ChatShell {
         }
         res
     }
+
+    /// The echo table, for tests.
+    #[cfg(test)]
+    pub(crate) fn echoes(&self) -> &super::sends::Echoes {
+        &self.echoes
+    }
 }
 
 /// Whether the open chat's newest message is on screen and the window is
