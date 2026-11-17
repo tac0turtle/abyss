@@ -10,6 +10,7 @@ pub(crate) mod copy;
 pub(crate) mod demo;
 pub(crate) mod discarded;
 pub(crate) mod drafts;
+pub(crate) mod first_unread;
 pub(crate) mod format;
 pub(crate) mod inline;
 pub(crate) mod list;
@@ -24,7 +25,7 @@ pub(crate) mod viewport;
 use std::collections::HashSet;
 use std::time::Instant;
 
-use abyss_core::api::{ConnState, Event, LoadTarget, UserError, WindowState};
+use abyss_core::api::{ConnState, Event, HistoryDir, LoadTarget, UserError, WindowState};
 use abyss_core::model::{
     ChatId, ChatKind, ChatSummary, Message, MsgId, ThreadKey, TopicGone, TopicId,
 };
@@ -33,6 +34,7 @@ use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, Task, px};
 
 pub(crate) use self::commands::{Admit, Refused};
 use self::discarded::Obsolete;
+use self::first_unread::{Divider, OpenRead, Opening, ReadGate};
 use self::inline::Inline;
 use self::list::ChatList;
 use self::messages::{Applied, Batch, MessageWindow, RowOp};
@@ -146,8 +148,11 @@ pub(crate) struct ChatShell {
     rows: ListState,
     shown_echoes: usize,
     revealed: HashSet<MsgId>,
-    /// Highest id core admitted as read for the open thread.
+    /// Highest id core admitted as read for the open thread; it starts at
+    /// the read position captured at open (plan section 17.5).
     read_sent: Option<MsgId>,
+    /// The open thread's read gate, divider and first positioning.
+    first_unread: OpenRead,
     /// The thread core was last told shows its live tail (`ViewingTail`).
     viewing: Option<ThreadKey>,
     /// Composer text of threads not open (task 6k): the box belongs to the
@@ -228,6 +233,7 @@ impl Default for ChatShell {
             shown_echoes: 0,
             revealed: HashSet::new(),
             read_sent: None,
+            first_unread: OpenRead::default(),
             viewing: None,
             drafts: drafts::Drafts::default(),
             core: CoreState::Running,
@@ -556,6 +562,10 @@ impl ChatShell {
             }
             Event::ThreadInvalidated(thread) => {
                 let applied = self.open_window(thread).map(MessageWindow::invalidate);
+                if applied.is_some() {
+                    // A new view comes: no read until it is painted.
+                    self.first_unread.gate = ReadGate::AwaitingHistory;
+                }
                 self.sync_rows(applied);
             }
             Event::Edited(m) => {
@@ -646,8 +656,16 @@ impl ChatShell {
         match target {
             LoadTarget::Dialogs => self.list.load_ended(error, now),
             LoadTarget::History { thread, dir } => {
-                if let Some(w) = self.open_window(thread) {
-                    w.load_ended(dir, error, now);
+                let Some(w) = self.open_window(thread) else {
+                    return;
+                };
+                w.load_ended(dir, error, now);
+                // The anchored open's load failed (best effort): the thread
+                // opens at its tail instead.
+                if matches!(dir, HistoryDir::Tail | HistoryDir::Around)
+                    && self.first_unread.opening == Opening::Anchored
+                {
+                    self.first_unread.opening = Opening::FallbackDue;
                 }
             }
             LoadTarget::Topics(chat) => {
@@ -757,18 +775,110 @@ impl ChatShell {
     /// top of the viewport survives it (task 10e): a refresh that replaces
     /// the window keeps late live messages, and the user may be reading
     /// one. Following the tail, the list stays at the tail anyway.
+    ///
+    /// A view's first history moves the read gate to its first paint. The
+    /// open's first view is positioned at the divider when it holds it
+    /// (plan section 17.5); otherwise the list stays at the tail.
     fn on_history(&mut self, thread: ThreadKey, batch: Batch) {
         let anchor = self.scroll_anchor();
+        let late = self.late_divider(thread, &batch);
+        let (view, dir) = (batch.view, batch.dir);
         let Some(w) = self.open_window(thread) else {
             return;
         };
         let applied = w.apply(batch);
         let reset = applied == Applied::Reset;
         self.sync_rows(Some(applied));
-        if reset && let Some((id, offset_in_item)) = anchor {
-            self.restore_anchor(id, offset_in_item);
+        if let Some(after) = late {
+            self.first_unread.divider = Divider::At(after);
+        }
+        if reset {
+            self.first_unread.gate = ReadGate::AwaitingPaint { view };
+            // Rows painted before this view must not open the gate.
+            drop(self.painted.take());
+            if self.first_unread.opening == Opening::Positioned {
+                if let Some((id, offset_in_item)) = anchor {
+                    self.restore_anchor(id, offset_in_item);
+                }
+            } else {
+                self.first_unread.opening = Opening::Positioned;
+                self.scroll_to_divider(dir);
+            }
         }
         self.after_echo_change();
+    }
+
+    /// Scrolls the divider's row to the top of the viewport (following the
+    /// tail stops), if the window holds it. An `Around` page proves the
+    /// first message above the anchor is the first newer one, even when
+    /// nothing at or below the anchor is loaded: that proof is kept for
+    /// the divider's row.
+    fn scroll_to_divider(&mut self, dir: HistoryDir) {
+        if dir == HistoryDir::Around {
+            let first_new = self
+                .first_unread
+                .after()
+                .zip(self.window.as_ref())
+                .and_then(|(after, w)| w.get(w.first_above(after)?))
+                .map(|m| m.id);
+            self.first_unread.first_new = first_new;
+        }
+        if let Some(item_ix) = self.divider_ix() {
+            self.rows.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: px(0.),
+            });
+        }
+    }
+
+    /// The late divider (plan section 17.5): with nothing captured at open,
+    /// an incoming message that arrives at the attached tail while the tail
+    /// isn't viewed (the window is inactive or scrolled up) gets the
+    /// divider, right after the newest message before it. Once per open.
+    fn late_divider(&self, thread: ThreadKey, batch: &Batch) -> Option<MsgId> {
+        if self.first_unread.divider != Divider::Unset
+            || batch.dir != HistoryDir::Newer
+            || (self.active == WindowState::Active && self.viewing == Some(thread))
+        {
+            return None;
+        }
+        let w = self
+            .window
+            .as_ref()
+            .filter(|w| w.thread() == thread && w.view() == Some(batch.view) && !w.has_newer())?;
+        let newest = w.newest()?;
+        batch
+            .messages
+            .iter()
+            .any(|m| !m.outgoing && m.id > newest)
+            .then_some(newest)
+    }
+
+    /// Whether message row `ix` starts with the divider.
+    pub(crate) fn divider_before(&self, ix: usize) -> bool {
+        self.divider_ix() == Some(ix)
+    }
+
+    /// The divider's row: where the window holds what comes right before
+    /// the first message above the read position, or where an `Around`
+    /// page proved that message the first newer one.
+    fn divider_ix(&self) -> Option<usize> {
+        let after = self.first_unread.after()?;
+        let w = self.window.as_ref()?;
+        w.divider_row(after).or_else(|| {
+            let ix = w.first_above(after)?;
+            (Some(w.get(ix)?.id) == self.first_unread.first_new).then_some(ix)
+        })
+    }
+
+    /// The divider goes (a send): its row is redrawn without it, and none
+    /// comes back while the pane shows the thread.
+    fn remove_divider(&mut self) {
+        let row = self.divider_ix();
+        self.first_unread.divider = Divider::Gone;
+        if let Some(ix) = row {
+            self.rows.remeasure_items(ix..ix + 1);
+        }
     }
 
     /// The message at the top of the viewport and how far into it the

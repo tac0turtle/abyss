@@ -7,6 +7,12 @@
 //! topics page, with pinned, closed and unread topics; chat 12's list is in
 //! creation order, the others by activity (Stage 2 task 3; the app shows
 //! topics from task 10).
+//!
+//! Each chat's read pointer leaves its unread count of incoming messages
+//! above it, so unread chats open at their first unread message (Stage 2
+//! task 18): the showcase has 120 unread among its own messages, chat 6
+//! only its own messages above the pointer, and the first forum's General
+//! topic over a page of unread posts.
 
 use abyss_core::backend::fake::FakeScript;
 use abyss_core::model::{
@@ -21,6 +27,14 @@ const SHOWCASE_MESSAGES: i32 = 2000;
 const MESSAGES: i32 = 30;
 /// The demo forum whose topics are listed by creation date.
 const CREATION_ORDERED_FORUM: i64 = 12;
+/// Unread messages in the showcase: more than two history pages.
+const SHOWCASE_UNREAD: u32 = 120;
+/// The chat whose only messages above its read pointer are the user's own.
+const OWN_ABOVE_POINTER: i64 = 6;
+/// The demo forum whose General topic gains a page of unread posts.
+const UNREAD_FORUM: i64 = 2;
+/// Posts added to that General topic.
+const GENERAL_POSTS: i32 = 120;
 
 fn chat_id(n: i64) -> ChatId {
     let kind = match n % 5 {
@@ -202,6 +216,60 @@ fn showcase(chat: ChatId, now: i64) -> Vec<Message> {
         .collect()
 }
 
+/// Sets `summary`'s newest message id, and places its read pointer so its
+/// unread count of incoming messages is above it. The showcase gets
+/// [`SHOWCASE_UNREAD`]. In chat [`OWN_ABOVE_POINTER`] only the user's own
+/// last three messages are above it, under a scripted count of 1, which the
+/// fake serves until the first read.
+fn read_up_to(summary: &mut ChatSummary, history: &mut [Message]) {
+    summary.last_id = history.last().map(|m| m.id);
+    if summary.id == chat_id(1) {
+        summary.read.unread = SHOWCASE_UNREAD;
+    }
+    if summary.id == chat_id(OWN_ABOVE_POINTER) {
+        let own = history.len().saturating_sub(3);
+        for m in history.iter_mut().skip(own) {
+            m.outgoing = true;
+        }
+        summary.read = ReadState {
+            unread: 1,
+            read_inbox_max: history.get(own).map_or(MsgId(0), |m| MsgId(m.id.0 - 1)),
+        };
+        return;
+    }
+    let unread = usize::try_from(summary.read.unread).unwrap_or(usize::MAX);
+    summary.read.read_inbox_max = match unread.checked_sub(1) {
+        None => history.last().map_or(MsgId(0), |m| m.id),
+        Some(k) => history
+            .iter()
+            .rev()
+            .filter(|m| !m.outgoing)
+            .nth(k)
+            .map_or(MsgId(0), |m| MsgId(m.id.0 - 1)),
+    };
+}
+
+/// [`GENERAL_POSTS`] posts into the forum's General topic, newest last,
+/// every fifth the user's own: General is read only up to its first
+/// message, so it opens around its read position.
+fn general_posts(history: &mut Vec<Message>, now: i64) {
+    let chat = chat_id(UNREAD_FORUM);
+    let first = history.last().map_or(1, |m| m.id.0 + 1);
+    for i in 0..GENERAL_POSTS {
+        let date = now - i64::from(GENERAL_POSTS - i) * 4;
+        let body = Body::Text(RichText::plain(&format!("Catching up {i} in General")));
+        let mut m = message(chat, first + i, date, body);
+        m.outgoing = i % 5 == 0;
+        if !m.outgoing {
+            m.sender = Some(Sender {
+                id: chat_id(10_001),
+                name: display_name("Grace"),
+            });
+        }
+        history.push(m);
+    }
+}
+
 fn ordinary(chat: ChatId, n: i64, now: i64) -> Vec<Message> {
     let senders = ["Ada", "Grace", "Linus"];
     (1..=MESSAGES)
@@ -239,12 +307,18 @@ pub(crate) fn script(now: i64) -> FakeScript {
             script.add_demo_forum(id, now, order);
             continue;
         }
-        let history = if n == 1 {
+        let mut history = if n == 1 {
             showcase(id, now)
         } else {
             ordinary(id, n, now)
         };
+        if let Some(summary) = script.dialogs.last_mut() {
+            read_up_to(summary, &mut history);
+        }
         script.history.insert(id, history);
+    }
+    if let Some(general) = script.history.get_mut(&chat_id(UNREAD_FORUM)) {
+        general_posts(general, now);
     }
     script.folders = folders();
     script

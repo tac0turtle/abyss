@@ -842,6 +842,11 @@ fn message_row(
             .window()
             .is_some_and(|w| w.is_loaded() && !w.has_older()))
     .then(|| day_separator(copy::START_OF_HISTORY.into()));
+    // Each row carries the tone of its own age, so history darkens upward.
+    let depth = depth_of(row.date(), format::now(), &ctx.tz);
+    let divider = shell
+        .divider_before(ix)
+        .then(|| unread_divider(theme.text_on(depth)));
     let content = match row {
         Row::Message(m) => {
             let reply = m
@@ -851,8 +856,6 @@ fn message_row(
         }
         Row::Echo(e) => echo_row(e, &theme, cx),
     };
-    // Each row carries the tone of its own age, so history darkens upward.
-    let depth = depth_of(row.date(), format::now(), &ctx.tz);
     let row = div()
         .w_full()
         .px_4()
@@ -863,6 +866,7 @@ fn message_row(
         .text_color(theme.text_on(depth))
         .children(start)
         .children(separator)
+        .children(divider)
         .child(content);
     // Painted bounds feed the after-paint check (mark read, live tail).
     shell.painted().track(ix, row).w_full().into_any_element()
@@ -875,6 +879,22 @@ fn day_separator(label: SharedString) -> Div {
         .flex()
         .justify_center()
         .child(muted(label).text_xs())
+}
+
+/// The read position (plan section 17.5, decision D10): a full-width band
+/// like the day separator, its label in quiet ink between hairline rules
+/// of the row's ink. No colour (brand rule 2).
+fn unread_divider(ink: Rgba) -> Div {
+    let rule = || div().flex_1().h(px(1.)).bg(theme::line(ink));
+    div()
+        .w_full()
+        .py_2()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(rule())
+        .child(muted(copy::NEW_SINCE_READ).text_xs().flex_none())
+        .child(rule())
 }
 
 /// Which side of the pane a bubble sits on.

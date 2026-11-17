@@ -56,10 +56,8 @@ fn summary() -> ChatSummary {
         title: "c".into(),
         kind: ChatKind::Private { contact: false },
         pinned: false,
-        read: ReadState {
-            unread: 2,
-            read_inbox_max: MsgId(0),
-        },
+        // Nothing unread: it opens at its tail (plan section 17.5).
+        read: ReadState::default(),
         unread_mentions: 0,
         last: None,
         last_date: 0,
@@ -467,3 +465,5 @@ fn switching_chats_keeps_echoes_with_their_chat() {
         "the pending send is still shown"
     );
 }
+
+mod first_unread;

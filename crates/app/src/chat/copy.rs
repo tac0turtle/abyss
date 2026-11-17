@@ -50,6 +50,9 @@ pub(crate) const ARCHIVE: &str = "Archive";
 pub(crate) const ARCHIVE_BACK: &str = "‹ Archive";
 pub(crate) const LOADING_HISTORY: &str = "Loading…";
 pub(crate) const START_OF_HISTORY: &str = "Start of the conversation";
+/// The divider at the read position of a thread opened with unread
+/// messages (plan section 17.5, decision D10).
+pub(crate) const NEW_SINCE_READ: &str = "New since you last read";
 pub(crate) const EMPTY_CHAT: &str = "No messages yet";
 pub(crate) const EDITED: &str = "edited";
 pub(crate) const UNSUPPORTED: &str = "This message type isn't supported yet.";

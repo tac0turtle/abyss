@@ -310,6 +310,39 @@ fn inline_topics(dir: &Path) -> Result<()> {
     shot.save(Mode::Night, "inline-topics-night.png")
 }
 
+/// The showcase opened at its first unread message (plan section 17.5):
+/// core's page around the read position, the divider at the top of the
+/// list. Unverified: written on Linux, where the snapshots don't build.
+fn unread_divider(dir: &Path) -> Result<()> {
+    let mut shot = Shot::open(dir)?;
+    shot.sign_in()?;
+    shot.root.update(&mut shot.cx, |root, window, cx| {
+        root.with_session(|s, cx| s.select_chat(SHOWCASE, window, cx), cx);
+    })?;
+    shot.cx.run_until_parked();
+    let mut script = demo::script(format::now());
+    let after = script
+        .dialogs
+        .iter()
+        .find(|c| c.id == SHOWCASE)
+        .map_or(abyss_core::model::MsgId(0), |c| c.read.read_inbox_max);
+    let messages = script.history.remove(&SHOWCASE).unwrap_or_default();
+    // Like core's page: 10 messages at or below the read position, 40
+    // above it.
+    let above = messages.partition_point(|m| m.id <= after);
+    let start = above.saturating_sub(10);
+    shot.core_says(Event::History {
+        thread: ThreadKey::whole(SHOWCASE),
+        view: ViewGen(1),
+        dir: HistoryDir::Around,
+        messages: messages.into_iter().skip(start).take(50).collect(),
+        removed: Vec::new(),
+        has_more: true,
+    })?;
+    shot.save(Mode::Day, "unread-divider-day.png")?;
+    shot.save(Mode::Night, "unread-divider-night.png")
+}
+
 /// A chat folder's tab selected: its pinned chat first, then its own.
 fn folder(dir: &Path) -> Result<()> {
     let mut shot = Shot::open(dir)?;
@@ -350,6 +383,7 @@ fn snapshots() -> Result<()> {
     archive(&dir)?;
     tabs(&dir)?;
     inline_topics(&dir)?;
+    unread_divider(&dir)?;
     folder(&dir)?;
     list_deep(&dir)
 }

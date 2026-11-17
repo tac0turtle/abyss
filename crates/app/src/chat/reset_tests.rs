@@ -21,10 +21,7 @@ fn summary(title: &str) -> ChatSummary {
         title: title.into(),
         kind: ChatKind::Private { contact: false },
         pinned: false,
-        read: ReadState {
-            unread: 1,
-            read_inbox_max: MsgId(0),
-        },
+        read: ReadState::default(),
         unread_mentions: 0,
         last: None,
         last_date: 0,

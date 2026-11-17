@@ -205,9 +205,24 @@ impl MessageWindow {
         self.messages.get(self.find(id).ok()?)
     }
 
-    #[cfg(test)]
     pub(crate) fn newest(&self) -> Option<MsgId> {
         self.messages.back().map(|m| m.id)
+    }
+
+    /// The row of the first message above `after`, if the window holds one.
+    pub(crate) fn first_above(&self, after: MsgId) -> Option<usize> {
+        let ix = self.messages.partition_point(|m| m.id <= after);
+        (ix < self.messages.len()).then_some(ix)
+    }
+
+    /// The row the divider of read position `after` sits on: the first
+    /// message above it, when the window also holds what comes right
+    /// before that message (a message at or below `after`, or the start
+    /// of history). Above the window's oldest message the divider's place
+    /// is unknown until older history loads.
+    pub(crate) fn divider_row(&self, after: MsgId) -> Option<usize> {
+        self.first_above(after)
+            .filter(|ix| *ix > 0 || !self.has_older)
     }
 
     /// Core's view this window mirrors, once a tail arrived.
@@ -234,11 +249,14 @@ impl MessageWindow {
     }
 
     /// Applies a `History` event. A newer view replaces the window; an older
-    /// one is stale. Until the first tail arrives only a tail is accepted, so
-    /// late events from a previous opening of the thread cannot seed it.
+    /// one is stale. Until the first view arrives only one that starts a
+    /// view (a tail, or a page around a read position) is accepted, so late
+    /// events from a previous opening of the thread cannot seed it.
     pub(crate) fn apply(&mut self, b: Batch) -> Applied {
         match self.view {
-            None if b.dir != HistoryDir::Tail => return Applied::Ignored,
+            None if !matches!(b.dir, HistoryDir::Tail | HistoryDir::Around) => {
+                return Applied::Ignored;
+            }
             Some(cur) if b.view < cur => return Applied::Ignored,
             _ => {}
         }
@@ -277,8 +295,8 @@ impl MessageWindow {
                 self.has_newer = b.has_more;
                 self.has_older |= trimmed;
             }
-            // A detached window around a read position; the app asks for
-            // none yet (`OpenThreadAt`, Stage 2 task 18).
+            // A detached window around the read position of an anchored
+            // open (`OpenThreadAt`): `LoadNewer` pages towards the tail.
             HistoryDir::Around => {
                 self.has_older = true;
                 self.has_newer = b.has_more;

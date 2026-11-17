@@ -7,9 +7,10 @@
 use std::time::Instant;
 
 use abyss_core::api::{Command, HistoryDir, UserError, WindowState};
-use abyss_core::model::{ChatId, LocalId, ThreadKey, TopicId};
+use abyss_core::model::{ChatId, LocalId, MsgId, ThreadKey, TopicId};
 use gpui::FollowMode;
 
+use super::first_unread::{self, OpenRead, Opening};
 use super::inline::Inline;
 use super::messages::MessageWindow;
 use super::retry::AUTO_RESTART_GAP;
@@ -56,18 +57,22 @@ impl ChatShell {
         Ok(())
     }
 
+    /// Opens `thread`, a chat that isn't a forum: at its first unread
+    /// message when it has some (`OpenThreadAt`, plan section 17.5).
     fn show_thread(&mut self, thread: ThreadKey, admit: Admit<'_>) -> Result<(), Refused> {
         if self.pane == Pane::Thread(thread) {
             return Ok(());
         }
+        let after = self.list.get(thread.chat).and_then(first_unread::of_chat);
         // Core stopped (task 6l): local only, so the thread's stranded
         // echoes and draft stay reachable; nothing is asked of core.
         if self.core == CoreState::Running {
-            admit(Command::OpenThread(thread))?;
+            admit(first_unread::open_command(thread, after))?;
         }
         self.topics = None;
         self.set_pane(Pane::Thread(thread));
         self.show_window(Some(thread));
+        self.capture(after);
         Ok(())
     }
 
@@ -92,9 +97,10 @@ impl ChatShell {
         Ok(())
     }
 
-    /// Opens `topic` of the shown forum (`OpenThread` with the topic).
-    /// Under the unread filter, a topic the copy holds stays under the
-    /// forum's row when it is read (plan section 17.4).
+    /// Opens `topic` of the shown forum (`OpenThread` with the topic, or
+    /// `OpenThreadAt` when its row shows an unread mark: plan section
+    /// 17.5). Under the unread filter, a topic the copy holds stays under
+    /// the forum's row when it is read (plan section 17.4).
     pub(crate) fn open_topic(&mut self, topic: TopicId, admit: Admit<'_>) -> Result<(), Refused> {
         let Pane::Forum { chat, open } = self.pane else {
             return Ok(());
@@ -106,10 +112,12 @@ impl ChatShell {
             chat,
             topic: Some(topic),
         };
+        let shown = self.topics.as_ref().and_then(|l| l.get(topic));
+        let after = shown.and_then(first_unread::of_topic);
         if self.core == CoreState::Running {
-            admit(Command::OpenThread(thread))?;
+            admit(first_unread::open_command(thread, after))?;
         }
-        if self.topics.as_ref().is_some_and(|l| l.get(topic).is_some()) {
+        if shown.is_some() {
             self.list.keep_topic(topic);
         }
         self.set_pane(Pane::Forum {
@@ -117,6 +125,7 @@ impl ChatShell {
             open: Some(topic),
         });
         self.show_window(Some(thread));
+        self.capture(after);
         Ok(())
     }
 
@@ -207,11 +216,23 @@ impl ChatShell {
         self.window = thread.map(MessageWindow::new);
         self.revealed.clear();
         self.read_sent = None;
+        // Leaving the thread drops its divider and read gate.
+        self.first_unread = OpenRead::default();
         // The user's choice: frame commands for the new thread start afresh.
         self.frame_retry.reset();
         self.shown_echoes = self.echo_count();
         self.rows.reset(self.shown_echoes);
         self.rows.set_follow_mode(FollowMode::Tail);
+    }
+
+    /// The thread just shown opened at read position `after` (none: it had
+    /// nothing unread). The divider marks it, and frames that show only
+    /// what was read send no read mark.
+    fn capture(&mut self, after: Option<MsgId>) {
+        self.first_unread = OpenRead::opened(after);
+        if after.is_some() {
+            self.read_sent = after;
+        }
     }
 
     /// Topic list row `last_visible` is on screen. Returns whether a
@@ -299,6 +320,10 @@ impl ChatShell {
         debug_assert!(pushed.is_ok(), "checked not full above");
         self.sync_echoes();
         self.rows.set_follow_mode(FollowMode::Tail);
+        // A send into the open thread removes its divider.
+        if self.selected() == Some(thread) {
+            self.remove_divider();
+        }
         Ok(Some(local_id))
     }
 
@@ -490,6 +515,10 @@ impl ChatShell {
             return self.set_viewing(None, admit);
         };
         let thread = w.thread();
+        if self.first_unread.opening == Opening::FallbackDue {
+            admit(Command::OpenThread(thread))?;
+            self.first_unread.opening = Opening::Unpositioned;
+        }
         if let Some(seen) = seen {
             if w.wants_older(seen.first_row, now) {
                 admit(Command::LoadOlder(thread))?;
@@ -502,10 +531,13 @@ impl ChatShell {
                 w.requested(HistoryDir::Newer);
             }
         }
+        // Only a frame that painted the gate's view opens it (plan
+        // section 17.5); the window's rows then show that view.
+        let ready = seen.is_some() && self.first_unread.gate.painted(w.view());
         let shown = seen.and_then(|s| s.last_message).and_then(|ix| w.get(ix));
         if let Some(max_id) = shown
             .map(|m| m.id)
-            .filter(|id| active && self.read_sent.is_none_or(|r| *id > r))
+            .filter(|id| ready && active && self.read_sent.is_none_or(|r| *id > r))
         {
             admit(Command::MarkRead { thread, max_id })?;
             self.read_sent = Some(max_id);

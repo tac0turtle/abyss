@@ -472,6 +472,63 @@ fn topic_tail(n: i32, ids: std::ops::RangeInclusive<i32>) -> Event {
     }
 }
 
+/// A topic with news since its count (its dot) opens at its read
+/// position: core's page lands at the divider, and the first paint reads
+/// only what is above it.
+#[gpui::test]
+fn a_topic_with_news_opens_at_its_read_position(cx: &mut TestAppContext) {
+    let (root, cx, harness) = forum_listed(cx);
+    cx.simulate_resize(gpui::size(gpui::px(800.), gpui::px(300.)));
+    select_forum(&root, cx);
+    let news = Topic {
+        freshness: Freshness::NewSince,
+        ..topic(5)
+    };
+    topics_listed(&harness, cx, vec![news, topic(6)], Pages::Done);
+    let (thread, after) = (topic_key(5), MsgId(5));
+    assert_eq!(
+        sent_by(&harness, || select_topic(&root, cx, 5)),
+        [debug(&Command::OpenThreadAt { thread, after })]
+    );
+
+    let messages = (1..=40)
+        .map(|id| abyss_core::model::Message {
+            thread,
+            ..message(FORUM, id)
+        })
+        .collect();
+    let page = Event::History {
+        thread,
+        view: abyss_core::store::ViewGen(1),
+        dir: abyss_core::api::HistoryDir::Around,
+        messages,
+        removed: Vec::new(),
+        has_more: true,
+    };
+    let sent = sent_by(&harness, || core_sends(&harness, cx, page));
+    let (divider, top) = read(&root, cx, |s| {
+        let rows = (0..s.shell.row_count()).filter(|ix| s.shell.divider_before(*ix));
+        (
+            rows.collect::<Vec<_>>(),
+            s.shell.rows().logical_scroll_top().item_ix,
+        )
+    });
+    assert_eq!((divider, top), (vec![5], 5), "at the divider, before 6");
+    let read_up_to = |id| {
+        debug(&Command::MarkRead {
+            thread,
+            max_id: MsgId(id),
+        })
+    };
+    assert!(sent.iter().any(|c| c.starts_with("MarkRead")), "{sent:?}");
+    assert!(
+        (1..=5).all(|id| !sent.contains(&read_up_to(id))),
+        "{sent:?}"
+    );
+    let tail = Command::ViewingTail(Some(thread));
+    assert!(!sent.contains(&debug(&tail)), "detached: {sent:?}");
+}
+
 #[gpui::test]
 fn sends_reads_and_the_tail_stay_in_their_topic(cx: &mut TestAppContext) {
     let (root, cx, harness) = forum_listed(cx);
@@ -916,6 +973,83 @@ fn a_demo_topic_thread_keeps_to_itself() {
     live.closed_then_sent(&fake, &mut admit);
     live.read_then_new(&fake, &mut admit);
     commands.cancel();
+}
+
+/// The real core over the demo account (`cargo dev`): the showcase, with
+/// 120 unread messages among the user's own, opens around its read
+/// position at the divider; reading part of them brings the server's
+/// remaining count; Jump to latest reaches the tail. The forum's General
+/// topic, with a page of unread posts, opens the same way.
+#[test]
+fn demo_unread_threads_open_at_their_first_unread_message() {
+    use crate::chat::viewport::Seen;
+
+    let showcase = ChatId {
+        kind: PeerKind::User,
+        id: 1,
+    };
+    let (mut live, commands, fake) =
+        Live::signed_in(crate::chat::demo::script(crate::chat::format::now()));
+    let mut admit = |cmd| {
+        commands.send(cmd).unwrap();
+        Ok(())
+    };
+    let after = live.shell.list.get(showcase).unwrap().read.read_inbox_max;
+    live.shell.select(showcase, &mut admit).unwrap();
+    live.until(|shell, _| loaded(shell));
+    let divider = live.at_divider(after);
+
+    // Read through the window's newest: a partial read.
+    let window = live.shell.window().unwrap();
+    let (newest, read_to) = (window.len() - 1, window.newest().unwrap());
+    let seen = Seen {
+        first_row: divider,
+        last_message: Some(newest),
+    };
+    live.shell
+        .frame_seen(Some(seen), Instant::now(), &mut admit)
+        .unwrap();
+    let left = fake
+        .server_history(showcase)
+        .iter()
+        .filter(|m| !m.outgoing && m.id > read_to)
+        .count();
+    assert!(left > 0 && left < 120, "{left}");
+    live.until(|shell, _| {
+        let chat = shell.list.get(showcase).unwrap();
+        chat.reading.is_none() && chat.displayed_unread() == u32::try_from(left).unwrap()
+    });
+
+    live.shell.jump_to_latest(&mut admit).unwrap();
+    let last = fake.server_history(showcase).last().map(|m| m.id);
+    live.until(|shell, _| {
+        let w = shell.window().unwrap();
+        !w.has_newer() && w.newest() == last
+    });
+
+    // General, read only up to its first message.
+    live.shell.select(DEMO_FORUM, &mut admit).unwrap();
+    live.until(|shell, _| !ids(shell).is_empty());
+    let general = live.shell.topics().unwrap().get(TopicId::GENERAL).unwrap();
+    let after = general.read_inbox_max;
+    live.shell.open_topic(TopicId::GENERAL, &mut admit).unwrap();
+    live.until(|shell, _| loaded(shell));
+    live.at_divider(after);
+    commands.cancel();
+}
+
+impl Live {
+    /// The open thread shows a detached window around read position
+    /// `after`, scrolled to the divider. Returns the divider's row.
+    #[track_caller]
+    fn at_divider(&self, after: MsgId) -> usize {
+        let window = self.shell.window().unwrap();
+        assert!(window.has_newer(), "around the read position, not the tail");
+        let divider = window.divider_row(after).unwrap();
+        assert!(self.shell.divider_before(divider));
+        assert_eq!(self.shell.rows().logical_scroll_top().item_ix, divider);
+        divider
+    }
 }
 
 /// The demo forum's badge.

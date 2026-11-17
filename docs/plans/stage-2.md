@@ -1424,6 +1424,8 @@ enum ReadGate {
 - In an anchored window that is a partial read, and the chat's count then comes from the server (section 17.6.2).
 - `ViewingTail(Some)` is still sent only when the window is attached and its end is on screen, so incoming messages keep counting as unread until the user reaches the tail.
 
+**Positioning runs once per open:** only the open's first view (or the fallback's) is scrolled to the divider; later views (rebuilds, invalidations, Jump to latest) keep task 10e's viewport restore (task 18).
+
 **Positioning without the divider in view.** If the window holds no message above `after` (the best-effort fallback, or an `Around` page with nothing above the anchor, which core answers with the tail), the thread sits at the tail. The divider appears if the user scrolls up to it, and nothing loads by itself.
 
 **The divider** marks the **read position** (decision D10). It is a full-width band like the day separator: the label "New since you last read" in quiet ink with a hairline rule, and no colour (brand rule 2).
@@ -1811,3 +1813,10 @@ The round 3 overlay fix is closed; the install-site list was checked against mai
 | 1 | P2: a failed or refused restoring tail left an attached window uncached indefinitely. P3: "anchored windows never touch the cache" overstated (Touch and authoritative deletions still apply) | A light refresh of an attached non-contiguous window restores continuity under its own `ContinuityMark`; wording qualified (17.6.5–6) |
 | 2 | P2 (tests): recovery tests raced on a 500 ms delay | Fake `hold(op, call)` gates; tests release after the observed event |
 | 3 | P2 (test harness): gate selection re-read a shared counter, so concurrent calls could pick the wrong gate | Count, fault, lead and gate taken in one critical section (`FakeClient::admit`), applied by the lead as specified by the reviewer |
+
+#### Task 18: first-unread positioning and the divider (2 rounds; pass, no P0–P2)
+
+| Round | Findings | Resolution |
+|---|---|---|
+| 1 | P2: a row-0 divider was hidden while older history might exist, even when an Around page proved the boundary; P2: the late-divider trigger ignored window activity | `first_new` keeps the Around split as proof and one `divider_ix` serves positioning, rendering and removal; late divider suppressed only when active and viewing that tail. Positioning runs on the open's first view only (17.5). The late divider is in scope (17.5, 17.8) |
+| 2 | Pass | — |
