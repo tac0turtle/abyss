@@ -1197,8 +1197,8 @@ pub(crate) struct View { shown: Shown, unread_only: bool }   // the filter: sect
 **The strip.**
 - **Order:** All, Private, Groups, Forums, then the folder tabs in server order.
 - **"All" exists once.** The strip's current "All" (`Shown::Main`, `copy::ALL_CHATS`) is the built-in All. `dialogFilterDefault` is still skipped (part B), so no folder can duplicate it.
-- **When it shows:** always, not only when the account has folders as today. In the archive, the tabs are hidden and only the unread toggle (section 17.4) shows.
-- **Layout:** it scrolls horizontally, with clickable left and right chevrons when the tabs overflow. A chevron dims at its end of the row. Selecting a tab, including with the keyboard or after restoring it, scrolls it into view. The unread toggle sits at the right end and doesn't scroll.
+- **When it shows:** always, including in the archive, where no tab is selected (so the chat list doesn't shift sideways); choosing a tab leaves the archive.
+- **Layout:** a vertical rail left of the chat list (replacing the horizontal strip, which was hard to scan). It scrolls vertically when the tabs overflow; long folder titles end in an ellipsis. Selecting a tab, including with the keyboard or after restoring it, scrolls it into view. The unread toggle sits at the rail's foot and doesn't scroll.
 - **Menus:** right-clicking a folder tab is unchanged; built-in tabs have no menu.
 - A folder that is removed while shown falls back to All, as today.
 

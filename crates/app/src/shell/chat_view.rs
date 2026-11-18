@@ -73,6 +73,7 @@ pub(super) fn chat_shell(
         .size_full()
         .flex()
         .flex_row()
+        .child(super::tabs::rail(session, theme, cx))
         .child(sidebar(session, theme, cx))
         .child(chat_pane(session, theme, cx))
         .into_any_element()
@@ -138,7 +139,6 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
                         .child(appearance_button(cx)),
                 ),
         )
-        .child(super::tabs::strip(session, theme, cx))
         .child(body)
         // Last, so it paints over the rows and takes their clicks.
         .children(retry)

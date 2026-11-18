@@ -1,10 +1,10 @@
 //! The sidebar's tabs (plan section 17.2) through the real window: Ctrl+Tab
-//! and Ctrl+Shift+Tab walk the strip, the choice is kept in the sidebar
+//! and Ctrl+Shift+Tab walk the rail, the choice is kept in the sidebar
 //! file, a restart restores it once the folders arrive, and logout deletes
 //! the file. The unread filter removes chats as soon as they are read.
 
 use abyss_core::model::{ChatFolder, ChatSummary, FolderRules};
-use gpui::{Modifiers, px};
+use gpui::px;
 
 use super::*;
 use crate::chat::list::{Shown, Tab};
@@ -31,11 +31,14 @@ fn shown(root: &Entity<Root>, cx: &mut VisualTestContext) -> Shown {
     read(root, cx, |s| s.shell.list.shown())
 }
 
+/// Many folders overflow the rail: it scrolls vertically, and selecting a
+/// tab off-screen scrolls it into view. The archive keeps the rail, with
+/// nothing selected.
 #[gpui::test]
-fn overflow_arrows_scroll_and_selection_reveals_hidden_folders(cx: &mut TestAppContext) {
+fn the_rail_scrolls_and_selection_reveals_hidden_folders(cx: &mut TestAppContext) {
     let (root, cx, harness) = open(cx);
     sign_in(&root, cx, &harness);
-    let folders = (2..10)
+    let folders = (2..80)
         .map(|id| ChatFolder {
             id,
             title: format!("Folder {id}"),
@@ -51,45 +54,32 @@ fn overflow_arrows_scroll_and_selection_reveals_hidden_folders(cx: &mut TestAppC
         .unbounded_send(Event::ChatFolders(folders))
         .unwrap();
     cx.run_until_parked();
-    let next = cx
-        .debug_bounds("tabs-next")
-        .expect("overflow is visible")
-        .center();
-    cx.simulate_mouse_move(next, None, Modifiers::none());
-    cx.simulate_click(next, Modifiers::none());
-    cx.run_until_parked();
-    assert!(read(&root, cx, |s| s.tabs.scroll.offset().x) < px(0.));
-    assert_eq!(
-        shown(&root, cx),
-        Shown::Tab(Tab::All),
-        "scrolling keeps the view"
+    assert!(
+        read(&root, cx, |s| s.tabs.scroll.max_offset().y) > px(0.),
+        "the folders overflow the rail"
     );
-    let previous = cx.debug_bounds("tabs-previous").unwrap().center();
-    cx.simulate_mouse_move(previous, None, Modifiers::none());
-    cx.simulate_click(previous, Modifiers::none());
-    cx.run_until_parked();
-    assert_eq!(read(&root, cx, |s| s.tabs.scroll.offset().x), px(0.));
+    assert_eq!(read(&root, cx, |s| s.tabs.scroll.offset().y), px(0.));
 
     act(&root, cx, |s, window, cx| {
-        s.show_chats(Shown::Tab(Tab::Folder(9)), window, cx);
+        s.show_chats(Shown::Tab(Tab::Folder(79)), window, cx);
     });
+    assert!(read(&root, cx, |s| s.tabs.scroll.offset().y) < px(0.));
     let selected = cx.debug_bounds("selected-tab").unwrap();
     let viewport = read(&root, cx, |s| s.tabs.scroll.bounds());
     assert!(
-        selected.left() >= viewport.left() - px(1.),
+        selected.top() >= viewport.top() - px(1.),
         "{selected:?} {viewport:?}"
     );
     assert!(
-        selected.right() <= viewport.right() + px(1.),
+        selected.bottom() <= viewport.bottom() + px(1.),
         "{selected:?} {viewport:?}"
     );
 
-    // Archive has no tabs, and must not retain the overflow controls.
     act(&root, cx, |s, window, cx| {
         s.show_chats(Shown::Archive, window, cx);
     });
-    assert!(cx.debug_bounds("tabs-next").is_none());
-    assert!(cx.debug_bounds("tabs-previous").is_none());
+    assert!(cx.debug_bounds("selected-tab").is_none());
+    assert!(cx.debug_bounds("unread-toggle").is_some());
 }
 
 #[gpui::test]
