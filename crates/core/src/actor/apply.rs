@@ -342,6 +342,13 @@ impl<B: Backend> Actor<B> {
         }
     }
 
+    pub(super) async fn cache_dialogs(&self) {
+        if self.cache.is_some() {
+            self.cache_write(CacheCmd::PutChats(self.dialogs.as_slice().to_vec()))
+                .await;
+        }
+    }
+
     async fn on_dialogs(
         &mut self,
         step: DialogsStep,
@@ -488,8 +495,20 @@ impl<B: Backend> Actor<B> {
         let Some(chats) = chats.filter(|c| !c.is_empty()) else {
             return;
         };
+        let remembered: Vec<_> = chats
+            .iter()
+            .filter(|c| c.topic_unread.is_some())
+            .cloned()
+            .collect();
         if self.dialogs_loaded {
-            return; // the server answered first
+            let changed = self.restore_topic_badges(&remembered);
+            if !changed.is_empty() {
+                self.cache_dialogs().await;
+            }
+            for summary in changed {
+                self.emit(Event::ChatBumped(summary)).await;
+            }
+            return; // the server's rows and order stay authoritative
         }
         // The oldest source: nothing changed live since start is reverted.
         let mut chats = chats;
@@ -497,6 +516,7 @@ impl<B: Backend> Actor<B> {
             return;
         }
         self.dialogs.reset(chats);
+        self.restore_topic_badges(&remembered);
         self.note_kinds();
         self.emit(Event::DialogsReset(self.dialogs.as_slice().to_vec()))
             .await;
@@ -882,7 +902,7 @@ impl<B: Backend> Actor<B> {
             } => {
                 // Deleting an unread message changes the server's counts,
                 // and no read update may follow (plan section 6.3).
-                self.badge_trigger(chat);
+                self.badge_trigger(chat).await;
                 let removed = self.windows.delete(chat, &ids);
                 self.cache_write(CacheCmd::Delete(chat, ids)).await;
                 if !removed.is_empty() {
@@ -909,7 +929,7 @@ impl<B: Backend> Actor<B> {
                 topic: Some(_),
                 ..
             }
-            | Update::ReadTopicMax { chat, .. } => self.badge_trigger(chat),
+            | Update::ReadTopicMax { chat, .. } => self.badge_trigger(chat).await,
             Update::MessageId { random_id, id } => self.on_message_id(random_id, id).await,
             // Topic edits and pins reached the retained topic lists when
             // they were received (`topics::topics_on_update`).
@@ -997,7 +1017,7 @@ impl<B: Backend> Actor<B> {
         // A forum's badge is never counted locally: an incoming message
         // only makes it due for a refresh (plan section 7).
         if forum && !m.outgoing {
-            self.badges.trigger(chat);
+            self.badge_trigger(chat).await;
         }
         let unread = if forum || m.outgoing || thread.is_some_and(|t| self.tail_visible(t)) {
             Unread::Unchanged

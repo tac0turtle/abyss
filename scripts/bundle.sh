@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Builds target/bundle/abyss.app: release binary, icon, Info.plist, ad-hoc signature.
+# Builds an app bundle: binary, icon, Info.plist, ad-hoc signature.
 #
 #   scripts/bundle.sh
+#   scripts/bundle.sh --debug    # target/bundle/debug/abyss.app
 #   ABYSS_BUNDLE_PRECOMPILED_SHADERS=1 scripts/bundle.sh
 #
 # The default build compiles Metal shaders at runtime and needs no Metal
@@ -30,7 +31,21 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
-build_args=(build --release -p abyss)
+profile="release"
+if [[ "$#" -gt 1 ]]; then
+    echo "usage: scripts/bundle.sh [--debug]" >&2
+    exit 2
+fi
+case "${1:-}" in
+    "") ;;
+    --debug) profile="debug" ;;
+    *) echo "usage: scripts/bundle.sh [--debug]" >&2; exit 2 ;;
+esac
+
+build_args=(build -p abyss)
+if [[ "$profile" == "release" ]]; then
+    build_args+=(--release)
+fi
 if [[ "${ABYSS_BUNDLE_PRECOMPILED_SHADERS:-0}" == "1" ]]; then
     build_args+=(--no-default-features)
 fi
@@ -46,8 +61,11 @@ if [[ -z "$target_dir" || -z "$version" ]]; then
     exit 1
 fi
 
-binary="$target_dir/release/abyss"
+binary="$target_dir/$profile/abyss"
 bundle="$target_dir/bundle/abyss.app"
+if [[ "$profile" == "debug" ]]; then
+    bundle="$target_dir/bundle/debug/abyss.app"
+fi
 [[ -x "$binary" ]] || { echo "bundle.sh: missing $binary" >&2; exit 1; }
 
 # Refuse to declare an older minimum than the binary was linked for.

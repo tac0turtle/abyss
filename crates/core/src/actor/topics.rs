@@ -68,6 +68,13 @@ pub(super) struct TopicLists {
 }
 
 impl TopicLists {
+    pub(super) fn confirmed_unread(&self, chat: ChatId) -> Option<u32> {
+        if self.cursors.contains_key(&chat) {
+            return None;
+        }
+        self.lists.get(chat)?.confirmed_unread_topics()
+    }
+
     /// Forgets the cursors of lists that are no longer retained.
     fn prune_cursors(&mut self) {
         let lists = &self.lists;
@@ -728,7 +735,8 @@ impl<B: Backend> Actor<B> {
 
     /// Emits a list's changes as events, for the shown forum only (the UI
     /// holds no other list; opening one sends it whole).
-    async fn emit_list_changes(&self, chat: ChatId, changes: Vec<ListChange>) {
+    async fn emit_list_changes(&mut self, chat: ChatId, changes: Vec<ListChange>) {
+        self.refresh_topic_badge(chat).await;
         if self.topics.lists.shown() != Some(chat) {
             return;
         }
@@ -759,7 +767,7 @@ impl<B: Backend> Actor<B> {
     }
 
     /// The retained list of `chat` as a `TopicsReset` of its generation.
-    async fn emit_reset(&self, chat: ChatId) {
+    async fn emit_reset(&mut self, chat: ChatId) {
         let Some(list) = self.topics.lists.get(chat) else {
             return;
         };

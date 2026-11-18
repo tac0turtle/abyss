@@ -618,17 +618,8 @@ impl ChatShell {
                 {
                     self.open_removed = Some((topic, reason));
                 }
-                let drops = matches!(
-                    topics,
-                    Event::TopicsReset { .. }
-                        | Event::TopicRemoved { .. }
-                        | Event::ForumInvalidated(_)
-                );
                 if let Some(list) = self.topics.as_mut() {
                     list.apply(topics);
-                    if drops {
-                        self.retain_kept_topics();
-                    }
                     self.sync_inline();
                 }
             }

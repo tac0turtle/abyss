@@ -37,10 +37,14 @@ fake = ["abyss-core/fake"]
 # (src/shell/tests/snapshots.rs has the command). Test-only; never default.
 snapshots = ["fake", "gpui/test-support", "gpui_platform/test-support", "dep:gpui_apple"]
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# AppKit for the Dock icon on direct launches; already pinned through GPUI.
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData"] }
 # The CoreText text system on its own, for the snapshots: `MacPlatform`, the
 # usual way to get it, insists on the main thread, and tests run off it. Same
 # zed revision as `gpui` (already in Cargo.lock through `gpui_platform`).
-[target.'cfg(target_os = "macos")'.dependencies]
 gpui_apple = { git = "https://github.com/zed-industries/zed", rev = "917559da35dd4d626205da705b071c800c9c2553", features = ["font-kit"], optional = true }
 
 [lints]

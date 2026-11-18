@@ -283,7 +283,7 @@ impl<B: Backend> Actor<B> {
                 .take(usize::try_from(jobs::DIALOGS_PAGE).unwrap_or(usize::MAX))
                 .any(|c| c.id == shown);
             if !first_page {
-                self.badge_trigger(shown);
+                self.badge_trigger(shown).await;
             }
         }
         self.recheck_suspects().await;

@@ -10,6 +10,7 @@ mod folder_menu;
 mod onboarding;
 mod session;
 mod shutdown;
+mod tabs;
 mod topic_view;
 mod view;
 
@@ -17,13 +18,27 @@ use abyss_core::StartError;
 use abyss_core::api::Event;
 use gpui::{
     App, AppContext, Bounds, Context, KeyBinding, Menu, MenuItem, Subscription, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, actions, px, size,
+    Window, WindowBounds, WindowOptions, actions, point, px, size,
 };
 
 use self::bridge::EventSink;
 use self::session::{Session, Started};
 use self::shutdown::Closing;
 use crate::launch::{Launch, LaunchError};
+
+/// Content inset below the native macOS controls. The transparent title bar
+/// uses the root's theme surface, with no separate system-colored strip.
+const TITLEBAR_HEIGHT: f32 = 34.;
+
+/// Window coordinates include the integrated title bar; session content
+/// starts below it. Fullscreen and non-macOS windows need no inset.
+fn titlebar_inset(window: &Window) -> gpui::Pixels {
+    px(if cfg!(target_os = "macos") && !window.is_fullscreen() {
+        TITLEBAR_HEIGHT
+    } else {
+        0.
+    })
+}
 
 actions!(
     abyss,
@@ -211,7 +226,8 @@ pub(crate) fn open(launch: Result<Launch, LaunchError>, cx: &mut App) -> gpui::R
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
             title: Some("abyss".into()),
-            ..Default::default()
+            appears_transparent: cfg!(target_os = "macos"),
+            traffic_light_position: Some(point(px(12.), px(10.))),
         }),
         ..Default::default()
     };

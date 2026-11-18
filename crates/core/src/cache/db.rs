@@ -18,7 +18,7 @@ use crate::model::{
 };
 use crate::store::MAX_DIALOGS;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 /// Version 2 replaced `Message::edited` with `edit_date`; version 1 message rows
 /// cannot be decoded, so they are dropped (the cache is disposable).
 const MIGRATE_1_TO_2: &str =
@@ -47,6 +47,9 @@ const MIGRATE_5_TO_6: &str = "BEGIN; DELETE FROM chats; PRAGMA user_version = 6;
 /// read pointer; stage 2 plan, section 17.6.1); version 6 chat rows cannot
 /// be decoded, so the cached chat list is dropped (messages are unchanged).
 const MIGRATE_6_TO_7: &str = "BEGIN; DELETE FROM chats; PRAGMA user_version = 7; COMMIT;";
+/// Version 8 persists the confirmed topic badge with its dialog version.
+/// Positional chat rows change; message rows remain compatible.
+const MIGRATE_7_TO_8: &str = "BEGIN; DELETE FROM chats; PRAGMA user_version = 8; COMMIT;";
 /// Messages deleted per eviction step.
 const EVICT_BATCH: i64 = 1000;
 /// Upper bound on eviction steps per call; exceeding it is reported, not hidden.
@@ -363,6 +366,7 @@ impl Cache {
                 conn.execute_batch(MIGRATE_4_TO_5)?;
                 conn.execute_batch(MIGRATE_5_TO_6)?;
                 conn.execute_batch(MIGRATE_6_TO_7)?;
+                conn.execute_batch(MIGRATE_7_TO_8)?;
                 Ok(())
             }
             2 => {
@@ -371,6 +375,7 @@ impl Cache {
                 conn.execute_batch(MIGRATE_4_TO_5)?;
                 conn.execute_batch(MIGRATE_5_TO_6)?;
                 conn.execute_batch(MIGRATE_6_TO_7)?;
+                conn.execute_batch(MIGRATE_7_TO_8)?;
                 Ok(())
             }
             3 => {
@@ -378,21 +383,29 @@ impl Cache {
                 conn.execute_batch(MIGRATE_4_TO_5)?;
                 conn.execute_batch(MIGRATE_5_TO_6)?;
                 conn.execute_batch(MIGRATE_6_TO_7)?;
+                conn.execute_batch(MIGRATE_7_TO_8)?;
                 Ok(())
             }
             4 => {
                 conn.execute_batch(MIGRATE_4_TO_5)?;
                 conn.execute_batch(MIGRATE_5_TO_6)?;
                 conn.execute_batch(MIGRATE_6_TO_7)?;
+                conn.execute_batch(MIGRATE_7_TO_8)?;
                 Ok(())
             }
             5 => {
                 conn.execute_batch(MIGRATE_5_TO_6)?;
                 conn.execute_batch(MIGRATE_6_TO_7)?;
+                conn.execute_batch(MIGRATE_7_TO_8)?;
                 Ok(())
             }
             6 => {
                 conn.execute_batch(MIGRATE_6_TO_7)?;
+                conn.execute_batch(MIGRATE_7_TO_8)?;
+                Ok(())
+            }
+            7 => {
+                conn.execute_batch(MIGRATE_7_TO_8)?;
                 Ok(())
             }
             SCHEMA_VERSION => Ok(()),

@@ -26,7 +26,7 @@ pub(crate) const APPEARANCE_MENU: &str = "Settings…";
 pub(crate) const SETTINGS: &str = "Settings";
 pub(crate) const KEYCHAIN_STORAGE: &str = "Store secrets in Keychain";
 pub(crate) const KEYCHAIN_STORAGE_DETAIL: &str = "Off by default. When off, session secrets stay unencrypted in a private local file accessible to your macOS account. Changes apply next launch.";
-pub(crate) const KEYCHAIN_MIGRATION_NOTE: &str = "Switching storage may ask for access to existing Keychain items. With Keychain enabled, macOS controls access prompts.";
+pub(crate) const KEYCHAIN_MIGRATION_NOTE: &str = "Moving existing secrets out of Keychain may ask for access, even when this is off. Once the move finishes, launches with Keychain off do not access it. With Keychain on, macOS controls access prompts.";
 pub(crate) const PREFERENCE_FAILED: &str =
     "Couldn't read or save this setting. Click to retry, then restart abyss.";
 pub(crate) const APPEARANCE_NOTE: &str =

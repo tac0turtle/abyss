@@ -53,6 +53,10 @@ impl Render for Root {
             .text_color(theme.text)
             .font_family(theme::BODY_FONT)
             .text_size(px(14.))
+            // The content view extends under the transparent macOS title
+            // bar. Paint it in the theme, but keep content below the native
+            // controls. Fullscreen needs no permanent title-bar space.
+            .pt(super::titlebar_inset(window))
             .on_action(cx.listener(|root, _: &super::ForumBack, window, cx| {
                 root.with_session(|s, cx| s.back_from_forum(window, cx), cx);
             }))

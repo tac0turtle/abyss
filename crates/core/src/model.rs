@@ -201,6 +201,11 @@ pub struct ChatSummary {
     /// of a snapshot.
     #[serde(skip)]
     pub reading: Option<MsgId>,
+    /// Unread topics from a complete, settled topic list. Telegram's dialog
+    /// count can remain positive after the topics were read. Cached with the
+    /// raw read state and newest message; invalidated when either changes.
+    #[serde(default)]
+    pub topic_unread: Option<u32>,
 }
 
 /// A chat's confirmed read state, one value under the unread stamp: the
@@ -334,17 +339,26 @@ impl FolderRules {
 impl ChatSummary {
     /// The unread count to show: 0 while an outstanding read covers every
     /// known message (Stage 1's overlay), the confirmed count otherwise. A
-    /// forum's count is its badge, which no read overlays.
+    /// forum uses its confirmed topic aggregate when available.
     pub fn displayed_unread(&self) -> u32 {
         let forum = matches!(self.kind, ChatKind::Supergroup { forum: true, .. });
         let covered = self
             .reading
             .is_some_and(|r| self.last_id.is_none_or(|last| r >= last));
-        if covered && !forum {
+        if forum {
+            self.topic_unread.unwrap_or(self.read.unread)
+        } else if covered {
             0
         } else {
             self.read.unread
         }
+    }
+
+    /// Whether unread views include this chat. Forums follow their topic
+    /// badge; a raw dialog mention count can outlive those topic reads.
+    pub fn has_unread(&self) -> bool {
+        let forum = matches!(self.kind, ChatKind::Supergroup { forum: true, .. });
+        self.displayed_unread() > 0 || (!forum && self.unread_mentions > 0)
     }
 
     /// Whether notifications are muted at `now` (Unix seconds).
@@ -356,10 +370,10 @@ impl ChatSummary {
 /// Whether [`ChatFolder::contains`] applies a folder's "exclude read" rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadRule {
-    /// As Telegram applies it: folder editing, and every chat the unread
-    /// filter doesn't keep.
+    /// Apply the folder's read test normally, including in folder editing.
     Applies,
-    /// Waived: a chat the unread filter keeps stays when it is read.
+    /// The unread view has positive topic evidence that the raw dialog
+    /// count does not yet reflect. Other folder rules still apply.
     Waived,
 }
 
@@ -409,9 +423,8 @@ impl ChatFolder {
     /// (`ChatFilter::contains`): excluded chats never are, named ones always
     /// are, and any other is when its kind matches and no exclusion applies.
     /// "Exclude muted" keeps a muted chat with an unread mention unless it
-    /// is archived. `read` waives "exclude read" alone, for a chat the
-    /// unread filter keeps (stage 2 plan, section 17.4): every other step
-    /// applies as ever.
+    /// is archived. `read` waives "exclude read" alone when topic evidence
+    /// is newer than the dialog count; every other step still applies.
     pub fn contains(&self, chat: &ChatSummary, now: i64, read: ReadRule) -> bool {
         if self.exclude.contains(&chat.id) {
             return false;
@@ -430,8 +443,7 @@ impl ChatFolder {
         kind && !(r.has(FolderRules::EXCLUDE_MUTED) && chat.muted_at(now) && !mentioned)
             && !(r.has(FolderRules::EXCLUDE_READ)
                 && read == ReadRule::Applies
-                && chat.displayed_unread() == 0
-                && chat.unread_mentions == 0)
+                && !chat.has_unread())
             && !(r.has(FolderRules::EXCLUDE_ARCHIVED) && chat.folder == PeerFolder::Archive)
     }
 

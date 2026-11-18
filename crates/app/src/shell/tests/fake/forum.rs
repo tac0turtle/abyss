@@ -825,12 +825,12 @@ fn inline_topics_collapse_and_follow_the_forum_into_every_view(cx: &mut TestAppC
 }
 
 /// Plan section 17.4 under the inline rows: the unread filter shows the
-/// unread topics (a count or a dot) and the opened ones, which stay when
-/// read until a removal drops them or the filter changes; More shows while
+/// unread topics (a count or a dot). Read topics leave even when open;
+/// More shows while
 /// the badge counts more unread topics than are shown. The pane's forum
 /// with a dot topic counts as unread, so its archive entry shows.
 #[gpui::test]
-fn the_unread_filter_keeps_opened_topics_under_the_forum(cx: &mut TestAppContext) {
+fn the_unread_filter_removes_read_topics_and_their_read_forum(cx: &mut TestAppContext) {
     let (root, cx, harness) = forum_listed(cx);
     act(&root, cx, Session::toggle_unread);
     select_forum(&root, cx);
@@ -858,7 +858,7 @@ fn the_unread_filter_keeps_opened_topics_under_the_forum(cx: &mut TestAppContext
     core_sends(&harness, cx, Event::ChatBumped(badge(5)));
     assert_eq!(inline(&root, cx), [topic_rows([1, 2]), vec![MORE]].concat());
 
-    // Opened topics stay, read or not; one read elsewhere leaves.
+    // Opening a read topic does not add it to the unread rows.
     select_topic(&root, cx, 3);
     select_topic(&root, cx, 4);
     let read_here = Topic {
@@ -870,10 +870,7 @@ fn the_unread_filter_keeps_opened_topics_under_the_forum(cx: &mut TestAppContext
         topic: read_here,
     };
     core_sends(&harness, cx, bumped);
-    assert_eq!(
-        inline(&root, cx),
-        [topic_rows([2, 3, 4]), vec![MORE]].concat()
-    );
+    assert_eq!(inline(&root, cx), [topic_rows([2]), vec![MORE]].concat());
     let removed = Event::TopicRemoved {
         chat: FORUM,
         topic: tid(3),
@@ -881,13 +878,10 @@ fn the_unread_filter_keeps_opened_topics_under_the_forum(cx: &mut TestAppContext
     };
     core_sends(&harness, cx, removed);
     select_topic(&root, cx, 5);
-    assert_eq!(
-        inline(&root, cx),
-        [topic_rows([2, 4, 5]), vec![MORE]].concat()
-    );
+    assert_eq!(inline(&root, cx), [topic_rows([2]), vec![MORE]].concat());
     act(&root, cx, Session::toggle_unread);
     act(&root, cx, Session::toggle_unread);
-    assert_eq!(inline(&root, cx), [topic_rows([2, 5]), vec![MORE]].concat());
+    assert_eq!(inline(&root, cx), [topic_rows([2]), vec![MORE]].concat());
 
     // No badge, a dot topic: the archived forum's entry counts it unread.
     let archived = ChatSummary {
@@ -903,6 +897,64 @@ fn the_unread_filter_keeps_opened_topics_under_the_forum(cx: &mut TestAppContext
             unread: 1
         }))
     );
+}
+
+#[gpui::test]
+fn a_read_forum_leaves_unread_without_closing_its_topic(cx: &mut TestAppContext) {
+    let (root, cx, harness) = forum_listed(cx);
+    act(&root, cx, Session::toggle_unread);
+    select_forum(&root, cx);
+    topics_listed(
+        &harness,
+        cx,
+        vec![Topic {
+            unread: 1,
+            ..topic(5)
+        }],
+        Pages::Done,
+    );
+    select_topic(&root, cx, 5);
+    let summary = |unread| ChatSummary {
+        topic_unread: Some(unread),
+        unread_mentions: 3,
+        read: abyss_core::model::ReadState {
+            unread: 37,
+            ..Default::default()
+        },
+        ..forum_chat(IS_FORUM)
+    };
+    core_sends(&harness, cx, Event::ChatBumped(summary(1)));
+    core_sends(
+        &harness,
+        cx,
+        Event::TopicBumped {
+            chat: FORUM,
+            topic: topic(5),
+        },
+    );
+    core_sends(&harness, cx, Event::ChatBumped(summary(0)));
+    let visible = |root: &Entity<Root>, cx: &mut VisualTestContext| {
+        read(root, cx, |s| {
+            s.shell.list.rows().contains(&SidebarRow::Chat(FORUM))
+        })
+    };
+    assert!(!visible(&root, cx));
+    assert_eq!(read(&root, cx, |s| s.shell.selected()), Some(topic_key(5)));
+    assert!(inline(&root, cx).is_empty());
+    // A new unread message brings the forum back, before its count refresh.
+    core_sends(
+        &harness,
+        cx,
+        Event::TopicBumped {
+            chat: FORUM,
+            topic: Topic {
+                freshness: Freshness::NewSince,
+                ..topic(5)
+            },
+        },
+    );
+    assert!(visible(&root, cx));
+    assert_eq!(inline(&root, cx), topic_rows([5]));
 }
 
 /// The real core over the `cargo dev` demo account: a forum lists General

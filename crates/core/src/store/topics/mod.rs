@@ -197,6 +197,22 @@ impl TopicList {
         self.paging
     }
 
+    /// A forum badge can be derived only from the entire settled list.
+    /// Partial/capped lists, outstanding discovery and pending refreshes
+    /// cannot prove that unseen topics are read. Hidden topics count too.
+    pub fn confirmed_unread_topics(&self) -> Option<u32> {
+        if self.paging != Paging::Complete
+            || self.first_page != FirstPage::Fresh
+            || self.page.is_some()
+            || !self.discovery.is_empty()
+            || self.unlisted_open().is_some()
+            || self.entries.iter().any(|e| !e.settled() || e.due.is_some())
+        {
+            return None;
+        }
+        u32::try_from(self.entries.iter().filter(|e| e.topic.unread > 0).count()).ok()
+    }
+
     pub fn post_closed(&self) -> PostClosed {
         self.post_closed
     }

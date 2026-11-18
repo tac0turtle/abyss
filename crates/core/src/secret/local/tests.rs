@@ -59,6 +59,54 @@ fn legacy_import_preserves_every_item_and_local_restarts_never_access_keychain()
 }
 
 #[test]
+fn a_completed_local_migration_never_probes_even_a_locked_keychain() {
+    #[derive(Default)]
+    struct InaccessibleKeychain(std::cell::Cell<usize>);
+    impl InaccessibleKeychain {
+        fn refuse<T>(&self) -> Result<T, StoreError> {
+            self.0.set(self.0.get() + 1);
+            Err(StoreError::Injected)
+        }
+    }
+    impl SecretStore for InaccessibleKeychain {
+        fn has_items(&self) -> Result<bool, StoreError> {
+            self.refuse()
+        }
+        fn get(&self, _: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+            self.refuse()
+        }
+        fn set(&self, _: SecretItem, _: &[u8]) -> Result<(), StoreError> {
+            self.refuse()
+        }
+        fn delete(&self, _: SecretItem) -> Result<(), StoreError> {
+            self.refuse()
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = MemoryStore::new();
+    seed(&keychain);
+    let local = store(dir.path(), keychain, Protection::Local);
+    assert!(local.get(SecretItem::Session).unwrap().is_some());
+    drop(local);
+
+    for _ in 0..2 {
+        let local = store(
+            dir.path(),
+            InaccessibleKeychain::default(),
+            Protection::Local,
+        );
+        for item in ITEMS {
+            assert_eq!(
+                local.get(item).unwrap().unwrap().as_slice(),
+                item.suffix().as_bytes()
+            );
+            local.set(item, item.suffix().as_bytes()).unwrap();
+        }
+        assert_eq!(local.keychain.0.get(), 0);
+    }
+}
+
+#[test]
 fn switching_both_ways_preserves_session_and_key_and_removes_local_copies() {
     let dir = tempfile::tempdir().unwrap();
     let keychain = MemoryStore::new();

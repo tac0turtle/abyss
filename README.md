@@ -25,7 +25,14 @@ cargo dev                   # demo account; the login code is 12345
 cargo dev -- --onboarding   # demo, starting from the credential screens
 ```
 
-To connect to Telegram, run `cargo run -p abyss` and follow
+To connect to Telegram, build and open the macOS app:
+
+```sh
+scripts/bundle.sh --debug
+open target/bundle/debug/abyss.app
+```
+
+Follow
 [Connecting abyss to Telegram](docs/connecting.md). You need your own
 `api_id` and `api_hash` from my.telegram.org; the guide walks through it.
 

@@ -133,6 +133,7 @@ pub(crate) struct Session {
     pub(super) folder_name: Entity<TextInput>,
     /// The open archive/folder menu, if any (`folder_menu`).
     pub(super) menu: Option<super::folder_menu::Menu>,
+    pub(super) tabs: super::tabs::Tabs,
     /// Chat list, open chat and pending sends (`crate::chat`, `shell::chats`).
     pub(super) shell: ChatShell,
     pub(super) conn: Option<ConnState>,
@@ -187,7 +188,6 @@ impl Session {
             ),
             folder_sub,
         ];
-        let pump = spawn_pump(started.events, window, cx);
         let mut shell = ChatShell::default();
         shell.list.restore(SidebarFile::load(cx));
         let chat_wiring = super::chats::wire(window, cx);
@@ -209,13 +209,14 @@ impl Session {
             pane_focus: cx.focus_handle(),
             folder_name,
             menu: None,
+            tabs: super::tabs::Tabs::default(),
             shell,
             conn: None,
             notice: None,
             notice_gen: 0,
             writes_cancelled: false,
             closing: Closing::Open,
-            _pump: pump,
+            _pump: spawn_pump(started.events, window, cx),
             #[cfg(feature = "fake")]
             fake: started.fake,
             _subscriptions: subscriptions,

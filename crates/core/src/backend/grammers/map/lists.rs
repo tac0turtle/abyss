@@ -231,6 +231,7 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
         muted_until: muted_until(&d.notify_settings),
         folder: peer_folder(d.folder_id.unwrap_or(0)),
         reading: None,
+        topic_unread: None,
     };
     if summary.is_valid() {
         out.chats.push(summary);

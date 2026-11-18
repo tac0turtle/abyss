@@ -5,6 +5,7 @@
 mod admission;
 mod badge;
 mod bootstrap;
+mod cached_badge;
 mod continuity;
 mod crossing;
 mod deletion;

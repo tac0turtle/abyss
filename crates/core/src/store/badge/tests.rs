@@ -297,6 +297,7 @@ fn summary(c: ChatId, server: Server) -> ChatSummary {
         can_send: true,
         muted_until: 0,
         reading: None,
+        topic_unread: None,
     }
 }
 

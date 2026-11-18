@@ -415,6 +415,17 @@ impl Dialogs {
         Some(summary)
     }
 
+    /// Updates the forum's display count without changing its raw dialog
+    /// read state or the stamps that order server snapshots.
+    pub fn set_topic_unread(&mut self, chat: ChatId, unread: Option<u32>) -> Option<&ChatSummary> {
+        let summary = self
+            .list
+            .iter_mut()
+            .find(|c| c.id == chat && c.topic_unread != unread)?;
+        summary.topic_unread = unread;
+        Some(summary)
+    }
+
     /// A counted live message changed `chat`'s unread count (Stage 1
     /// rules) at badge clock `now`: an older snapshot can't revert it.
     pub fn unread_counted(&mut self, chat: ChatId, now: BadgeSeq) {
@@ -457,6 +468,7 @@ mod tests {
             muted_until: 0,
             folder: PeerFolder::Main,
             reading: None,
+            topic_unread: None,
         }
     }
 

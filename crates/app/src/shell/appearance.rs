@@ -1,10 +1,10 @@
-//! The appearance panel: the user's hue and tint for night and for day
+//! Settings, including the user's hue and tint for night and for day
 //! (`docs/brand/brand.md`). The app behind the panel is the preview; a choice
 //! applies and saves as it is made.
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, FontWeight, Hsla, Rgba, Stateful, div, prelude::*, px,
-    transparent_black,
+    AnyElement, ClickEvent, Context, Div, FontWeight, Hsla, MouseButton, MouseDownEvent, Rgba,
+    Stateful, div, prelude::*, px, transparent_black,
 };
 
 use super::Root;
@@ -41,6 +41,8 @@ pub(super) fn panel(
         .border_1()
         .border_color(theme::line(theme.text))
         .bg(theme.surface(Depth::NOW))
+        .debug_selector(|| "settings-panel".to_owned())
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
             div()
                 .text_xl()
@@ -57,6 +59,7 @@ pub(super) fn panel(
         .child(storage_section(theme, cx))
         .child(footer(theme, cx));
     div()
+        .id("settings-backdrop")
         .absolute()
         .top_0()
         .left_0()
@@ -66,6 +69,13 @@ pub(super) fn panel(
         .flex()
         .justify_center()
         .items_center()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|root, _: &MouseDownEvent, _, cx| {
+                root.appearance_open = false;
+                cx.notify();
+            }),
+        )
         .child(card)
         .into_any_element()
 }

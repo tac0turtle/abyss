@@ -103,7 +103,7 @@ Verified in grammers source (`G/`) unless marked *docs* (Telegram's API document
   - `updateReadHistoryInbox { peer, top_msg_id?, max_id, still_unread_count }` (`api.tl:349`), which Stage 1 maps only when `top_msg_id` is absent (`map/lists.rs`, `update`);
   - `updateReadChannelInbox` (`api.tl:356`) for the chat as a whole.
 - **Risk:** grammers asserts that `updateReadHistoryInbox` never names a channel: `assert!(!matches!(u.peer, tl::enums::Peer::Channel(_)))` at `A/:520-521`, on the update path. If Telegram ever sends a per-topic read that way for a forum, the update consumer panics. That is contained (S1 §1), but costs a rebuild each time (risk 2).
-- **Unknown U3 (live):** that `dialog.unread_count` (`api.tl:225`), and the `still_unread_count` of a chat-level read update, count unread *topics* for a forum (D1 assumes so; section 7).
+- **U3 live correction (2026-11-18):** the parent dialog total can remain positive after General and the other topics are read. It is not sufficient to establish a forum's displayed unread-topic count; section 7 now derives that count from complete, settled topic snapshots.
 
 **Topic updates.**
 - `updateEditForumTopic { peer, topic_id, title?, icon_emoji_id?, closed?, hidden? }` (`api.tl:499`).
@@ -599,7 +599,7 @@ enum Deletion { None, Suspected }           // core-internal; a local suspicion 
 
 **Decision D1:** a forum's row shows the server's unread-*topic* count. The row otherwise looks like any group row, with the "forum" kind label it already has (`copy::kind_label`). Opening a forum row shows the topic list and marks nothing read.
 
-**The badge is only ever set from the server.** It is never adjusted locally, because the retained topics are a subset and local deltas can't be proven consistent with the server's baseline.
+**Live correction (2026-11-18).** General's topic read succeeds and its server count reaches zero, while the parent dialog total can remain positive. The displayed badge therefore uses the number of unread topics from a complete, settled topic list, including hidden topics. This follows [Telegram Desktop's forum badge implementation](https://github.com/telegramdesktop/tdesktop/blob/dev/Telegram/SourceFiles/history/history.cpp#L2698). `ChatSummary::topic_unread` holds this display value without changing the raw dialog state or its stamps; it is reprojected after topic changes and dialog snapshots. The confirmed count is cached with the raw read state and newest message, so restarting does not restore a stale parent badge. A changed read state or newest message invalidates it; a late cache response restores it only when that dialog version still matches. Partial or capped lists, pending refreshes and unknown topics cannot prove a total and use the raw dialog fallback. An aggregate retained after list eviction is invalidated by the next relevant live event. Topic reads remain scoped to the topic; no whole-forum read is sent.
 
 **Authoritative sources.**
 - The forum's `ChatSummary.unread` is *set* from:
@@ -1198,7 +1198,7 @@ pub(crate) struct View { shown: Shown, unread_only: bool }   // the filter: sect
 - **Order:** All, Private, Groups, Forums, then the folder tabs in server order.
 - **"All" exists once.** The strip's current "All" (`Shown::Main`, `copy::ALL_CHATS`) is the built-in All. `dialogFilterDefault` is still skipped (part B), so no folder can duplicate it.
 - **When it shows:** always, not only when the account has folders as today. In the archive, the tabs are hidden and only the unread toggle (section 17.4) shows.
-- **Layout:** it scrolls horizontally as today. The unread toggle sits at its right end and doesn't scroll.
+- **Layout:** it scrolls horizontally, with clickable left and right chevrons when the tabs overflow. A chevron dims at its end of the row. Selecting a tab, including with the keyboard or after restoring it, scrolls it into view. The unread toggle sits at the right end and doesn't scroll.
 - **Menus:** right-clicking a folder tab is unchanged; built-in tabs have no menu.
 - A folder that is removed while shown falls back to All, as today.
 
@@ -1317,7 +1317,7 @@ pub(crate) enum SidebarRow {
 - **A chat that is not a forum:** its displayed count or its mentions are above 0. The displayed count is the confirmed count, except that Stage 1's overlay shows 0 while a read covering every known message is outstanding (section 17.6.1).
   - Muted chats count.
   - `dialog.unread_mark` isn't modelled (decision D8).
-- **A forum:** its badge, `unread > 0 || unread_mentions > 0`. That is the server's unread-topic count (D1), set only from authoritative sources (section 7).
+- **A forum:** its displayed topic badge is above zero (section 7). A stale raw dialog mention count does not keep a forum unread after its confirmed topic count reaches zero.
   - While the pane shows the forum, it also counts as unread when its copy shows an unread topic.
   - So a topic marked with a dot isn't hidden behind a badge whose refresh is still pending.
 - **A topic:** `UnreadMark::of(topic) != UnreadMark::None`.
@@ -1336,36 +1336,11 @@ pub(crate) enum SidebarRow {
 2. Otherwise, an explicit inclusion (pinned or included) admits it.
 3. Otherwise, the kind flags decide, followed by the "exclude muted", "exclude read" and "exclude archived" flags.
 
-`contains` gains a `read_waived: bool` argument. It waives only `EXCLUDE_READ`; every other step runs as before. The menu of part C computes its ✓ marks with `read_waived = false`, so folder editing is unchanged.
+**Strict unread membership (updated 2026-11-18).** With the filter off, a chat shows when its base predicate holds. With the filter on, it must also be unread. Read chats, forums and inline topics leave immediately, including the currently open conversation; its pane, draft and scroll position stay open independently of the sidebar.
 
-- **With the filter off,** a chat is shown iff its base predicate holds, with nothing waived.
-- **With the filter on,** a chat is shown iff:
-  - its base predicate holds, with `read_waived = true` for a kept chat and `false` otherwise; and
-  - it is unread or kept.
+`ChatSummary::has_unread` supplies the shared read test for the filter and a folder's `EXCLUDE_READ` rule. `ReadRule::Waived` waives only that folder rule when positive unread-topic evidence is newer than the raw dialog count. Explicit exclusions, kind, mute and archive rules still apply. Explicitly pinned or included folder members retain the folder's existing precedence, but the unread toggle still filters out read rows.
 
-So a kept chat outlives only its own reading:
-- It stays when it becomes read, under the filter's unread test and under a folder's "exclude read".
-- Any other change removes its row only when the resulting base predicate fails:
-  - a new explicit exclusion;
-  - a removed inclusion, if the kind flags don't then admit the chat;
-  - a kind change;
-  - a mute or an archive move that a folder flag excludes;
-  - a move between peer folders for a built-in tab or the archive;
-  - leaving the loaded list.
-
-In All, the archive entry shows under the filter only while an archived chat is unread.
-
-**Kept chats and topics.** Kept rows let a list stay still while it is read through.
-- **What is kept:** a chat the user opens from the view while the filter is on, and a topic opened from inline rows while the filter is on.
-- **The open item.** The pane's chat and its open topic count as kept while they are open, whether or not they were opened under the filter. They are not stored for this; they follow the pane.
-  - An open chat that isn't listed (it has a window but is not among the loaded dialogs) has no row in any view, so the exception doesn't apply to it.
-  - An open topic that the copy doesn't hold has no inline row.
-- **Stored sets:**
-  - `kept: HashSet<ChatId>` holds only listed chats, so at most `MAX_DIALOGS`.
-  - `kept_topics: HashSet<TopicId>` belongs to the pane's forum and holds only ids in its copy, so at most `MAX_TOPICS_PER_FORUM + 1`.
-- **Maintenance.** After every list event that can drop chats (`DialogsReset`, and a `ChatFolders` that removes the shown folder), `kept` is intersected with the listed ids. After every topic event that can drop topics (`TopicsReset`, `TopicRemoved`; `ForumInvalidated` clears it), `kept_topics` is intersected with the copy's ids. Both maintenance passes are linear in the list.
-- **Clearing.** Both sets are cleared when the filter is turned on or off, when the tab changes, or when the archive is entered or left. `kept_topics` is also cleared when the pane leaves the forum.
-- A chat read on another device that isn't kept leaves the filtered view at once.
+The former kept-chat and kept-topic sets and the implicit open-row exception are removed. Toggling the filter, changing tabs and reloading the list cannot reintroduce a read row. A new unread message can bring it back. In All, the archive entry shows under the filter only while an archived chat is unread.
 
 **Paging.** Only loaded chats are known: at most 1,000, as for folders and the archive.
 - The filter doesn't change dialogs paging. The view's own row count drives `seen`, so a sparse view asks for further pages, as folder views do today, up to `MAX_DIALOGS`.
@@ -1470,7 +1445,7 @@ pub struct ReadState { pub unread: u32, pub read_inbox_max: MsgId }
 - So a newer message, a partial read, a rejection or a completion each show the confirmed count again, until the refresh brings the server's.
 - `mark_read` no longer calls `set_unread(.., 0)` at admission.
 
-**Cache schema 7:** postcard rows are positional, so 6→7 drops the cached chat list, as 4→5 and 5→6 did. Messages are kept. Cached rows carry `ReadState`; `reading` starts as `None`.
+**Cache schema 8:** postcard rows are positional, so 7→8 drops the cached chat list while preserving messages. Cached rows carry `ReadState` and the confirmed `topic_unread` count; pending `reading` starts as `None`. Earlier versions upgrade through their existing migrations.
 
 **Fake:**
 - Each scripted chat keeps a read pointer, moved by `read_history` and by a pushed `ReadInbox`.
@@ -1571,7 +1546,7 @@ The rule:
 
 **Per-render cost.**
 - The sidebar's rows are computed today on every call of `rows()` and `row_count()`, several times a frame. With tabs, the filter and inline rows, they are cached as owned descriptors.
-- The cache is recomputed when the list, the folders, the view, the pane, the topic copy or the kept sets change. Expired mutes are rechecked at most once a minute.
+- The cache is recomputed when the list, the folders, the view, the pane or the topic copy changes. Expired mutes are rechecked at most once a minute.
 - **Unread counts per tab are out of scope** for this reason: `ChatFolder::contains` is linear in a folder's peers (≤ 512). Counting every tab on each change is up to 64 folders × 1,000 chats × 512 peers.
 
 ### 17.8 Tests
@@ -1595,14 +1570,12 @@ The owner's test policy holds here: a small set of behavioural tests per task, a
   - `TopicRemoved` removes the row;
   - rendering inline rows sends no command (the admitted commands are recorded).
 - **Task 15, unread filter:**
-  - a property over random lists, folders, kept sets and events (resets, kind changes, archive moves, folder edits):
-    - every shown chat satisfies its base rule with only read-based exclusions waived, and is unread or kept;
-    - every unread chat whose base rule holds is shown;
-    - a chat that an explicit exclusion names, or whose kind or peer folder fails the base rule, is never shown;
-    - the kept sets hold only listed ids (or ids in the copy) after every event;
-  - a chat read inside the filter stays until the filter is turned off, including in a folder that excludes read chats;
-  - a remote read of a chat that isn't kept removes it;
-  - the pane's forum with a dot topic stays.
+  - a property over random lists, folders, pane evidence and events verifies exact unread membership while respecting kind, peer-folder, mute and explicit exclusion rules;
+  - reading an open chat or topic removes its row while preserving its conversation pane;
+  - confirmed forum counts override stale raw dialog mentions in the unread filter and an exclude-read folder;
+  - remote reads also remove rows, and a new unread message restores them;
+  - when the last visible row is read, paging continues for unread chats not yet loaded;
+  - the pane's forum with a new-message dot remains unread.
 - **Task 16, core read state:**
   - a property over random interleavings of admissions (growing intents), flushes, completions (success, retry, rejection) in any order, snapshots, server read updates and counted messages, checked against a reference model:
     - `ReadState`'s pointer always equals the max of the server evidence applied and the `max_id`s of successful reads;
@@ -1655,7 +1628,7 @@ These continue section 12 and run in this order, after task 11 and before task 1
     - in `cargo dev`, selecting a demo forum shows its pinned topics first under its row;
     - switching topics from the sidebar is instant;
     - no topic request is sent that the pane wouldn't send without inline rows.
-15. **App: the unread filter.** The unread functions, membership with the read-only waiver, `ChatFolder::contains`'s `read_waived` argument, kept chats and topics with their maintenance, the copy, and the archive entry under the filter.
+15. **App: the unread filter.** Shared unread predicates, strict membership, positive topic evidence for folders, the topic copy, and the archive entry under the filter. Read rows leave immediately; the conversation pane stays open.
     *Done when:*
     - the task 15 tests pass;
     - in `cargo dev`, reading through the filter keeps the list still until the filter is turned off.

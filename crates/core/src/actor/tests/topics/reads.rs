@@ -16,6 +16,70 @@ async fn mark_read(h: &Harness, thread: ThreadKey, max_id: i32) {
     .await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn reading_general_leaves_unread_sibling_topics_alone() {
+    let f = forum(100);
+    let mut script = FakeScript::demo(1, 1);
+    add_unread_forum(&mut script, f);
+    script.history.entry(f).or_default().extend([
+        message_in(topic_key(f, 1), 11, "first General post"),
+        message_in(topic_key(f, 1), 12, "last General post"),
+    ]);
+    let mut h = online(script).await;
+    open_forum(&mut h, f).await;
+    h.send(Command::OpenThread(topic_key(f, 1))).await;
+    h.until(|e| matches!(e, Event::Reconciled { thread, .. } if *thread == topic_key(f, 1)))
+        .await;
+
+    mark_read(&h, topic_key(f, 1), 12).await;
+    let events = events_for(&mut h, Duration::from_secs(5)).await;
+    assert_eq!(h.fake.read_calls(), [(topic_key(f, 1), MsgId(12))]);
+    let general = states_of(&events, TopicId::GENERAL);
+    assert_eq!(
+        general.last().map(|t| (t.unread, t.freshness)),
+        Some((0, Freshness::Current)),
+        "{events:?}"
+    );
+    assert_eq!(last_bump(&events, f).map(|c| c.read.unread), Some(1));
+    h.stop().await;
+}
+
+/// The dialog's raw count can disagree with the per-topic counts after
+/// reading General. A complete topic refresh must win for display, and a
+/// sibling that is still unread must keep the parent badge on.
+#[tokio::test(start_paused = true)]
+async fn the_parent_badge_uses_confirmed_topics_instead_of_a_stale_dialog_total() {
+    for unread_sibling in [false, true] {
+        let f = forum(100);
+        let mut script = FakeScript::demo(1, 1);
+        add_unread_forum(&mut script, f);
+        if !unread_sibling {
+            script.topics.get_mut(&f).unwrap().iter_mut().for_each(|s| {
+                s.topic.read_inbox_max = MsgId(10);
+            });
+        }
+        let mut h = online(script).await;
+        open_forum(&mut h, f).await;
+        h.fake.inject(Op::PeerDialogs, Fault::Hang);
+        h.fake
+            .push_update(Update::ReadInbox {
+                chat: f,
+                topic: None,
+                still_unread: 37,
+                max_id: MsgId(0),
+            })
+            .await;
+        let (event, _) = h
+            .until(|e| matches!(e, Event::ChatBumped(c) if c.id == f && c.read.unread == 37 && c.topic_unread.is_some()))
+            .await;
+        let Event::ChatBumped(summary) = event else {
+            unreachable!();
+        };
+        assert_eq!(summary.displayed_unread(), u32::from(unread_sibling));
+        h.stop().await;
+    }
+}
+
 /// A topic read fails transiently, then times out, then lands only after
 /// a long delay: the intent is retried with backoff without a second
 /// `MarkRead`. Until it lands nothing is refetched and the badge keeps the

@@ -40,6 +40,88 @@ fn edited(topic: TopicId, id: i32, body: &str, version: i64) -> Message {
     }
 }
 
+#[test]
+fn a_badge_requires_complete_settled_topics_and_includes_hidden_topics() {
+    let now = Instant::now();
+    let mut l = list();
+    assert_eq!(l.confirmed_unread_topics(), None);
+    let unread = snap(Topic {
+        unread: 3,
+        ..topic(2)
+    });
+    let hidden = TopicSnapshot {
+        visibility: Visibility::Hidden,
+        ..snap(Topic {
+            unread: 2,
+            ..topic(1)
+        })
+    };
+    let topics = vec![unread, hidden];
+    load(
+        &mut l,
+        PageKind::First,
+        page(TopicOrder::LastActivity, topics.clone(), Rest::More),
+        now,
+    );
+    assert_eq!(l.confirmed_unread_topics(), None, "unseen topics remain");
+    load(
+        &mut l,
+        PageKind::First,
+        page(TopicOrder::LastActivity, topics, Rest::Last),
+        now,
+    );
+    assert_eq!(l.confirmed_unread_topics(), Some(2));
+
+    l.read_locally(tid(2), MsgId(20), now);
+    assert_eq!(
+        l.confirmed_unread_topics(),
+        None,
+        "a read alone proves no count"
+    );
+    let (seq, _) = dispatch(&mut l, now);
+    let read = Topic {
+        read_inbox_max: MsgId(20),
+        ..topic(2)
+    };
+    l.apply_by_id(seq, by_id(vec![snap(read)], vec![]), now)
+        .unwrap();
+    assert_eq!(
+        l.confirmed_unread_topics(),
+        Some(1),
+        "hidden General is still unread"
+    );
+
+    l.set_open(Some(tid(99)));
+    assert_eq!(
+        l.confirmed_unread_topics(),
+        None,
+        "the open topic is unknown"
+    );
+    l.set_open(None);
+
+    l.on_new_message(&message(tid(99), 100), Tail::Hidden, now);
+    assert_eq!(
+        l.confirmed_unread_topics(),
+        None,
+        "an unknown topic invalidates completeness"
+    );
+}
+
+#[test]
+fn capped_topics_cannot_prove_an_unread_total() {
+    let now = Instant::now();
+    let mut l = list();
+    let topics = (1..=501).map(|id| snap(topic(id))).collect();
+    load(
+        &mut l,
+        PageKind::First,
+        page(TopicOrder::LastActivity, topics, Rest::Last),
+        now,
+    );
+    assert_eq!(l.paging(), crate::store::topics::Paging::Capped);
+    assert_eq!(l.confirmed_unread_topics(), None);
+}
+
 /// Finding 1: a page that adds an unseen topic is dispatched; an edit of
 /// that topic's top message arrives; the old page completes. The topic must
 /// not be inserted as settled with the stale preview.

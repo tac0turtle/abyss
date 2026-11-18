@@ -71,9 +71,13 @@ pub(crate) struct Frame {
 
 impl Eq for Frame {}
 
-/// Where a menu of `entries` rows opened at `at` fits in the window.
+/// Convert the pointer's window coordinates to the session's content
+/// coordinates, then fit the menu below the integrated title bar.
 fn placed(at: Point<Pixels>, entries: usize, window: &Window) -> Frame {
-    frame(at, entries, window.viewport_size())
+    let inset = super::titlebar_inset(window);
+    let mut viewport = window.viewport_size();
+    viewport.height = (viewport.height - inset).max(px(0.));
+    frame(at - point(px(0.), inset), entries, viewport)
 }
 
 /// [`placed`] for a viewport of `size`: moved up and left to fit, and no

@@ -109,6 +109,7 @@ fn summary(c: ChatId, title: &str) -> ChatSummary {
         muted_until: 0,
         folder: PeerFolder::Main,
         reading: None,
+        topic_unread: None,
     }
 }
 
@@ -355,12 +356,12 @@ fn version_1_messages_are_dropped_on_upgrade() {
         .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 /// Version 2 → 3 drops the chat list; the upgrade then continues to
 /// version 4, which drops messages (see `version_3_messages_and_chats_are_dropped`),
-/// then versions 5, 6 and 7.
+/// then versions 5 through 8.
 #[test]
 fn version_2_chat_list_is_dropped_on_upgrade() {
     let (_t, dir, key) = setup();
@@ -377,11 +378,11 @@ fn version_2_chat_list_is_dropped_on_upgrade() {
     assert!(db.tail(ThreadKey::whole(c), 10).unwrap().is_empty());
 }
 
-/// Versions 4, 5 and 6 each drop the cached chat list on the way to 7
+/// Versions 4 through 7 drop the cached chat list on the way to 8
 /// (their chat rows can't be decoded) and keep the messages.
 #[test]
-fn chat_lists_before_version_7_are_dropped_on_upgrade() {
-    for from in [4, 5, 6] {
+fn chat_lists_before_version_8_are_dropped_on_upgrade() {
+    for from in [4, 5, 6, 7] {
         let (_t, dir, key) = setup();
         let c = user(1);
         {
@@ -400,7 +401,7 @@ fn chat_lists_before_version_7_are_dropped_on_upgrade() {
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 }
 
@@ -417,13 +418,14 @@ fn peer_folder_round_trips() {
     let mut db = Cache::open(&dir, &key).unwrap();
     db.put_chats(std::slice::from_ref(&archived)).unwrap();
     assert_eq!(db.chats().unwrap(), std::slice::from_ref(&archived));
-    // The read state is cached; the read overlay never is.
+    // Confirmed topic counts survive restart; pending reads never do.
     let reading = ChatSummary {
         read: ReadState {
             unread: 3,
             read_inbox_max: MsgId(40),
         },
         reading: Some(MsgId(50)),
+        topic_unread: Some(0),
         ..archived
     };
     db.put_chats(std::slice::from_ref(&reading)).unwrap();

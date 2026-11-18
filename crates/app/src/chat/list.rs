@@ -1,7 +1,6 @@
 //! The chat list as the UI holds it: core's dialogs in display order (plan
 //! section 7). Core owns the order; this mirrors its events.
 
-use std::collections::HashSet;
 use std::time::Instant;
 
 use abyss_core::api::{Event, UserError};
@@ -155,7 +154,7 @@ impl SidebarRow {
 /// its badge (the server's unread topics). Muted chats count; a chat
 /// marked unread doesn't (decision D8).
 pub(crate) fn chat_unread(chat: &ChatSummary) -> bool {
-    chat.displayed_unread() > 0 || chat.unread_mentions > 0
+    chat.has_unread()
 }
 
 /// Whether a topic counts as unread: whatever its row marks, a count or a
@@ -164,8 +163,8 @@ pub(crate) fn topic_unread(topic: &Topic) -> bool {
     UnreadMark::of(topic) != UnreadMark::None
 }
 
-/// The pane's chat, as the unread filter sees it (plan section 17.4): kept
-/// while it is open, and a forum also unread while its topic copy shows an
+/// The pane's chat, as the unread filter sees it (plan section 17.4):
+/// a forum is also unread while its topic copy shows an
 /// unread topic, so a dot isn't hidden behind a badge still refreshing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Opened {
@@ -173,17 +172,6 @@ pub(crate) struct Opened {
     /// The pane's forum's copy shows an unread topic (never for a chat
     /// that isn't a forum).
     pub(crate) unread_topics: bool,
-}
-
-/// What the unread filter keeps although it was read (plan section 17.4):
-/// chats opened from the view, and topics of the pane's forum opened,
-/// while the filter is on. Only listed chats (at most `MAX_DIALOGS`) and
-/// topics in the copy (at most `MAX_TOPICS_PER_FORUM + 1`); cleared when
-/// the filter or the view changes.
-#[derive(Debug, Default)]
-struct Kept {
-    chats: HashSet<ChatId>,
-    topics: HashSet<TopicId>,
 }
 
 /// Rows the chat shell places right after a forum's row: its inline topics
@@ -204,8 +192,6 @@ pub(crate) struct ChatList {
     restoring: Option<i32>,
     /// The account's chat folders, in server order.
     folders: Vec<ChatFolder>,
-    /// What the unread filter keeps.
-    kept: Kept,
     /// The pane's chat, from the chat shell.
     opened: Option<Opened>,
     /// The shown view's rows without inline topics, recomputed when the
@@ -280,18 +266,14 @@ impl ChatList {
     /// chats may lie further down).
     pub(crate) fn show(&mut self, shown: Shown) {
         self.restoring = None;
-        if shown != self.view.shown {
-            self.kept = Kept::default();
-        }
         self.view.shown = shown;
         self.view_changed();
     }
 
     /// Turns the unread filter on or off (the strip's toggle, Cmd+Shift+U),
-    /// in any view, the archive's included. Nothing stays kept.
+    /// in any view, the archive's included.
     pub(crate) fn toggle_unread(&mut self) {
         self.view.unread_only = !self.view.unread_only;
-        self.kept = Kept::default();
         self.view_changed();
     }
 
@@ -385,26 +367,19 @@ impl ChatList {
         chat_unread(chat) || topics
     }
 
-    /// Whether the unread filter keeps `chat`: opened from the view under
-    /// the filter, or the pane's chat.
-    fn kept(&self, chat: ChatId) -> bool {
-        self.kept.chats.contains(&chat) || self.opened.is_some_and(|o| o.chat == chat)
-    }
-
-    /// The read rule of `chat`'s base predicate: waived for a chat the
-    /// filter keeps, so it outlives only its own reading.
-    fn read_rule(&self, chat: ChatId) -> ReadRule {
-        if self.view.unread_only && self.kept(chat) {
+    /// Waive a folder's raw read test only when the unread view has
+    /// positive unread evidence, such as a forum topic's new-message dot.
+    fn read_rule(&self, chat: &ChatSummary) -> ReadRule {
+        if self.view.unread_only && self.unread(chat) {
             ReadRule::Waived
         } else {
             ReadRule::Applies
         }
     }
 
-    /// The filter's own test, after the view's base predicate: with the
-    /// filter on, a chat shows only while it is unread or kept.
+    /// Read chats leave the unread view even while their pane stays open.
     fn passes(&self, chat: &ChatSummary) -> bool {
-        !self.view.unread_only || self.unread(chat) || self.kept(chat.id)
+        !self.view.unread_only || self.unread(chat)
     }
 
     /// The chats of the shown view: a built-in tab's or the archive's in
@@ -418,7 +393,7 @@ impl ChatList {
     }
 
     /// The chats of the shown view's base predicate (plan section 17.4),
-    /// with "exclude read" waived for the chats the filter keeps.
+    /// with "exclude read" waived only for positive unread-topic evidence.
     fn base_chats(&self, now: i64) -> Vec<&ChatSummary> {
         match self.view.shown {
             Shown::Tab(Tab::Folder(id)) => {
@@ -427,7 +402,7 @@ impl ChatList {
                 };
                 let pinned = folder.pinned.iter().filter_map(|&p| self.get(p));
                 let rest = self.chats.iter().filter(|c| {
-                    !folder.pinned.contains(&c.id) && folder.contains(c, now, self.read_rule(c.id))
+                    !folder.pinned.contains(&c.id) && folder.contains(c, now, self.read_rule(c))
                 });
                 pinned.chain(rest).collect()
             }
@@ -454,24 +429,6 @@ impl ChatList {
         }
     }
 
-    /// Kept chats outlive only their own reading: one no longer listed, or
-    /// that the view's base predicate no longer takes in with reading
-    /// waived (an exclusion, a kind change, a peer-folder move, a mute),
-    /// is kept no more, so it doesn't come back read when the change is
-    /// undone. Linear in the list.
-    fn prune_kept(&mut self, now: i64) {
-        if self.kept.chats.is_empty() {
-            return;
-        }
-        let held: HashSet<ChatId> = self
-            .chats
-            .iter()
-            .filter(|c| self.kept.chats.contains(&c.id) && self.in_base(c, now, ReadRule::Waived))
-            .map(|c| c.id)
-            .collect();
-        self.kept.chats = held;
-    }
-
     /// Whether the shown view is led by the archive's entry: All only.
     fn leads_with_archive(&self) -> bool {
         self.view.shown == Shown::Tab(Tab::All)
@@ -491,7 +448,6 @@ impl ChatList {
     /// every change of the list, the folders or the view.
     fn recompute(&mut self) {
         let now = super::format::now();
-        self.prune_kept(now);
         let entry = self
             .leads_with_archive()
             .then(|| self.archive_entry())
@@ -504,6 +460,9 @@ impl ChatList {
             .collect();
         self.computed = now;
         self.place_beneath();
+        // Reading the last visible row leaves nothing that can call seen().
+        // Keep paging for unread chats further down, under the usual bounds.
+        self.paging.wanted |= self.row_count() == 0;
     }
 
     /// Places the rows beneath their forum's row, if the view shows it:
@@ -535,35 +494,6 @@ impl ChatList {
             self.opened = opened;
             self.recompute();
         }
-    }
-
-    /// The user opened `chat` from the view: under the filter, it stays
-    /// when it is read, until the filter or the view changes. Only listed
-    /// chats are kept.
-    pub(crate) fn keep(&mut self, chat: ChatId) {
-        if self.view.unread_only && self.get(chat).is_some() && self.kept.chats.insert(chat) {
-            self.recompute();
-        }
-    }
-
-    /// The user opened `topic` of the pane's forum, which its copy holds:
-    /// under the filter, its inline row stays when it is read.
-    pub(crate) fn keep_topic(&mut self, topic: TopicId) {
-        if self.view.unread_only {
-            self.kept.topics.insert(topic);
-        }
-    }
-
-    /// Whether the filter keeps `topic` of the pane's forum.
-    pub(crate) fn topic_kept(&self, topic: TopicId) -> bool {
-        self.kept.topics.contains(&topic)
-    }
-
-    /// Keeps only the topics `held` says the forum's copy still holds:
-    /// after a reset or a removal, or every topic when the pane leaves the
-    /// forum.
-    pub(crate) fn retain_kept_topics(&mut self, held: impl Fn(TopicId) -> bool) {
-        self.kept.topics.retain(|&t| held(t));
     }
 
     /// A redraw at `now`: a folder view rechecks its chats' mutes, at most
@@ -763,6 +693,8 @@ pub(crate) fn initials(title: &str) -> SharedString {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use abyss_core::model::ReadRule::{Applies, Waived};
     use abyss_core::model::{ChatKind, FolderRules, MediaKind, MsgId, PeerKind, ReadState};
 
@@ -790,6 +722,7 @@ mod tests {
             muted_until: 0,
             folder: PeerFolder::Main,
             reading: None,
+            topic_unread: None,
         }
     }
 
@@ -1133,6 +1066,40 @@ mod tests {
         assert!(f.contains(&muted, 1_000, Applies), "the mute has expired");
     }
 
+    #[test]
+    fn read_forums_leave_unread_views_and_exclude_read_folders_despite_raw_mentions() {
+        let forum = ChatSummary {
+            kind: ChatKind::Supergroup {
+                forum: true,
+                gigagroup: false,
+            },
+            topic_unread: Some(0),
+            unread_mentions: 3,
+            read: ReadState {
+                unread: 37,
+                ..ReadState::default()
+            },
+            ..chat(1)
+        };
+        assert!(!chat_unread(&forum));
+        let unread = folder(1, FolderRules::GROUPS.with(FolderRules::EXCLUDE_READ));
+        assert!(!unread.contains(&forum, 0, Applies));
+        let mut list = ChatList::default();
+        list.reset(vec![forum]);
+        list.set_opened(Some(Opened {
+            chat: id(1),
+            unread_topics: false,
+        }));
+        list.toggle_unread();
+        assert!(list.rows().is_empty());
+
+        let mentioned = ChatSummary {
+            unread_mentions: 1,
+            ..chat(2)
+        };
+        assert!(chat_unread(&mentioned), "private-chat mentions still count");
+    }
+
     /// Forums are supergroups, so a "groups" folder takes them in, as
     /// Telegram Desktop does (megagroups count as groups), archived or
     /// not. Broadcast channels never reach the list, so a folder naming one
@@ -1324,6 +1291,27 @@ mod tests {
         assert!(list.wants_more(now));
     }
 
+    #[test]
+    fn reading_the_last_unread_row_keeps_paging_for_unseen_chats() {
+        let now = Instant::now();
+        let mut list = ChatList::default();
+        let unread = ChatSummary {
+            read: ReadState {
+                unread: 1,
+                ..ReadState::default()
+            },
+            ..chat(1)
+        };
+        list.reset(vec![unread]);
+        list.toggle_unread();
+        list.requested();
+        list.paged(Pages::More);
+        assert!(!list.wants_more(now));
+        list.bump(chat(1));
+        assert!(list.rows().is_empty());
+        assert!(list.wants_more(now));
+    }
+
     /// A change the unread filter's property applies to the list.
     #[derive(Clone, Debug)]
     enum Change {
@@ -1334,8 +1322,6 @@ mod tests {
             n: i64,
             field: u8,
         },
-        /// The user opens chat `n` from the view.
-        Keep(i64),
         /// The pane shows chat `n`, or nothing; a forum's copy may show an
         /// unread topic.
         Open(Option<i64>, bool),
@@ -1358,7 +1344,6 @@ mod tests {
         prop_oneof![
             flags().prop_map(Change::Reset),
             (0..UNIVERSE, 0u8..5).prop_map(|(n, field)| Change::Bump { n, field }),
-            (0..UNIVERSE).prop_map(Change::Keep),
             (proptest::option::of(0..UNIVERSE), any::<bool>())
                 .prop_map(|(n, dots)| Change::Open(n, dots)),
             (any::<u8>(), flags(), flags(), proptest::bool::weighted(0.1)).prop_map(
@@ -1425,9 +1410,8 @@ mod tests {
     }
 
     /// The property's reference model, kept apart from the list: the
-    /// universe's chats as generated, which of them core lists, the folder
-    /// as generated, the view, and the chats opened under the filter since
-    /// it or the view last changed.
+    /// universe's chats as generated, which of them core lists, the folder,
+    /// the view, and the pane's unread-topic evidence.
     #[derive(Debug)]
     struct Model {
         chats: Vec<ChatSummary>,
@@ -1437,7 +1421,6 @@ mod tests {
         folder: Option<(u8, Vec<bool>, Vec<bool>)>,
         shown: Shown,
         filtered: bool,
-        kept: HashSet<usize>,
         /// The pane's chat, and whether its copy shows an unread topic.
         opened: Option<(usize, bool)>,
     }
@@ -1470,7 +1453,9 @@ mod tests {
             };
             let archived = c.folder == PeerFolder::Archive;
             let muted = c.muted_until != 0 && (c.unread_mentions == 0 || archived);
-            let read_out = c.read.unread == 0 && c.unread_mentions == 0 && read == Applies;
+            let forum = matches!(c.kind, ChatKind::Supergroup { forum: true, .. });
+            let read_out =
+                c.read.unread == 0 && (forum || c.unread_mentions == 0) && read == Applies;
             kind && !(bit(4) && muted) && !(bit(5) && read_out) && !(bit(6) && archived)
         }
 
@@ -1500,30 +1485,12 @@ mod tests {
         /// From the generated counts, and the pane's forum's topics.
         fn unread(&self, n: usize) -> bool {
             let c = &self.chats[n];
-            c.read.unread > 0 || c.unread_mentions > 0 || self.opened == Some((n, true))
-        }
-
-        fn kept(&self, n: usize) -> bool {
-            self.kept.contains(&n) || self.opened.is_some_and(|(o, _)| o == n)
+            let forum = matches!(c.kind, ChatKind::Supergroup { forum: true, .. });
+            c.read.unread > 0 || (!forum && c.unread_mentions > 0) || self.opened == Some((n, true))
         }
 
         fn show(&mut self, shown: Shown) {
-            if shown != self.shown {
-                self.kept.clear();
-            }
             self.shown = shown;
-        }
-
-        /// After every event: a kept chat stays only while it is listed
-        /// and its base predicate holds with reading waived.
-        fn settle(&mut self) {
-            let held: HashSet<usize> = self
-                .kept
-                .iter()
-                .copied()
-                .filter(|&n| self.listed[n] && self.base(n, Waived))
-                .collect();
-            self.kept = held;
         }
 
         fn apply(&mut self, change: &Change) {
@@ -1550,11 +1517,6 @@ mod tests {
                     // A bump lists a chat core hadn't listed.
                     self.listed[n] = true;
                 }
-                Change::Keep(n) => {
-                    if self.filtered && self.listed[ix(*n)] {
-                        self.kept.insert(ix(*n));
-                    }
-                }
                 Change::Open(n, dots) => self.opened = n.map(|n| (ix(n), *dots)),
                 Change::Folder {
                     rules,
@@ -1574,10 +1536,8 @@ mod tests {
                 Change::Show(n) => self.show(shown_of(*n)),
                 Change::Toggle => {
                     self.filtered = !self.filtered;
-                    self.kept.clear();
                 }
             }
-            self.settle();
         }
 
         /// The model's rows, as sets: the chats shown, and the archive's
@@ -1586,13 +1546,12 @@ mod tests {
             let listed = || (0..self.chats.len()).filter(|&n| self.listed[n]);
             let shown = listed()
                 .filter(|&n| {
-                    let kept = self.kept(n);
-                    let read = if self.filtered && kept {
+                    let read = if self.filtered && self.unread(n) {
                         Waived
                     } else {
                         Applies
                     };
-                    self.base(n, read) && (!self.filtered || self.unread(n) || kept)
+                    self.base(n, read) && (!self.filtered || self.unread(n))
                 })
                 .collect();
             let archived: Vec<usize> = listed()
@@ -1633,7 +1592,6 @@ mod tests {
                     .collect(),
             ),
             Change::Bump { n, .. } => list.bump(model.chats[ix(*n)].clone()),
-            Change::Keep(n) => list.keep(id(*n)),
             Change::Open(n, dots) => list.set_opened(n.map(|n| Opened {
                 chat: id(n),
                 unread_topics: *dots,
@@ -1660,12 +1618,11 @@ mod tests {
         /// over random lists, folders, opened chats and events (resets,
         /// kind changes, archive moves, reads, mentions, mutes, folder
         /// edits, view changes): the list shows exactly the chats whose
-        /// base predicate holds, with "exclude read" waived only for a
-        /// kept chat, that are unread or kept; it keeps exactly the
-        /// chats opened under the filter that are still listed and still
-        /// in their view but for reading; the archive's entry follows.
+        /// base predicate holds and that are unread. A topic's unread
+        /// evidence can waive a folder's raw read test; opening a read
+        /// chat cannot keep it in the view. The archive's entry follows.
         #[test]
-        fn the_unread_filter_waives_only_reading(
+        fn the_unread_filter_shows_only_unread_chats(
             changes in proptest::collection::vec(change(), 1..40),
         ) {
             let mut model = Model {
@@ -1674,7 +1631,6 @@ mod tests {
                 folder: None,
                 shown: Shown::default(),
                 filtered: false,
-                kept: HashSet::new(),
                 opened: None,
             };
             let mut list = ChatList::default();
@@ -1699,8 +1655,6 @@ mod tests {
                         _ => None,
                     })
                     .collect();
-                let kept: HashSet<usize> = list.kept.chats.iter().map(|c| ix(c.id)).collect();
-                proptest::prop_assert_eq!(&kept, &model.kept, "kept after {:?}", change);
                 proptest::prop_assert_eq!(&rows, &shown, "rows after {:?}", change);
                 let first = match list.rows().first() {
                     Some(SidebarRow::Archive(e)) => Some(*e),

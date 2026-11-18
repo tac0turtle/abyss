@@ -19,7 +19,7 @@ use super::topic_view::topic_row;
 use super::view::{centered, field, muted};
 use super::{Root, State};
 use crate::chat::inline::Inline;
-use crate::chat::list::{ArchiveEntry, ChatList, Shown, SidebarRow, Tab, View};
+use crate::chat::list::{ArchiveEntry, Shown, SidebarRow, Tab, View};
 use crate::chat::messages::MessageWindow;
 use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
@@ -138,7 +138,7 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
                         .child(appearance_button(cx)),
                 ),
         )
-        .child(tab_strip(session, theme, cx))
+        .child(super::tabs::strip(session, theme, cx))
         .child(body)
         // Last, so it paints over the rows and takes their clicks.
         .children(retry)
@@ -186,129 +186,6 @@ fn sidebar_title(shown: Shown, theme: &Theme, cx: &mut Context<'_, Root>) -> Any
     }
 }
 
-/// The strip under the heading: All, Private, Groups and Forums, then each
-/// chat folder in server order (plan section 17.2). The tabs scroll
-/// sideways; the unread toggle sits at the strip's right end, outside the
-/// scroll. The archive has no tabs, only the toggle.
-fn tab_strip(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
-    let list = &session.shell.list;
-    let shown = match list.shown() {
-        Shown::Tab(tab) => Some(tab),
-        Shown::Archive => None,
-    };
-    let tabs = list.tabs().filter(|_| shown.is_some()).map(|tab| {
-        let selected = Some(tab) == shown;
-        let mark: Hsla = if selected {
-            theme.text.into()
-        } else {
-            transparent_black()
-        };
-        div()
-            .id(tab_id(tab))
-            .flex_none()
-            .px_2()
-            .pb_1()
-            .border_b_2()
-            .border_color(mark)
-            .text_sm()
-            .cursor_pointer()
-            .child(tab_title(tab, list))
-            .when(!selected, |d| d.text_color(theme::quiet(theme.text)))
-            .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
-                root.with_session(|s, cx| s.show_chats(Shown::Tab(tab), window, cx), cx);
-            }))
-            // Folder tabs keep their menu; built-in tabs have none.
-            .when_some(folder_id(tab), |d, folder| {
-                d.on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |root, ev: &MouseDownEvent, window, cx| {
-                        root.with_session(
-                            |s, cx| s.open_folder_menu(folder, ev.position, window, cx),
-                            cx,
-                        );
-                    }),
-                )
-            })
-    });
-    let scroll = div()
-        .id("tabs")
-        .flex_1()
-        .min_w_0()
-        .flex()
-        .gap_1()
-        .px_1()
-        .pt_1()
-        .overflow_x_scroll()
-        .children(tabs);
-    div()
-        .flex()
-        .flex_none()
-        .bg(theme.surface(Depth::NOW))
-        .text_color(theme.text)
-        .child(scroll)
-        .child(unread_toggle(list.view(), theme, cx))
-}
-
-/// The unread filter's toggle (plan section 17.4): on, it carries the ink
-/// rule and full ink like a selected tab; off, quiet ink. No hue.
-fn unread_toggle(view: View, theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
-    let on = view.unread_only;
-    let mark: Hsla = if on {
-        theme.text.into()
-    } else {
-        transparent_black()
-    };
-    div()
-        .id("unread-toggle")
-        .flex_none()
-        .mx_1()
-        .px_2()
-        .py_1()
-        .border_b_2()
-        .border_color(mark)
-        .text_sm()
-        .cursor_pointer()
-        .child(copy::UNREAD_FILTER)
-        .when(!on, |d| d.text_color(theme::quiet(theme.text)))
-        .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
-            root.with_session(|s, cx| s.toggle_unread(window, cx), cx);
-        }))
-}
-
-/// A tab's stable element id: built-in tabs by name, folders by id.
-fn tab_id(tab: Tab) -> ElementId {
-    match tab {
-        Tab::All => "tab-all".into(),
-        Tab::Private => "tab-private".into(),
-        Tab::Groups => "tab-groups".into(),
-        Tab::Forums => "tab-forums".into(),
-        Tab::Folder(id) => ("tab-folder", u64::from(id.cast_unsigned())).into(),
-    }
-}
-
-fn tab_title(tab: Tab, list: &ChatList) -> SharedString {
-    match tab {
-        Tab::All => copy::ALL_CHATS.into(),
-        Tab::Private => copy::PRIVATE_TAB.into(),
-        Tab::Groups => copy::GROUPS_TAB.into(),
-        Tab::Forums => copy::FORUMS_TAB.into(),
-        Tab::Folder(id) => list
-            .folders()
-            .iter()
-            .find(|f| f.id == id)
-            .map(|f| SharedString::from(f.title.clone()))
-            .unwrap_or_default(),
-    }
-}
-
-/// The chat folder a tab shows, if it is one.
-fn folder_id(tab: Tab) -> Option<i32> {
-    match tab {
-        Tab::Folder(id) => Some(id),
-        Tab::All | Tab::Private | Tab::Groups | Tab::Forums => None,
-    }
-}
-
 /// Leaves the archive for All.
 fn back_button(cx: &mut Context<'_, Root>) -> Stateful<Div> {
     div()
@@ -322,13 +199,13 @@ fn back_button(cx: &mut Context<'_, Root>) -> Stateful<Div> {
         }))
 }
 
-/// Opens the appearance panel; also in the app menu and on Cmd+comma.
+/// Opens settings; also in the app menu and on Cmd+comma.
 fn appearance_button(cx: &mut Context<'_, Root>) -> Stateful<Div> {
     div()
         .id("appearance")
         .text_xs()
         .cursor_pointer()
-        .child(crate::ui::copy::APPEARANCE)
+        .child(crate::ui::copy::SETTINGS)
         .on_click(cx.listener(|root, _: &ClickEvent, _, cx| {
             root.toggle_appearance(cx);
         }))

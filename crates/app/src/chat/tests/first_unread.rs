@@ -58,11 +58,11 @@ enum Side {
 }
 
 /// A frame that painted rows `first..=last`.
-fn painted(first: usize, last: usize) -> Option<Seen> {
-    Some(Seen {
+fn painted(first: usize, last: usize) -> Seen {
+    Seen {
         first_row: first,
         last_message: Some(last),
-    })
+    }
 }
 
 /// The rows that carry the divider.
@@ -105,11 +105,11 @@ fn opening_with_unread_lands_at_the_divider() {
 
     // The first paint shows only the read context: no read mark.
     shell
-        .frame_seen(painted(0, 9), now(), &mut core.admit())
+        .frame_seen(Some(painted(0, 9)), now(), &mut core.admit())
         .unwrap();
     assert!(reads(&core.take()).is_empty());
     shell
-        .frame_seen(painted(5, 30), now(), &mut core.admit())
+        .frame_seen(Some(painted(5, 30)), now(), &mut core.admit())
         .unwrap();
     let cmds = core.take();
     assert_eq!(reads(&cmds), [81], "a partial read");
@@ -154,7 +154,7 @@ fn an_anchored_open_falls_back_to_the_tail_when_its_load_ends() {
     assert!(divider_rows(&shell).is_empty());
     assert!(shell.rows().is_following_tail());
     shell
-        .frame_seen(painted(40, 49), later, &mut core.admit())
+        .frame_seen(Some(painted(40, 49)), later, &mut core.admit())
         .unwrap();
     let cmds = core.take();
     assert_eq!(reads(&cmds), [100]);
@@ -171,7 +171,7 @@ fn the_divider_stays_until_a_send_or_leaving() {
     shell.apply(history(1, HistoryDir::Tail, 31..=100));
     assert_eq!(divider_rows(&shell), [30]);
     shell
-        .frame_seen(painted(30, 69), now(), &mut core.admit())
+        .frame_seen(Some(painted(30, 69)), now(), &mut core.admit())
         .unwrap();
     assert_eq!(reads(&core.take()), [100]);
     let read = ChatSummary {
@@ -221,7 +221,7 @@ fn a_late_divider_marks_what_arrives_unseen() {
     let mut core = Core::default();
     let mut shell = open(&mut core);
     shell
-        .frame_seen(painted(40, 49), now(), &mut core.admit())
+        .frame_seen(Some(painted(40, 49)), now(), &mut core.admit())
         .unwrap();
     shell.apply(live(101));
     assert!(divider_rows(&shell).is_empty(), "the tail is viewed");
@@ -239,7 +239,7 @@ fn a_late_divider_marks_what_arrives_unseen() {
         .set_focus(WindowState::Active, now(), &mut core.admit())
         .unwrap();
     shell
-        .frame_seen(painted(45, 54), now(), &mut core.admit())
+        .frame_seen(Some(painted(45, 54)), now(), &mut core.admit())
         .unwrap();
     shell
         .set_focus(WindowState::Inactive, now(), &mut core.admit())

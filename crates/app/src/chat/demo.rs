@@ -110,6 +110,7 @@ fn summary(n: i64, now: i64) -> ChatSummary {
             PeerFolder::Main
         },
         reading: None,
+        topic_unread: None,
     }
 }
 

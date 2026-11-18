@@ -307,7 +307,7 @@ impl<B: Backend> Actor<B> {
         if outcome == Outcome::Landed && cgen == self.cgen {
             if thread.topic.is_some() {
                 self.topic_read(thread, max_id).await;
-                self.badge_trigger(chat);
+                self.badge_trigger(chat).await;
             } else {
                 // The pointer rises, unstamped; the read proves no count,
                 // so the row is refreshed from the server. The pane's chat

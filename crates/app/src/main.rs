@@ -3,6 +3,8 @@
 mod chat;
 mod launch;
 mod logging;
+#[cfg(target_os = "macos")]
+mod macos;
 mod preferences;
 mod shell;
 mod storage;
@@ -15,6 +17,8 @@ fn main() {
     logging::init();
     let launch = launch::resolve(std::env::args_os(), |name| std::env::var_os(name));
     application().run(move |cx: &mut App| {
+        #[cfg(target_os = "macos")]
+        macos::set_app_icon();
         cx.bind_keys(ui::text_input::key_bindings());
         cx.bind_keys(shell::key_bindings());
         cx.set_menus(shell::menus());

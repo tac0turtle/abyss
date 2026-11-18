@@ -30,6 +30,7 @@ fn summary(title: &str) -> ChatSummary {
         muted_until: 0,
         folder: PeerFolder::Main,
         reading: None,
+        topic_unread: None,
     }
 }
 

@@ -3,12 +3,15 @@
 //! [`crate::store::PeerScheduler`]; this module feeds them and applies
 //! what comes back.
 //!
-//! - **Set only from the server.** A forum's `unread` (its unread-topic
-//!   count) is set from a dialogs page containing it, a `peer_dialogs`
+//! - **Raw dialog counts.** A forum's `unread` is set from a dialogs page
+//!   containing it, a `peer_dialogs`
 //!   result, or a chat-level read update. It is a dialog row field like the
 //!   kind and the folder, ordered by the badge clock: a snapshot sets it
 //!   only if dispatched after the field's last source (`Dialogs::guard`).
-//!   Nothing adjusts it locally.
+//!   Nothing adjusts it locally. For display, a complete, settled topic
+//!   list supplies `ChatSummary::topic_unread`: the number of server topic
+//!   counts above zero. A raw dialog total can stay positive after every
+//!   topic is read, so it is only the fallback while topics are incomplete.
 //! - **Triggers** (an incoming message, a remote topic read, a deletion in
 //!   the forum; a completed local read in task 9) set the chat's dirty
 //!   stamp. The scheduler drains dirty chats through `peer_dialogs`, and only
@@ -46,23 +49,80 @@ impl<B: Backend> Actor<B> {
     }
 
     /// Something may have changed a forum's count: refresh its badge.
-    pub(super) fn badge_trigger(&mut self, chat: ChatId) {
+    pub(super) async fn badge_trigger(&mut self, chat: ChatId) {
         if self.is_forum(chat) {
+            // An evicted list's last aggregate remains useful until a new
+            // event makes it uncertain. The next peer refresh supplies the
+            // fallback until the topic list is loaded again.
+            if self.topics.lists.get(chat).is_none()
+                && let Some(summary) = self.dialogs.set_topic_unread(chat, None).cloned()
+            {
+                self.cache_dialogs().await;
+                self.emit(Event::ChatBumped(summary)).await;
+            }
             self.badges.trigger(chat);
         }
     }
 
+    fn topic_unread(&self, chat: ChatId) -> Option<u32> {
+        match self.topics.lists.get(chat) {
+            Some(_) => self.topics.confirmed_unread(chat),
+            None => self.dialogs.get(chat).and_then(|s| s.topic_unread),
+        }
+    }
+
+    /// Reproject after topic changes, including changes to retained lists
+    /// that are no longer shown. Never infer a full count from a partial list.
+    pub(super) async fn refresh_topic_badge(&mut self, chat: ChatId) {
+        let unread = self.topic_unread(chat);
+        if let Some(summary) = self.dialogs.set_topic_unread(chat, unread).cloned() {
+            self.cache_dialogs().await;
+            self.emit(Event::ChatBumped(summary)).await;
+        }
+    }
+
+    /// Restore cached topic evidence only for the same dialog version. This
+    /// also handles a cache read that finishes after the first server page.
+    pub(super) fn restore_topic_badges(&mut self, cached: &[ChatSummary]) -> Vec<ChatSummary> {
+        let mut changed = Vec::new();
+        for saved in cached {
+            let matches = self.dialogs.get(saved.id).is_some_and(|current| {
+                kind_status(current.kind) == ForumStatus::Forum
+                    && current.kind == saved.kind
+                    && current.read == saved.read
+                    && current.last_id == saved.last_id
+                    && current.topic_unread.is_none()
+            });
+            if matches
+                && self.topics.lists.get(saved.id).is_none()
+                && let Some(summary) = self.dialogs.set_topic_unread(saved.id, saved.topic_unread)
+            {
+                changed.push(summary.clone());
+            }
+        }
+        changed
+    }
+
     /// A chat-level read update (`ReadInbox { topic: None }`, a read here
     /// or on another device): a live change of the row's count, which no
-    /// snapshot dispatched before it can revert (for a forum, its
-    /// unread-topic count), and the pointer raised to `max_id`.
+    /// snapshot dispatched before it can revert, and the pointer raised
+    /// to `max_id`. Forums refetch their topic aggregate separately.
     pub(super) async fn chat_read(&mut self, chat: ChatId, still_unread: u32, max_id: MsgId) {
+        if self.is_forum(chat) {
+            if let Some(list) = self.topics.lists.get_mut(chat) {
+                // A whole-chat read update does not identify the topics it
+                // changed. Refetch before trusting the previous aggregate.
+                list.want_first_page();
+            }
+            self.dialogs.set_topic_unread(chat, None);
+        }
         let now = self.badges.now();
         if let Some(summary) = self
             .dialogs
             .server_read(chat, still_unread, max_id, now)
             .cloned()
         {
+            self.cache_dialogs().await;
             self.emit(Event::ChatBumped(summary)).await;
         }
     }
@@ -82,6 +142,23 @@ impl<B: Backend> Actor<B> {
         // The read overlay is re-derived on every install: no snapshot
         // supplies or clears it (stage 2 plan, section 17.6.1).
         self.reads.project(chats);
+        for chat in chats.iter_mut() {
+            // A new dialog read state may expose a missed topic update.
+            // A remembered aggregate must not hide that new unread state.
+            if self.dialogs.get(chat.id).is_some_and(|old| {
+                old.topic_unread.is_some() && (old.read != chat.read || old.last_id != chat.last_id)
+            }) {
+                if let Some(list) = self.topics.lists.get_mut(chat.id) {
+                    list.want_first_page();
+                }
+                self.dialogs.set_topic_unread(chat.id, None);
+            }
+            chat.topic_unread = if kind_status(chat.kind) == ForumStatus::Forum {
+                self.topic_unread(chat.id)
+            } else {
+                None
+            };
+        }
         if guarded != crate::store::Guarded::Discard {
             for chat in chats.iter() {
                 if kind_status(chat.kind) == ForumStatus::Forum {
