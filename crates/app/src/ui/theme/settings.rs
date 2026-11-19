@@ -145,9 +145,9 @@ fn parse_choice(line: &str, name: &str) -> Option<Choice> {
     words.next().is_none().then_some(Choice { hue, tint })
 }
 
-/// Where the choice is kept, if the home directory is known.
-pub(crate) fn default_path() -> Option<PathBuf> {
-    small_file::path(FILE)
+/// Where the choice is kept in `app_dir`.
+pub(crate) fn path_in(app_dir: &Path) -> PathBuf {
+    app_dir.join(FILE)
 }
 
 /// The saved choice, or the defaults if there is none or it is not valid.

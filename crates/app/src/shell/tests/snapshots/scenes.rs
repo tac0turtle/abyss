@@ -120,12 +120,13 @@ fn long_draft(shot: &mut Shot) -> Result<()> {
 }
 
 /// Where the pointer rests for the hover scene: on an unselected tab in the
-/// rail, then on the menu's first entry.
+/// rail, on the selected one (Forums), then on the menu's first entry.
 const UNSELECTED_TAB: (f32, f32) = (37., 118.);
+const SELECTED_TAB: (f32, f32) = (37., 148.);
 const MENU_ENTRY: (f32, f32) = (200., 140.);
 
-/// Hover states: a selected tab beside a hovered unselected one, then a
-/// hovered entry in a chat's menu.
+/// Hover states: an unselected tab hovered beside the selected one, the
+/// selected one hovered, then a hovered entry in a chat's menu.
 pub(super) fn hover(dir: &Path, colourway: Colourway) -> Result<()> {
     let mut shot = Shot::open(dir, colourway)?;
     shot.sign_in()?;
@@ -141,6 +142,9 @@ pub(super) fn hover(dir: &Path, colourway: Colourway) -> Result<()> {
     shot.input(pointer_at(UNSELECTED_TAB))?;
     shot.save(Mode::Day, "hover-tab-day.png")?;
     shot.save(Mode::Night, "hover-tab-night.png")?;
+    shot.input(pointer_at(SELECTED_TAB))?;
+    shot.save(Mode::Day, "hover-selected-tab-day.png")?;
+    shot.save(Mode::Night, "hover-selected-tab-night.png")?;
     let forum = ChatId {
         kind: PeerKind::Channel,
         id: 2,

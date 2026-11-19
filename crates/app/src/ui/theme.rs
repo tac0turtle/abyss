@@ -17,11 +17,11 @@ pub(crate) mod colourway;
 mod flat;
 pub(crate) mod settings;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{App, AppContext, BorrowAppContext, Global, Rgba, Task, Window, WindowAppearance};
 
-pub(crate) use self::colourway::Colourway;
+pub(crate) use self::colourway::{Colourway, FirstLaunch};
 use self::flat::Flat;
 pub(crate) use self::settings::{Choice, Hue, Settings, Tint};
 
@@ -424,22 +424,30 @@ impl Themes {
         }
     }
 
-    /// Installs the saved choices, or the defaults. Call once at startup.
-    /// Nothing is written here: a missing colourway file just means the
-    /// default.
-    pub(crate) fn init(cx: &mut App) {
+    /// Installs the saved choices, or the defaults. Call once at startup,
+    /// before the window opens: a first launch decides its colourway here
+    /// (see [`colourway::decide`]).
+    pub(crate) fn init(policy: FirstLaunch, cx: &mut App) {
+        if let Some(app_dir) = crate::storage::app_dir() {
+            Self::init_in(&app_dir, policy, cx);
+        } else {
+            tracing::warn!("the home directory is unknown; theme choices last this run");
+            let defaults = Self::new(Colourway::DEFAULT, Settings::default(), Stores::default());
+            cx.set_global(defaults);
+        }
+    }
+
+    /// [`Themes::init`] with the app's directory at `app_dir`.
+    pub(crate) fn init_in(app_dir: &Path, policy: FirstLaunch, cx: &mut App) {
         let stores = Stores {
-            theme: settings::default_path(),
-            colourway: colourway::default_path(),
+            theme: Some(settings::path_in(app_dir)),
+            colourway: Some(colourway::path_in(app_dir)),
         };
         let settings = stores
             .theme
             .as_deref()
             .map_or_else(Settings::default, settings::load);
-        let colourway = stores
-            .colourway
-            .as_deref()
-            .map_or(Colourway::DEFAULT, |path| colourway::load(path).colourway());
+        let colourway = colourway::decide(app_dir, policy);
         cx.set_global(Self::new(colourway, settings, stores));
     }
 
@@ -589,5 +597,7 @@ fn encode(linear: f32) -> f32 {
     }
 }
 
+#[cfg(test)]
+mod persist_tests;
 #[cfg(test)]
 mod tests;

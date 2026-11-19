@@ -29,9 +29,13 @@ pub(crate) fn path(name: &str) -> Option<PathBuf> {
 }
 
 /// At most the file's first [`MAX_FILE_BYTES`], as text. Only a regular
-/// file is read: a symlink (even a dangling one) or anything else at `path`
-/// is an error, never [`io::ErrorKind::NotFound`], and a FIFO cannot block.
+/// file in an owned app directory is read: a symlink (even a dangling one)
+/// or anything else at `path` or in the directory's place is an error,
+/// never [`io::ErrorKind::NotFound`], and a FIFO cannot block.
 pub(crate) fn read(path: &Path) -> io::Result<String> {
+    if !owned_dir(path)? {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -62,12 +66,26 @@ pub(crate) fn write(path: &Path, text: &str) -> io::Result<()> {
 /// fine. A symlinked, non-directory or foreign-owned directory is refused
 /// and nothing is removed.
 pub(crate) fn remove(path: &Path) -> io::Result<()> {
+    if !owned_dir(path)? {
+        return Ok(());
+    }
+    match fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Whether the directory holding `path` exists: `Ok(false)` if it is
+/// missing, an error if a symlink, a non-directory or a directory owned by
+/// someone else stands in its place. Nothing is created or followed.
+fn owned_dir(path: &Path) -> io::Result<bool> {
     let dir = path
         .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     let meta = match fs::symlink_metadata(dir) {
         Ok(meta) => meta,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
     // SAFETY: getuid has no preconditions and cannot fail.
@@ -77,10 +95,7 @@ pub(crate) fn remove(path: &Path) -> io::Result<()> {
             "unsafe app directory",
         ));
     }
-    match fs::remove_file(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -137,13 +152,24 @@ mod tests {
         let (parent, app) = app_dir();
         let elsewhere = parent.path().join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("theme"), "planted\n").unwrap();
         symlink(&elsewhere, &app).unwrap();
-        assert!(write(&app.join("theme"), "x\n").is_err());
-        assert!(remove(&app.join("theme")).is_err());
-        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0, "followed");
+        let file = app.join("theme");
+        assert!(write(&file, "x\n").is_err());
+        assert!(remove(&file).is_err());
+        assert_ne!(read(&file).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let planted = fs::read_to_string(elsewhere.join("theme")).unwrap();
+        assert_eq!(planted, "planted\n", "followed");
+        // A dangling link is not a missing directory either.
+        fs::remove_file(&app).unwrap();
+        symlink(parent.path().join("nowhere"), &app).unwrap();
+        assert_ne!(read(&file).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(remove(&file).is_err());
         fs::remove_file(&app).unwrap();
         fs::write(&app, "").unwrap();
-        assert!(write(&app.join("theme"), "x\n").is_err());
+        assert!(write(&file, "x\n").is_err());
+        assert!(remove(&file).is_err());
+        assert_ne!(read(&file).unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -177,6 +203,11 @@ mod tests {
         fs::create_dir(&app).unwrap();
         let file = app.join("colourway");
         assert_eq!(read(&file).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let missing_dir = parent.path().join("gone").join("colourway");
+        assert_eq!(
+            read(&missing_dir).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
         symlink(parent.path().join("nowhere"), &file).unwrap();
         assert_ne!(read(&file).unwrap_err().kind(), io::ErrorKind::NotFound);
         fs::remove_file(&file).unwrap();

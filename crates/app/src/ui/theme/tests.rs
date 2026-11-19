@@ -155,7 +155,12 @@ fn in_bubble(t: &Theme, mode: Mode, side: Side, d: Depth, out: &mut Vec<Pair>) {
         ),
         pair(
             format!("spoiler {at}"),
-            contrast(t.spoiler(side), g),
+            // An opaque block, so nothing under it shows through.
+            if t.spoiler(side).a < 1. {
+                0.
+            } else {
+                contrast(t.spoiler(side), g)
+            },
             NON_TEXT,
         ),
         pair(

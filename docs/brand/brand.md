@@ -1,6 +1,6 @@
 # abyss brand
 
-Status: decided in the branding workshop on 2026-11-16. The colour system, the hue and tint picker, type, the mark and rules 1 to 5 are implemented in `crates/app/src/ui/theme.rs`, `ui/mark.rs` and the shell views. The icon is drawn (`assets/icon/`) and attached by the bundle script. A first landing page (`site/index.html`) and store listing copy (`docs/brand/store-listing.md`) exist; neither is published. What remains is under "Open".
+Status: decided in the branding workshop on 2026-11-16, amended for colourways on 2026-11-19 (`docs/plans/colourways.md`). The colour system, the hue and tint picker, type, the mark and rules 1 to 5 are implemented in `crates/app/src/ui/theme.rs`, `ui/mark.rs` and the shell views. The icon is drawn (`assets/icon/`) and attached by the bundle script. A first landing page (`site/index.html`) and store listing copy (`docs/brand/store-listing.md`) exist; neither is published. What remains is under "Open".
 
 **Checking the look.** The views can be rendered to PNG without opening a window:
 
@@ -8,7 +8,7 @@ Status: decided in the branding workshop on 2026-11-16. The colour system, the h
 ABYSS_SNAPSHOT_DIR=/path/to/shots cargo test -p abyss --features snapshots shell::tests::snapshots
 ```
 
-It writes the Welcome and sign-in screens, an open chat, the appearance panel and the chat list at three depths, in day and night.
+It writes the Welcome and sign-in screens, an open chat, the appearance panel, tabs, topics, menus, a busy group chat and hover states in every colourway, and the chat list at three depths under abyss, in day and night. Shots other than abyss's are prefixed with the colourway's name.
 
 ## Positioning
 
@@ -18,26 +18,46 @@ It writes the Welcome and sign-in screens, an open chat, the appearance panel an
 - **Idea:** the stream is the abyss; the app is the glass you read it through.
 - **Personality:** austere and exact, calm and quiet. Not menacing, not wry.
 - **Name:** `abyss`, lowercase, no article. "The abyss" means the endless stream, never the product.
-- **No Telegram visual DNA:** no paper plane, no sky blue. The brand must stretch to other networks.
+- **No Telegram marks:** no paper plane, no logo. Colourways take their structure from familiar messengers under their own names and values; "Telegram" and "Signal" are never colourway names. The brand must stretch to other networks.
+- **Terms note:** colourways that echo familiar messengers are a design decision (owner, 2026-11-19, decision 2 of the colourways plan). They copy structure, not marks, names or exact values.
 - **Tagline:** Look in. Nothing looks back.
 - **Descriptor:** "abyss, an unofficial Telegram client" as a store title, until a second network ships. In the app: "abyss is an unofficial Telegram client. It uses the Telegram API." Telegram's API terms allow "Telegram" in a title only after "Unofficial", forbid its logo, and require stating prominently that the app uses the Telegram API. The sign-in screens carry the wordmark, the tagline and that sentence.
 
-## Rules that hold in every theme
+## Rules
 
-Users choose the colour, so the brand is the set of rules that survive any hue.
+Rules keep their workshop numbers, so a reference such as "rule 3" still holds.
 
-1. **Old things sink.** Tone tracks age in the chat list and in history. Older is darker, in both modes.
-2. **No accent colour.** Emphasis is contrast only. No state may depend on a hue.
-3. **The user's words carry the most contrast on screen.** Everything that arrives is quieter.
-4. **People are set in Charter.** Names and the wordmark use the serif. Messages, times and states use Avenir Next.
-5. **One radius, full-width bands.** Messages and the composer share a 12-point corner. Chat rows touch edge to edge.
-6. **One graphic device: the strata.** The ramp used in order, lightest first. No second colour, no decorative gradient.
+**In every colourway:**
+
+- **Rule 2: No state depends on hue alone.** The accent may mark a state, but shape, weight or a rule marks it too.
+- **Rule 4: People are set in Charter.** Names and the wordmark use the serif. Messages, times and states use Avenir Next.
+- **Rule 5: One radius, full-width bands.** Messages and the composer share a 12-point corner. Chat rows touch edge to edge.
+
+**In the abyss colourway:**
+
+- **Rule 1: Old things sink.** Tone tracks age in the chat list and in history. Older is darker, in both modes.
+- **Rule 3: The user's words carry the most contrast on screen.** Everything that arrives is quieter.
+- **Rule 6: One graphic device: the strata.** The ramp used in order, lightest first. No second colour, no decorative gradient.
 
 ## Colour
 
+**Three colourways**, picked at the top of Appearance. Each defines a night and a day theme, and the system appearance picks between them.
+
+- **Ultramarine:** flat neutrals and a saturated blue (oklch 0.53 0.20 265) for the user's own messages and the accent. The default for a new install.
+- **Sky:** flat, slightly cool surfaces, white incoming messages by day, and a sky-blue accent.
+- **abyss:** the strata below. The user chooses its hue and tint; the rest of this section up to the public ramp describes it.
+
+The choice is saved as two lines of text in `~/Library/Application Support/dev.abyss/colourway` (`abyss-colourway 1`, then `ultramarine`, `sky` or `abyss`), readable only by the user, beside the `theme` file that keeps abyss's hues. The first real launch without it decides once and writes it: an install that already has a `theme` file or a message cache keeps abyss; a new one gets Ultramarine. A damaged file means Ultramarine and is left alone until the user picks.
+
+**Contrast in the flat colourways.** The weakest text pair is 4.53 in Ultramarine (quiet text on the own-message blue, both modes) and 5.03 in Sky (night; 5.11 by day). The flat colourways' values live in `crates/app/src/ui/theme/flat.rs`.
+
+### abyss
+
+Users choose the colour, so abyss's brand is the set of rules that survive any hue.
+
 A theme is two numbers per mode: a hue and a tint amount. Lightness is fixed by the tables below and is not user-editable, which is what keeps text readable and rule 1 working.
 
-**The picker** (Appearance, in the app menu, on Cmd+comma and above the chat list) offers 24 hues, 15 degrees apart, and five tint amounts from 0% (grey) to 200%, separately for night and day. A choice applies as it is made. It is saved as three lines of text in `~/Library/Application Support/dev.abyss/theme`, readable only by the user; a missing or invalid file means the defaults.
+**The picker** (Appearance, in the app menu, on Cmd+comma and above the chat list) offers 24 hues, 15 degrees apart, and five tint amounts from 0% (grey) to 200%, separately for night and day. A choice applies as it is made. abyss's hues are saved as three lines of text in `~/Library/Application Support/dev.abyss/theme`, readable only by the user; a missing or invalid file means the defaults.
 
 Values are `oklch(lightness chroma hue)`. Chroma is multiplied by the tint amount (default 1). Hex values are the defaults converted to sRGB; the darkest steps clip slightly.
 
@@ -64,13 +84,13 @@ In day mode, steps 1 to 4 take dark text and steps 5 to 7 take light text.
 
 **Which step a thing takes** is its age in local calendar days: today is step 1, yesterday 2, within a week 3, within 30 days 4, within 90 days 5, within a year 6, older 7.
 
-**Contrast** (WCAG ratio). Every way text can sit on the theme is checked: on each step, inside an incoming message over each step, and inside the user's own message, at full and at quiet strength. The weakest pair is 5.6 in night mode and 4.8 in day mode, against a minimum of 4.5. The tests in `theme.rs` hold this for all 120 combinations the picker offers, in both modes, so no choice can make text unreadable.
+**Contrast** (WCAG ratio). Every way text can sit on the theme is checked: on each step, inside an incoming message over each step, and inside the user's own message, at full and at quiet strength. Across all 120 combinations the picker offers, the weakest pair is 4.94 in night mode and 4.59 in day mode, against a minimum of 4.5. The tests in `theme/tests.rs` hold this for every combination and for both flat colourways, in both modes, so no choice can make text unreadable.
 
 The workshop boards used day steps 4 to 6 at 0.760, 0.520 and 0.400, an incoming fill of 62% and quiet text at 68%. Those failed the minimum for quiet text and were tuned to the values above.
 
-**Hue carries no meaning anywhere.** Avatars are initials on a faint disc of the row's text colour, sender names take the message's text colour, a link is marked by its underline, a mention by its weight, and an error by a rule and a heavier weight.
+**No state depends on hue alone**, in every colourway. Avatars are initials on a faint disc of the row's text colour, sender names take the message's text colour, a link is marked by its underline, a mention by its weight, and an error by a rule and a heavier weight.
 
-**Public ramp.** Everything outside the app (icon, website, screenshots, store page) uses hue 215 and these six tones only:
+**Public ramp.** Everything outside the app (icon, website, frames, backdrops) uses hue 215 and these six tones only. In-app screenshots show the app as it is, in any colourway; the store set shows Ultramarine and one abyss shot.
 
 | Name | oklch | Hex |
 | --- | --- | --- |
@@ -104,7 +124,7 @@ Mid water is the one tone that cannot carry body text in ramp colours at 4.5:1. 
 
 - Built only from the public ramp, so it survives system tinting.
 - The centre stays empty and dark. Never add a highlight; that is the "nothing looks back" part.
-- **The mark** is the shape full bleed: [well.svg](../../assets/icon/well.svg). The app draws it live in the theme's own hue (`crates/app/src/ui/mark.rs`), beside the wordmark.
+- **The mark** is the shape full bleed: [well.svg](../../assets/icon/well.svg). The app draws it live beside the wordmark (`crates/app/src/ui/mark.rs`): in the chosen hue and tint under abyss, and in the public ramp (hue 215, default tint) under Ultramarine and Sky.
 - **The app icon** is the shape on Apple's macOS icon grid (824-point body on a 1024-point canvas, continuous corners, soft shadow): `assets/icon/abyss.icns`, generated by `assets/icon/render.swift`.
 - **Building the app bundle:** `scripts/bundle.sh` builds the release binary and writes `target/bundle/abyss.app` (binary, `abyss.icns`, `assets/macos/Info.plist`), then signs it ad hoc and verifies the seal. `ABYSS_BUNDLE_PRECOMPILED_SHADERS=1` builds with `--no-default-features`, as CI does. `scripts/icon.sh` regenerates `abyss.icns` from `render.swift`.
 - **Development launches:** `scripts/bundle.sh --debug` writes `target/bundle/debug/abyss.app` for Finder and Dock use. Direct `cargo run` and `cargo dev` launches set the Dock icon from the same embedded `abyss.icns`.

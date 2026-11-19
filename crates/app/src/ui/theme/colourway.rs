@@ -5,6 +5,10 @@
 //! file, which keeps abyss's hues in its own unchanged format, so an older
 //! build (which never reads this file) still shows abyss with the user's
 //! hues.
+//!
+//! The first real launch without the file decides once and writes the
+//! choice ([`decide`]): an existing install keeps abyss, a new one gets
+//! Ultramarine.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,8 +31,9 @@ pub(crate) enum Colourway {
 }
 
 impl Colourway {
-    /// The default when nothing has been chosen.
-    pub(crate) const DEFAULT: Self = Self::Abyss;
+    /// The default for a new install, and whenever the file can't be
+    /// trusted.
+    pub(crate) const DEFAULT: Self = Self::Ultramarine;
 
     pub(crate) const ALL: [Self; 3] = [Self::Ultramarine, Self::Sky, Self::Abyss];
 
@@ -83,13 +88,7 @@ fn parse(text: &str) -> Option<Colourway> {
     (lines.next().is_none() && text.ends_with('\n')).then_some(colourway)
 }
 
-/// Where the choice is kept, if the home directory is known.
-pub(crate) fn default_path() -> Option<PathBuf> {
-    small_file::path(FILE)
-}
-
-/// Where the choice is kept in `app_dir`, for tests.
-#[cfg(test)]
+/// Where the choice is kept in `app_dir`.
 pub(crate) fn path_in(app_dir: &Path) -> PathBuf {
     app_dir.join(FILE)
 }
@@ -116,6 +115,50 @@ pub(crate) fn load(path: &Path) -> Saved {
 /// Saves the choice (see [`small_file::write`]).
 pub(crate) fn save(path: &Path, colourway: Colourway) -> io::Result<()> {
     small_file::write(path, &format(colourway))
+}
+
+/// Whether a launch may write its first-launch decision. Only a real
+/// Telegram launch persists; a fake or failed one keeps it in memory, so a
+/// development run can never pin the real install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FirstLaunch {
+    Persist,
+    MemoryOnly,
+}
+
+/// The colourway to show at startup, from the file in `app_dir`. Only a
+/// missing file is a first launch: under [`FirstLaunch::Persist`] an
+/// existing install (a `theme` file or the cache directory is there) keeps
+/// abyss and a new one gets Ultramarine, and the choice is written before
+/// this returns, so the window (which creates the cache) can't sway the
+/// next launch. A failed write keeps the choice for this run and logs it.
+pub(crate) fn decide(app_dir: &Path, policy: FirstLaunch) -> Colourway {
+    let path = path_in(app_dir);
+    let saved = load(&path);
+    if saved != Saved::Missing || policy == FirstLaunch::MemoryOnly {
+        return saved.colourway();
+    }
+    let chosen = if existing_install(app_dir) {
+        Colourway::Abyss
+    } else {
+        Colourway::DEFAULT
+    };
+    if let Err(error) = save(&path, chosen) {
+        // The path holds the user's name; the kind is enough.
+        tracing::warn!(kind = ?error.kind(), "couldn't save the first colourway");
+    }
+    chosen
+}
+
+/// Anything at the `theme` file's or the cache's path: an earlier build has
+/// run here. Links are not followed; an entry is enough.
+fn existing_install(app_dir: &Path) -> bool {
+    [
+        super::settings::path_in(app_dir),
+        crate::storage::cache_dir_in(app_dir),
+    ]
+    .iter()
+    .any(|path| path.symlink_metadata().is_ok())
 }
 
 #[cfg(test)]

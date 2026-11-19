@@ -127,12 +127,27 @@ fn drain_takes_at_most_drain_max_per_wake() {
     assert_eq!(drain(events.as_mut(), first).len(), 10);
 }
 
+/// Shows abyss at its default hues, kept in memory; the default for a new
+/// install is Ultramarine.
+fn in_abyss(cx: &mut TestAppContext) {
+    use crate::ui::theme::{Colourway, Settings, Stores, Themes};
+
+    cx.update(|cx| {
+        cx.set_global(Themes::new(
+            Colourway::Abyss,
+            Settings::default(),
+            Stores::default(),
+        ));
+    });
+}
+
 /// The panel works in any state, here on the error screen. No store is set
 /// up in tests, so the choice stays in memory.
 #[gpui::test]
 fn appearance_choice_rethemes_the_window_and_reset_restores_it(cx: &mut TestAppContext) {
     use crate::ui::theme::{Choice, Hue, Mode, Settings, Themes, Tint};
 
+    in_abyss(cx);
     let error = LaunchError::FakeNotBuilt;
     let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(error), window, cx));
     cx.run_until_parked();
@@ -167,9 +182,9 @@ fn appearance_choice_rethemes_the_window_and_reset_restores_it(cx: &mut TestAppC
 fn colourway_picker_switches_and_reset_stays_in_abyss(cx: &mut TestAppContext) {
     use gpui::Modifiers;
 
-    use crate::ui::theme::colourway::Colourway;
-    use crate::ui::theme::{Choice, Hue, Mode, Settings, Theme, Themes, Tint};
+    use crate::ui::theme::{Choice, Colourway, Hue, Mode, Settings, Theme, Themes, Tint};
 
+    in_abyss(cx);
     let (root, cx) =
         cx.add_window_view(|window, cx| Root::new(Err(LaunchError::FakeNotBuilt), window, cx));
     root.update(cx, Root::toggle_appearance);

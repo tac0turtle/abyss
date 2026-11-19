@@ -87,7 +87,7 @@ impl CacheLocation {
             .filter(|h| h.is_absolute())
             .ok_or(StorageError::NoHome)?;
         Ok(Self {
-            root: home.join("Library").join("Application Support"),
+            root: application_support(&home),
             app: APP_ID,
             #[cfg(feature = "fake")]
             fake: None,
@@ -159,9 +159,18 @@ pub(crate) fn app_dir() -> Option<PathBuf> {
 
 /// The app's directory under `home`.
 pub(crate) fn app_dir_in(home: &Path) -> PathBuf {
-    home.join("Library")
-        .join("Application Support")
-        .join(APP_ID)
+    application_support(home).join(APP_ID)
+}
+
+/// `Library/Application Support` under `home`: the root of both the app's
+/// directory and the real cache's location.
+fn application_support(home: &Path) -> PathBuf {
+    home.join("Library").join("Application Support")
+}
+
+/// The real cache directory inside the app's directory `app_dir`.
+pub(crate) fn cache_dir_in(app_dir: &Path) -> PathBuf {
+    app_dir.join(CACHE_DIR)
 }
 
 /// The user's home directory from the user database (`getpwuid_r` for the

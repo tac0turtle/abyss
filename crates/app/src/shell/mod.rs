@@ -231,7 +231,14 @@ pub(crate) fn open(launch: Result<Launch, LaunchError>, cx: &mut App) -> gpui::R
         }),
         ..Default::default()
     };
-    crate::ui::theme::Themes::init(cx);
+    // Only a real launch may write its first-launch colourway: `--fake`
+    // (built or not) and any failed launch keep it in memory.
+    let first_launch = if matches!(launch, Ok(Launch::Telegram { .. })) {
+        crate::ui::theme::FirstLaunch::Persist
+    } else {
+        crate::ui::theme::FirstLaunch::MemoryOnly
+    };
+    crate::ui::theme::Themes::init(first_launch, cx);
     crate::preferences::Preferences::init(cx);
     crate::chat::sidebar_file::SidebarFile::init(cx);
     let handle = cx.open_window(options, |window, cx| {
