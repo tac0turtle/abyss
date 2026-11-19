@@ -28,8 +28,8 @@ pub use seed::{MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 use crate::api::{CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
 pub use crate::credentials::CredentialSlot;
 use crate::model::{
-    ChatFolder, ChatId, ChatSummary, FolderEdit, Message, MsgId, PeerFolder, ThreadKey, Topic,
-    TopicId, TopicOrder, TopicSnapshot, Visibility,
+    ChatFolder, ChatId, ChatSummary, FolderEdit, Message, MsgId, PeerFolder, ThreadKey, TopicId,
+    TopicOrder, TopicSnapshot, Visibility,
 };
 use crate::store::PostClosed;
 
@@ -65,24 +65,6 @@ pub struct TopicsCursor {
 }
 
 impl TopicsCursor {
-    /// The position after `last`, the final topic of a page in `order`:
-    /// - [`TopicOrder::LastActivity`]: the top message's date and id;
-    /// - [`TopicOrder::Created`]: the creation date (`forumTopic.date`) and
-    ///   the top message's id.
-    pub(crate) fn after(order: TopicOrder, last: &Topic, index: u32) -> Self {
-        let date = match order {
-            TopicOrder::LastActivity => last.last_date,
-            TopicOrder::Created => last.created,
-        };
-        Self {
-            order,
-            offset_date: i32::try_from(date.clamp(0, i64::from(i32::MAX))).unwrap_or(i32::MAX),
-            offset_id: last.last_id.map_or(0, |id| id.0),
-            offset_topic: last.id.get(),
-            index,
-        }
-    }
-
     /// The order of the page this cursor continues.
     pub fn order(&self) -> TopicOrder {
         self.order

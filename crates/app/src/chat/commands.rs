@@ -729,8 +729,8 @@ impl ChatShell {
         res
     }
 
-    /// The echo table, for tests.
-    #[cfg(test)]
+    /// The echo table, for the fake-backed tests.
+    #[cfg(all(test, feature = "fake"))]
     pub(crate) fn echoes(&self) -> &super::sends::Echoes {
         &self.echoes
     }

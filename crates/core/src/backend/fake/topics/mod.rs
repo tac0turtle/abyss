@@ -20,7 +20,7 @@ pub use demo::{DEMO_FORUM_TOPICS, DemoForum, demo_forum};
 use super::{State, to_usize};
 use crate::backend::{BackendError, RejectReason, TopicsById, TopicsCursor, TopicsPage};
 use crate::model::{
-    ChatId, ChatKind, ChatSummary, Freshness, Message, MsgId, Preview, ThreadKey, TopicId,
+    ChatId, ChatKind, ChatSummary, Freshness, Message, MsgId, Preview, ThreadKey, Topic, TopicId,
     TopicOrder, TopicSnapshot,
 };
 use crate::store::{ForumStatus, MAX_PEER_DIALOGS, MAX_TOPICS_BY_ID, PostClosed, Route, route};
@@ -261,15 +261,35 @@ pub(super) fn page(
         .cloned()
         .collect();
     let end = start + topics.len();
-    let next = topics.last().filter(|_| end < all.len()).map(|last| {
-        TopicsCursor::after(order, &last.topic, u32::try_from(end).unwrap_or(u32::MAX))
-    });
+    let next = topics
+        .last()
+        .filter(|_| end < all.len())
+        .map(|last| cursor_after(order, &last.topic, u32::try_from(end).unwrap_or(u32::MAX)));
     Ok(TopicsPage {
         order,
         topics,
         next,
         post_closed: post_closed(s, chat),
     })
+}
+
+/// The position after `last`, the final topic of a page in `order`, the way
+/// the server's cursor works:
+/// - [`TopicOrder::LastActivity`]: the top message's date and id;
+/// - [`TopicOrder::Created`]: the creation date (`forumTopic.date`) and the
+///   top message's id.
+fn cursor_after(order: TopicOrder, last: &Topic, index: u32) -> TopicsCursor {
+    let date = match order {
+        TopicOrder::LastActivity => last.last_date,
+        TopicOrder::Created => last.created,
+    };
+    TopicsCursor {
+        order,
+        offset_date: i32::try_from(date.clamp(0, i64::from(i32::MAX))).unwrap_or(i32::MAX),
+        offset_id: last.last_id.map_or(0, |id| id.0),
+        offset_topic: last.id.get(),
+        index,
+    }
 }
 
 /// `messages.getForumTopicsByID`: every distinct requested id is found or
