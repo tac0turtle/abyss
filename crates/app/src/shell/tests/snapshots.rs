@@ -14,6 +14,10 @@
 //! test platform's windows are always light, so night is forced through
 //! [`theme::forced`], which only exists in this feature's test builds.
 //! Shots are 1280x800 points at the test window's 2x scale (2560x1600 px).
+//!
+//! Every run renders the same pixels: the clock and the time zone are pinned
+//! ([`format::forced`]) and the theme is kept in memory at its defaults, so
+//! two runs on one machine can be compared byte for byte.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,6 +52,8 @@ const TAIL: usize = 80;
 const DEEP_SCROLL: f32 = 8_700.;
 /// How much further for the flip shot: to about row 715 (30 days old).
 const FLIP_SCROLL: f32 = 31_400.;
+/// The pinned clock: 2026-11-16 14:05:00 UTC, a Monday.
+const NOW: i64 = 1_794_837_900;
 
 /// One window on the headless platform, driven through the core double.
 struct Shot {
@@ -378,12 +384,19 @@ fn snapshots() -> Result<()> {
         return Ok(());
     };
     std::fs::create_dir_all(&dir)?;
-    signin(&dir)?;
-    chat(&dir)?;
-    archive(&dir)?;
-    tabs(&dir)?;
-    inline_topics(&dir)?;
-    unread_divider(&dir)?;
-    folder(&dir)?;
-    list_deep(&dir)
+    format::forced::set(Some((NOW, jiff::tz::TimeZone::UTC)));
+    let result = all(&dir);
+    format::forced::set(None);
+    result
+}
+
+fn all(dir: &Path) -> Result<()> {
+    signin(dir)?;
+    chat(dir)?;
+    archive(dir)?;
+    tabs(dir)?;
+    inline_topics(dir)?;
+    unread_divider(dir)?;
+    folder(dir)?;
+    list_deep(dir)
 }

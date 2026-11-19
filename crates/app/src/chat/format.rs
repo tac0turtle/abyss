@@ -8,7 +8,35 @@ use jiff::{Timestamp, Zoned};
 
 /// The system time zone. jiff caches the lookup.
 pub(crate) fn local_tz() -> TimeZone {
+    #[cfg(all(test, feature = "snapshots"))]
+    if let Some((_, tz)) = forced::get() {
+        return tz;
+    }
     TimeZone::system()
+}
+
+/// The snapshot tests' override of [`now`] and [`local_tz`], so every run
+/// renders the same times, dates and tones. Compiled only into
+/// `--features snapshots` test builds, like `theme::forced`.
+#[cfg(all(test, feature = "snapshots"))]
+pub(crate) mod forced {
+    use std::cell::RefCell;
+
+    use jiff::tz::TimeZone;
+
+    thread_local! {
+        static CLOCK: RefCell<Option<(i64, TimeZone)>> = const { RefCell::new(None) };
+    }
+
+    /// Pins the clock (seconds since the epoch) and the time zone on this
+    /// thread; `None` follows the system again.
+    pub(crate) fn set(clock: Option<(i64, TimeZone)>) {
+        CLOCK.set(clock);
+    }
+
+    pub(super) fn get() -> Option<(i64, TimeZone)> {
+        CLOCK.with_borrow(Clone::clone)
+    }
 }
 
 fn zoned(unix: i64, tz: &TimeZone) -> Option<Zoned> {
@@ -76,6 +104,10 @@ pub(crate) fn list_time(unix: i64, now: i64, tz: &TimeZone) -> SharedString {
 
 /// Seconds since the epoch, now.
 pub(crate) fn now() -> i64 {
+    #[cfg(all(test, feature = "snapshots"))]
+    if let Some((now, _)) = forced::get() {
+        return now;
+    }
     Timestamp::now().as_second()
 }
 
