@@ -23,6 +23,14 @@ pub(crate) enum Colourway {
     Ultramarine,
     /// Flat, slightly cool surfaces and a sky blue.
     Sky,
+    /// A warm pane, soft green messages and a deep green accent.
+    Fern,
+    /// Flat neutrals and a saturated violet.
+    Violet,
+    /// Warm paper and a terracotta accent.
+    Ember,
+    /// No hue at all: black, white and greys.
+    Graphite,
 }
 
 impl Colourway {
@@ -30,7 +38,15 @@ impl Colourway {
     /// trusted.
     pub(crate) const DEFAULT: Self = Self::Ultramarine;
 
-    pub(crate) const ALL: [Self; 3] = [Self::Ultramarine, Self::Sky, Self::Abyss];
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Ultramarine,
+        Self::Sky,
+        Self::Fern,
+        Self::Violet,
+        Self::Ember,
+        Self::Graphite,
+        Self::Abyss,
+    ];
 
     /// Its name in the file and, capitalized, in the picker.
     pub(crate) fn key(self) -> &'static str {
@@ -38,7 +54,17 @@ impl Colourway {
             Self::Abyss => "abyss",
             Self::Ultramarine => "ultramarine",
             Self::Sky => "sky",
+            Self::Fern => "fern",
+            Self::Violet => "violet",
+            Self::Ember => "ember",
+            Self::Graphite => "graphite",
         }
+    }
+
+    /// Whether the user's accent hue recolours it: every colourway but
+    /// abyss (which has its own hues) and Graphite (which has none).
+    pub(crate) fn takes_accent(self) -> bool {
+        !matches!(self, Self::Abyss | Self::Graphite)
     }
 
     fn from_key(key: &str) -> Option<Self> {

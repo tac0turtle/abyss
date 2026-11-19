@@ -8,7 +8,7 @@ Status: decided in the branding workshop on 2026-11-16, amended for colourways o
 ABYSS_SNAPSHOT_DIR=/path/to/shots cargo test -p abyss --features snapshots shell::tests::snapshots
 ```
 
-It writes the Welcome and sign-in screens, an open chat, the appearance panel, tabs, topics, menus, a busy group chat and hover states in every colourway, and the chat list at three depths under abyss, in day and night. Shots other than abyss's are prefixed with the colourway's name.
+It writes the Welcome and sign-in screens, an open chat, the appearance panel, tabs, topics, menus, a busy group chat and hover states in every colourway, the group chat in Sky with a chosen accent, and the chat list at three depths under abyss, in day and night. Shots other than abyss's are prefixed with the colourway's name.
 
 ## Positioning
 
@@ -41,15 +41,32 @@ Rules keep their workshop numbers, so a reference such as "rule 3" still holds.
 
 ## Colour
 
-**Three colourways**, picked at the top of Appearance. Each defines a night and a day theme, and the system appearance picks between them.
+**Seven colourways**, picked at the top of Appearance. Each defines a night and a day theme, and the system appearance picks between them. Six are flat: one surface at every depth, a coloured fill for the user's own messages, and an accent.
 
-- **Ultramarine:** flat neutrals and a saturated blue (oklch 0.53 0.20 265) for the user's own messages and the accent. The default.
+- **Ultramarine:** flat neutrals and a saturated blue (oklch 0.51 0.20 265) for the user's own messages and the accent. The default.
 - **Sky:** flat, slightly cool surfaces, white incoming messages by day, and a sky-blue accent.
+- **Fern:** a warm pane, soft green messages and a deep green accent; dark teal by night.
+- **Violet:** flat neutrals and a saturated violet; by night the accent is a light lilac inked dark.
+- **Ember:** warm paper and a terracotta accent; brown-black by night.
+- **Graphite:** no hue at all. The user's own messages take the strongest grey on screen.
 - **abyss:** the strata below. The user chooses its hue and tint; the rest of this section up to the public ramp describes it.
 
-The choice is saved as two lines of text in `~/Library/Application Support/dev.abyss/colourway` (`abyss-colourway 1`, then `ultramarine`, `sky` or `abyss`), readable only by the user, beside the `theme` file that keeps abyss's hues. Nothing is written until the user picks; a missing or damaged file means Ultramarine.
+**Choosing colour.** Every colourway but Graphite lets the user choose its colour. Under abyss that is its hue and tint per mode. Elsewhere it is one accent hue, from the same 24 on offer, that recolours the own-message fill and the accent (badges, row marks, buttons, the tab rail) and leaves surfaces and text alone. A chosen hue is drawn at the WCAG luminance of the colourway's own colour, so it reads exactly as well. Reset puts back the showing colourway's own and stays in it.
 
-**Contrast in the flat colourways.** The weakest text pair is 4.53 in Ultramarine (quiet text on the own-message blue, both modes) and 5.03 in Sky (night; 5.11 by day). The flat colourways' values live in `crates/app/src/ui/theme/flat.rs`.
+**Files.** The colourway is saved as two lines of text in `~/Library/Application Support/dev.abyss/colourway` (`abyss-colourway 1`, then its name in lowercase), and the colour choices as four lines in `theme` beside it (`abyss-theme 2`, abyss's night and day hue and tint, then `accent default` or a hue). Both are readable only by the user. Nothing is written until the user picks; a missing or damaged file means the defaults.
+
+**Contrast in the flat colourways**, the weakest text pair over every accent on offer:
+
+| Colourway | Day | Night |
+| --- | --- | --- |
+| Ultramarine | 4.75 | 4.75 |
+| Sky | 5.11 | 4.97 |
+| Fern | 5.66 | 4.99 |
+| Violet | 5.17 | 5.17 |
+| Ember | 5.16 | 5.11 |
+| Graphite | 7.30 | 6.93 |
+
+The flat colourways' values live in `crates/app/src/ui/theme/flat.rs`.
 
 ### abyss
 
@@ -57,7 +74,7 @@ Users choose the colour, so abyss's brand is the set of rules that survive any h
 
 A theme is two numbers per mode: a hue and a tint amount. Lightness is fixed by the tables below and is not user-editable, which is what keeps text readable and rule 1 working.
 
-**The picker** (Appearance, in the app menu, on Cmd+comma and above the chat list) offers 24 hues, 15 degrees apart, and five tint amounts from 0% (grey) to 200%, separately for night and day. A choice applies as it is made. abyss's hues are saved as three lines of text in `~/Library/Application Support/dev.abyss/theme`, readable only by the user; a missing or invalid file means the defaults.
+**The picker** (Appearance, in the app menu, on Cmd+comma and above the chat list) offers 24 hues, 15 degrees apart, and five tint amounts from 0% (grey) to 200%, separately for night and day. A choice applies as it is made. abyss's hues are saved in the `theme` file described above.
 
 Values are `oklch(lightness chroma hue)`. Chroma is multiplied by the tint amount (default 1). Hex values are the defaults converted to sRGB; the darkest steps clip slightly.
 
@@ -124,7 +141,7 @@ Mid water is the one tone that cannot carry body text in ramp colours at 4.5:1. 
 
 - Built only from the public ramp, so it survives system tinting.
 - The centre stays empty and dark. Never add a highlight; that is the "nothing looks back" part.
-- **The mark** is the shape full bleed: [well.svg](../../assets/icon/well.svg). The app draws it live beside the wordmark (`crates/app/src/ui/mark.rs`): in the chosen hue and tint under abyss, and in the public ramp (hue 215, default tint) under Ultramarine and Sky.
+- **The mark** is the shape full bleed: [well.svg](../../assets/icon/well.svg). The app draws it live beside the wordmark (`crates/app/src/ui/mark.rs`): in the chosen hue and tint under abyss, and in the public ramp (hue 215, default tint) under every other colourway.
 - **The app icon** is the shape on Apple's macOS icon grid (824-point body on a 1024-point canvas, continuous corners, soft shadow): `assets/icon/abyss.icns`, generated by `assets/icon/render.swift`.
 - **Building the app bundle:** `scripts/bundle.sh` builds the release binary and writes `target/bundle/abyss.app` (binary, `abyss.icns`, `assets/macos/Info.plist`), then signs it ad hoc and verifies the seal. `ABYSS_BUNDLE_PRECOMPILED_SHADERS=1` builds with `--no-default-features`, as CI does. `scripts/icon.sh` regenerates `abyss.icns` from `render.swift`.
 - **Development launches:** `scripts/bundle.sh --debug` writes `target/bundle/debug/abyss.app` for Finder and Dock use. Direct `cargo run` and `cargo dev` launches set the Dock icon from the same embedded `abyss.icns`.

@@ -218,8 +218,8 @@ const HIDDEN: Tone = tone(0.60, 0.030);
 pub(crate) struct Theme {
     surfaces: [Rgba; STEPS],
     flip: usize,
-    /// One surface at every depth, and marks in the accent (Ultramarine and
-    /// Sky); otherwise the strata, and marks in each row's own ink (abyss).
+    /// One surface at every depth, and marks in the accent (every colourway
+    /// but abyss); otherwise the strata, and marks in each row's own ink (abyss).
     flat: bool,
     /// Text on the surface. In abyss it is also the source of the `own` and
     /// `accent` fills; views paint those through their roles.
@@ -267,13 +267,18 @@ impl Side {
 }
 
 impl Theme {
-    /// The theme `colourway` paints in `mode`; `choice` (the user's hue and
-    /// tint) counts only under abyss.
-    pub(crate) fn new(mode: Mode, colourway: Colourway, choice: Choice) -> Self {
+    /// The theme `colourway` paints in `mode` with the user's `settings`:
+    /// abyss takes the mode's hue and tint, the others the accent hue.
+    pub(crate) fn new(mode: Mode, colourway: Colourway, settings: Settings) -> Self {
+        let accent = settings.accent.filter(|_| colourway.takes_accent());
         match colourway {
-            Colourway::Abyss => Self::abyss(mode, choice),
-            Colourway::Ultramarine => flat::theme(Flat::Ultramarine, mode),
-            Colourway::Sky => flat::theme(Flat::Sky, mode),
+            Colourway::Abyss => Self::abyss(mode, settings.get(mode)),
+            Colourway::Ultramarine => flat::theme(Flat::Ultramarine, mode, accent),
+            Colourway::Sky => flat::theme(Flat::Sky, mode, accent),
+            Colourway::Fern => flat::theme(Flat::Fern, mode, accent),
+            Colourway::Violet => flat::theme(Flat::Violet, mode, accent),
+            Colourway::Ember => flat::theme(Flat::Ember, mode, accent),
+            Colourway::Graphite => flat::theme(Flat::Graphite, mode, accent),
         }
     }
 
@@ -417,8 +422,8 @@ impl Themes {
         Self {
             colourway,
             settings,
-            night: Theme::new(Mode::Night, colourway, settings.night),
-            day: Theme::new(Mode::Day, colourway, settings.day),
+            night: Theme::new(Mode::Night, colourway, settings),
+            day: Theme::new(Mode::Day, colourway, settings),
             stores,
             saving: None,
         }
@@ -458,7 +463,7 @@ impl Themes {
     pub(crate) fn of(window: &Window, cx: &App) -> Theme {
         let mode = Mode::of(window);
         cx.try_global::<Self>().map_or_else(
-            || Theme::new(mode, Colourway::DEFAULT, Settings::default().get(mode)),
+            || Theme::new(mode, Colourway::DEFAULT, Settings::default()),
             |t| t.theme(mode),
         )
     }
@@ -492,10 +497,21 @@ impl Themes {
         });
     }
 
-    /// Puts abyss's hues back to their defaults, staying in abyss: Reset in
-    /// the picker. Never changes the colourway.
-    pub(crate) fn reset_hues(cx: &mut App) {
-        Self::set(Settings::default(), cx);
+    /// Reset in the picker: puts back the defaults of what the showing
+    /// colourway lets the user choose (abyss's hues, or the accent), and
+    /// leaves the rest. Never changes the colourway.
+    pub(crate) fn reset_colours(cx: &mut App) {
+        let settings = Self::settings(cx);
+        let defaults = Settings::default();
+        let reset = if Self::colourway(cx) == Colourway::Abyss {
+            Settings {
+                accent: settings.accent,
+                ..defaults
+            }
+        } else {
+            settings.with_accent(defaults.accent)
+        };
+        Self::set(reset, cx);
     }
 
     /// Switches the colourway, repaints every window and saves it. The saved
@@ -524,8 +540,8 @@ impl Themes {
             let Some(save) = update(themes) else {
                 return false;
             };
-            themes.night = Theme::new(Mode::Night, themes.colourway, themes.settings.night);
-            themes.day = Theme::new(Mode::Day, themes.colourway, themes.settings.day);
+            themes.night = Theme::new(Mode::Night, themes.colourway, themes.settings);
+            themes.day = Theme::new(Mode::Day, themes.colourway, themes.settings);
             if let Some(save) = save {
                 themes.save(save, cx);
             }
@@ -590,6 +606,18 @@ fn oklch(tone: Tone, hue_degrees: f32, tint: f32) -> Rgba {
 }
 
 /// Linear light to an sRGB component.
+/// WCAG relative luminance of an opaque sRGB color.
+fn luminance(color: Rgba) -> f32 {
+    let linear = |c: f32| {
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+}
+
 fn encode(linear: f32) -> f32 {
     let linear = linear.clamp(0., 1.);
     if linear <= 0.003_130_8 {

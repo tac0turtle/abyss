@@ -13,8 +13,8 @@ use super::{Result, Shot};
 use crate::chat::list::{Shown, Tab};
 use crate::chat::{demo, format};
 use crate::ui::text_input::{COMPOSER_MAX_UTF16, SelectAll};
-use crate::ui::theme::Mode;
 use crate::ui::theme::colourway::Colourway;
+use crate::ui::theme::{Hue, Mode, Settings, Themes};
 
 /// The demo's small group: senders on every incoming message.
 const GROUP: ChatId = ChatId {
@@ -28,7 +28,21 @@ const LOADED: usize = 24;
 /// both sides, a failed send with its actions, the jump button over the
 /// user's own bubble, and a composer long enough to count, all selected.
 pub(super) fn group(dir: &Path, colourway: Colourway) -> Result<()> {
+    group_as(dir, colourway, None, "group")
+}
+
+/// The group scene in Sky with a pink accent the user chose: the own fill,
+/// badges, rail and floating controls all move to it.
+pub(super) fn accented(dir: &Path) -> Result<()> {
+    // 5 + 15 * 22 degrees: pink.
+    group_as(dir, Colourway::Sky, Hue::all().nth(22), "accent-group")
+}
+
+fn group_as(dir: &Path, colourway: Colourway, accent: Option<Hue>, name: &str) -> Result<()> {
     let mut shot = Shot::open(dir, colourway)?;
+    shot.cx.update(|cx| {
+        Themes::set(Settings::default().with_accent(accent), cx);
+    });
     shot.sign_in()?;
     shot.root.update(&mut shot.cx, |root, window, cx| {
         root.with_session(|s, cx| s.select_chat(GROUP, window, cx), cx);
@@ -37,8 +51,8 @@ pub(super) fn group(dir: &Path, colourway: Colourway) -> Result<()> {
     load_group(&mut shot)?;
     failed_send(&mut shot)?;
     long_draft(&mut shot)?;
-    shot.save(Mode::Day, "group-day.png")?;
-    shot.save(Mode::Night, "group-night.png")
+    shot.save(Mode::Day, &format!("{name}-day.png"))?;
+    shot.save(Mode::Night, &format!("{name}-night.png"))
 }
 
 /// The group's newest messages, as a page around a read position with more

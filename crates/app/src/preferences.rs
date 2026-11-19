@@ -120,7 +120,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"1\n");
         cx.update(|cx| {
             assert_eq!(cx.global::<Preferences>().use_keychain, Some(true));
-            crate::ui::theme::Themes::reset_hues(cx);
+            crate::ui::theme::Themes::reset_colours(cx);
             assert_eq!(cx.global::<Preferences>().use_keychain, Some(true));
             Preferences::toggle(cx);
         });

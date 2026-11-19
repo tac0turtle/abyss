@@ -29,11 +29,17 @@ pub(crate) const KEYCHAIN_STORAGE_DETAIL: &str = "Off by default. When off, sess
 pub(crate) const KEYCHAIN_MIGRATION_NOTE: &str = "Moving existing secrets out of Keychain may ask for access, even when this is off. Once the move finishes, launches with Keychain off do not access it. With Keychain on, macOS controls access prompts.";
 pub(crate) const PREFERENCE_FAILED: &str =
     "Couldn't read or save this setting. Click to retry, then restart abyss.";
-pub(crate) const COLOURWAY_NOTE: &str = "Pick a colourway. abyss lets you choose its hue.";
+pub(crate) const COLOURWAY_NOTE: &str = "Pick a colourway, then its colour.";
+pub(crate) const ACCENT_NOTE: &str =
+    "Pick the colour of your messages and highlights. Reset goes back to the colourway's own.";
 pub(crate) const APPEARANCE_NOTE: &str =
     "Pick a hue and how much of it. Lightness is fixed, so text stays readable in any hue.";
 pub(crate) const ULTRAMARINE: &str = "Ultramarine";
 pub(crate) const SKY: &str = "Sky";
+pub(crate) const FERN: &str = "Fern";
+pub(crate) const VIOLET: &str = "Violet";
+pub(crate) const EMBER: &str = "Ember";
+pub(crate) const GRAPHITE: &str = "Graphite";
 pub(crate) const ABYSS_COLOURWAY: &str = "abyss";
 pub(crate) const NIGHT: &str = "Night";
 pub(crate) const DAY: &str = "Day";

@@ -57,22 +57,33 @@ fn sides() -> [Side; 2] {
 }
 
 fn abyss(mode: Mode) -> Theme {
-    Theme::new(mode, Colourway::Abyss, Settings::default().get(mode))
+    Theme::new(mode, Colourway::Abyss, Settings::default())
 }
 
-/// Every theme a user can see: each flat colourway in both modes, and abyss
-/// for every choice in both modes.
+/// Every colourway but abyss.
+fn flat_colourways() -> impl Iterator<Item = Colourway> {
+    Colourway::ALL
+        .into_iter()
+        .filter(|c| *c != Colourway::Abyss)
+}
+
+/// Every theme a user can see: each flat colourway with its own accent and
+/// every accent on offer, and abyss for every choice, in both modes.
 fn every_theme() -> Vec<(String, Mode, Theme)> {
     let mut themes = Vec::new();
     for mode in Mode::ALL {
-        for colourway in [Colourway::Ultramarine, Colourway::Sky] {
-            let theme = Theme::new(mode, colourway, Settings::default().get(mode));
-            themes.push((format!("{colourway:?} {mode:?}"), mode, theme));
+        for colourway in flat_colourways() {
+            for accent in Hue::all().map(Some).chain([None]) {
+                let settings = Settings::default().with_accent(accent);
+                let theme = Theme::new(mode, colourway, settings);
+                themes.push((format!("{colourway:?} {mode:?} {accent:?}"), mode, theme));
+            }
         }
         for hue in Hue::all() {
             for tint in Tint::all() {
                 let choice = Choice { hue, tint };
-                let theme = Theme::new(mode, Colourway::Abyss, choice);
+                let settings = Settings::default().with(mode, choice);
+                let theme = Theme::new(mode, Colourway::Abyss, settings);
                 themes.push((format!("Abyss {mode:?} {hue:?} {tint:?}"), mode, theme));
             }
         }
@@ -265,8 +276,8 @@ fn abyss_roles_are_the_colors_they_replace() {
 #[test]
 fn flat_colourways_are_flat() {
     for mode in Mode::ALL {
-        for colourway in [Colourway::Ultramarine, Colourway::Sky] {
-            let theme = Theme::new(mode, colourway, Settings::default().get(mode));
+        for colourway in flat_colourways() {
+            let theme = Theme::new(mode, colourway, Settings::default());
             for d in depths() {
                 assert_eq!(theme.surface(d), theme.surface(Depth::NOW), "{colourway:?}");
                 assert_eq!(theme.text_on(d), theme.text, "{colourway:?}");
@@ -285,7 +296,7 @@ fn flat_colourways_are_flat() {
                     tint: Tint::DEFAULT,
                 },
             );
-            let retinted = Theme::new(mode, colourway, other.get(mode));
+            let retinted = Theme::new(mode, colourway, other);
             assert_eq!(theme, retinted, "{colourway:?} ignores the hues");
             assert!(close(theme.mark[0], rgb(0xdd_ebee)));
         }

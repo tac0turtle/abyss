@@ -1,5 +1,6 @@
-//! Settings: the colourway and, under abyss, the user's hue and tint for
-//! night and for day (`docs/brand/brand.md`, `docs/plans/colourways.md`).
+//! Settings: the colourway and its colours: under abyss the user's hue and
+//! tint for night and for day, elsewhere an accent hue (`docs/brand/brand.md`,
+//! `docs/plans/colourways.md`).
 //! The app behind the panel is the preview; a choice applies and saves as it
 //! is made.
 
@@ -40,6 +41,9 @@ pub(super) fn panel(
             .child(muted(copy::APPEARANCE_NOTE).text_sm())
             .children(sections)
     });
+    let accent = colourway
+        .takes_accent()
+        .then(|| accent_section(colourway, showing, settings, theme, cx));
     let card = div()
         .id("settings-panel")
         .w(px(PANEL_WIDTH))
@@ -69,6 +73,7 @@ pub(super) fn panel(
         .child(muted(copy::COLOURWAY_NOTE).text_sm())
         .child(colourway_row(colourway, showing, settings, theme, cx))
         .children(abyss)
+        .children(accent)
         .child(storage_section(theme, cx))
         .child(footer(colourway, theme, cx));
     div()
@@ -97,14 +102,22 @@ fn colourway_name(colourway: Colourway) -> &'static str {
     match colourway {
         Colourway::Ultramarine => copy::ULTRAMARINE,
         Colourway::Sky => copy::SKY,
+        Colourway::Fern => copy::FERN,
+        Colourway::Violet => copy::VIOLET,
+        Colourway::Ember => copy::EMBER,
+        Colourway::Graphite => copy::GRAPHITE,
         Colourway::Abyss => copy::ABYSS_COLOURWAY,
     }
 }
 
-fn colourway_id(colourway: Colourway) -> &'static str {
+pub(super) fn colourway_id(colourway: Colourway) -> &'static str {
     match colourway {
         Colourway::Ultramarine => "colourway-ultramarine",
         Colourway::Sky => "colourway-sky",
+        Colourway::Fern => "colourway-fern",
+        Colourway::Violet => "colourway-violet",
+        Colourway::Ember => "colourway-ember",
+        Colourway::Graphite => "colourway-graphite",
         Colourway::Abyss => "colourway-abyss",
     }
 }
@@ -120,7 +133,7 @@ fn colourway_row(
     cx: &mut Context<'_, Root>,
 ) -> Div {
     let swatches = Colourway::ALL.map(|colourway| {
-        let looks = Theme::new(showing, colourway, settings.get(showing));
+        let looks = Theme::new(showing, colourway, settings);
         let selected = colourway == chosen;
         let ring: Hsla = if selected {
             theme.text.into()
@@ -162,7 +175,8 @@ fn colourway_row(
                 Themes::set_colourway(colourway, cx);
             }))
     });
-    div().flex().gap_3().children(swatches)
+    // Four to a row in the panel; the rest wrap below.
+    div().flex().flex_wrap().gap_3().children(swatches)
 }
 
 fn mode_name(mode: Mode) -> &'static str {
@@ -198,7 +212,7 @@ fn mode_section(
                 fill: theme::swatch(choice),
                 ring: ring(choice),
             };
-            chip.render(mode, choice, cx)
+            chip.render(move |s| s.with(mode, choice), cx)
         })
         .collect();
     let tints: Vec<_> = (0_u64..)
@@ -211,7 +225,7 @@ fn mode_section(
                 fill: theme::tint_swatch(choice),
                 ring: ring(choice),
             };
-            chip.render(mode, choice, cx)
+            chip.render(move |s| s.with(mode, choice), cx)
         })
         .collect();
     let heading = div()
@@ -227,6 +241,42 @@ fn mode_section(
         .child(heading)
         .child(row(copy::HUE, hues))
         .child(row(copy::TINT, tints))
+}
+
+/// The accent hue on offer in `colourway`, each chip the accent it gives in
+/// the mode showing. No chip is marked while the colourway's own shows;
+/// Reset goes back to it.
+fn accent_section(
+    colourway: Colourway,
+    showing: Mode,
+    settings: Settings,
+    theme: &Theme,
+    cx: &mut Context<'_, Root>,
+) -> Div {
+    let chips: Vec<_> = (0_u64..)
+        .zip(Hue::all())
+        .map(|(ix, hue)| {
+            let accent = Some(hue);
+            let looks = Theme::new(showing, colourway, settings.with_accent(accent));
+            let chip = Chip {
+                id: ("accent-hue", ix),
+                width: HUE_CHIP_WIDTH,
+                fill: looks.accent,
+                ring: if settings.accent == accent {
+                    theme.text.into()
+                } else {
+                    transparent_black()
+                },
+            };
+            chip.render(move |s| s.with_accent(accent), cx)
+        })
+        .collect();
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(muted(copy::ACCENT_NOTE).text_sm())
+        .child(row(copy::HUE, chips))
 }
 
 fn hue_row(mode: Mode) -> &'static str {
@@ -262,8 +312,12 @@ struct Chip {
 }
 
 impl Chip {
-    /// Clicking sets `mode` to `choice`.
-    fn render(self, mode: Mode, choice: Choice, cx: &mut Context<'_, Root>) -> Stateful<Div> {
+    /// Clicking applies `choose` to the saved settings.
+    fn render(
+        self,
+        choose: impl Fn(Settings) -> Settings + 'static,
+        cx: &mut Context<'_, Root>,
+    ) -> Stateful<Div> {
         div()
             .id(self.id)
             .w(px(self.width))
@@ -275,16 +329,17 @@ impl Chip {
             .bg(self.fill)
             .cursor_pointer()
             .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                let settings = Themes::settings(cx).with(mode, choice);
-                Themes::set(settings, cx);
+                Themes::set(choose(Themes::settings(cx)), cx);
             }))
     }
 }
 
-/// Reset (abyss only: it puts abyss's hues back and stays in abyss) on the
-/// left, Done on the right; the left slot stays when Reset is hidden.
+/// Reset (wherever there are colours to choose: it puts back the showing
+/// colourway's and stays in it) on the left, Done on the right; the left
+/// slot stays when Reset is hidden.
 fn footer(colourway: Colourway, theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
-    let reset = (colourway == Colourway::Abyss).then(|| reset_button(theme, cx));
+    let choosable = colourway == Colourway::Abyss || colourway.takes_accent();
+    let reset = choosable.then(|| reset_button(theme, cx));
     let done = button("appearance-done", copy::DONE, theme).on_click(cx.listener(
         |root, _: &ClickEvent, _, cx| {
             root.toggle_appearance(cx);
@@ -310,7 +365,7 @@ fn reset_button(theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
         .cursor_pointer()
         .child(copy::RESET)
         .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-            Themes::reset_hues(cx);
+            Themes::reset_colours(cx);
         }))
 }
 

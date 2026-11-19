@@ -211,27 +211,41 @@ fn colourway_picker_switches_and_reset_stays_in_abyss(cx: &mut TestAppContext) {
     cx.update(|_, cx| Themes::set(hues, cx));
     cx.run_until_parked();
 
-    for (colourway, id) in [
-        (Colourway::Ultramarine, "colourway-ultramarine"),
-        (Colourway::Sky, "colourway-sky"),
-    ] {
-        click(cx, id);
+    let flat = Colourway::ALL
+        .into_iter()
+        .filter(|c| *c != Colourway::Abyss);
+    for colourway in flat {
+        click(cx, super::appearance::colourway_id(colourway));
         assert_eq!(cx.update(|_, cx| Themes::colourway(cx)), colourway);
-        let expected = Theme::new(showing, colourway, choice);
-        assert_eq!(shown(cx), expected);
-        assert!(cx.debug_bounds("appearance-reset").is_none(), "abyss only");
+        assert_eq!(shown(cx), Theme::new(showing, colourway, hues));
+        assert_eq!(
+            cx.debug_bounds("appearance-reset").is_some(),
+            colourway.takes_accent(),
+            "Reset only where there is a colour to choose"
+        );
         assert_eq!(cx.update(|_, cx| Themes::settings(cx)), hues, "kept");
     }
 
+    // An accent recolours a flat colourway; its Reset clears only that.
+    click(cx, "colourway-ultramarine");
+    let accented = hues.with_accent(Hue::all().nth(20));
+    cx.update(|_, cx| Themes::set(accented, cx));
+    cx.run_until_parked();
+    let plain = Theme::new(showing, Colourway::Ultramarine, hues);
+    assert_ne!(shown(cx).accent, plain.accent, "recoloured");
+    click(cx, "appearance-reset");
+    assert_eq!(cx.update(|_, cx| Themes::settings(cx)), hues);
+    assert_eq!(shown(cx), plain);
+
+    // abyss's Reset puts its hues back and keeps the accent.
+    cx.update(|_, cx| Themes::set(accented, cx));
     click(cx, "colourway-abyss");
-    assert_eq!(shown(cx), Theme::new(showing, Colourway::Abyss, choice));
+    assert_eq!(shown(cx), Theme::new(showing, Colourway::Abyss, hues));
     click(cx, "appearance-reset");
     assert_eq!(cx.update(|_, cx| Themes::colourway(cx)), Colourway::Abyss);
-    assert_eq!(cx.update(|_, cx| Themes::settings(cx)), Settings::default());
-    assert_eq!(
-        shown(cx),
-        Theme::new(showing, Colourway::Abyss, Settings::default().get(showing))
-    );
+    let after = Settings::default().with_accent(accented.accent);
+    assert_eq!(cx.update(|_, cx| Themes::settings(cx)), after);
+    assert_eq!(shown(cx), Theme::new(showing, Colourway::Abyss, after));
 }
 
 #[gpui::test]

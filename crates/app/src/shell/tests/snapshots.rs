@@ -437,6 +437,7 @@ fn all(dir: &Path) -> Result<()> {
         scenes::group(dir, colourway)?;
         scenes::hover(dir, colourway)?;
     }
+    scenes::accented(dir)?;
     // Age only shows in abyss: every flat surface is the same.
     list_deep(dir, Colourway::Abyss)
 }

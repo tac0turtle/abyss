@@ -1,6 +1,7 @@
-//! The user's theme choice and the small file that keeps it.
+//! The user's colour choices and the small file that keeps them: abyss's
+//! hue and tint per mode, and the accent hue the other colourways take.
 //!
-//! The file is not secret and not precious: three lines of text in
+//! The file is not secret and not precious: four lines of text in
 //! Application Support, readable only by the user (`ui::small_file`).
 //! Anything unexpected in it (wrong header, a value that is not on offer,
 //! extra bytes) means the defaults, never an error the user has to deal
@@ -18,7 +19,8 @@ const HUE_OFFSET: u16 = 5;
 const HUE_COUNT: u16 = 24;
 const TINT_PERCENTS: [u16; 5] = [0, 50, 100, 150, 200];
 
-const HEADER: &str = "abyss-theme 1";
+const HEADER: &str = "abyss-theme 2";
+const DEFAULT_ACCENT: &str = "default";
 const FILE: &str = "theme";
 
 /// A hue on offer, in degrees: 24 steps around the wheel.
@@ -69,11 +71,16 @@ pub(crate) struct Choice {
     pub(crate) tint: Tint,
 }
 
-/// The user's choice for each mode.
+/// The user's colour choices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Settings {
+    /// abyss at night.
     pub(crate) night: Choice,
+    /// abyss by day.
     pub(crate) day: Choice,
+    /// The hue of the own-message fill and the accent in every other
+    /// colourway; `None` keeps each colourway's own.
+    pub(crate) accent: Option<Hue>,
 }
 
 impl Default for Settings {
@@ -87,6 +94,7 @@ impl Default for Settings {
                 hue: Hue::DAY,
                 tint: Tint::DEFAULT,
             },
+            accent: None,
         }
     }
 }
@@ -97,6 +105,12 @@ impl Settings {
             Mode::Night => self.night,
             Mode::Day => self.day,
         }
+    }
+
+    /// These settings with the accent hue changed to `accent`.
+    #[must_use]
+    pub(crate) fn with_accent(self, accent: Option<Hue>) -> Self {
+        Self { accent, ..self }
     }
 
     /// These settings with `mode` changed to `choice`.
@@ -117,14 +131,17 @@ impl Settings {
 
 fn format(settings: Settings) -> String {
     let line = |name: &str, c: Choice| format!("{name} {} {}\n", c.hue.0, c.tint.0);
+    let accent = settings
+        .accent
+        .map_or_else(|| DEFAULT_ACCENT.to_owned(), |hue| hue.0.to_string());
     format!(
-        "{HEADER}\n{}{}",
+        "{HEADER}\n{}{}accent {accent}\n",
         line("night", settings.night),
         line("day", settings.day)
     )
 }
 
-/// Exactly the three lines [`format`] writes, or nothing.
+/// Exactly the four lines [`format`] writes, or nothing.
 fn parse(text: &str) -> Option<Settings> {
     let mut lines = text.lines();
     if lines.next()? != HEADER {
@@ -132,7 +149,19 @@ fn parse(text: &str) -> Option<Settings> {
     }
     let night = parse_choice(lines.next()?, "night")?;
     let day = parse_choice(lines.next()?, "day")?;
-    lines.next().is_none().then_some(Settings { night, day })
+    let accent = parse_accent(lines.next()?).ok()?;
+    (lines.next().is_none() && text.ends_with('\n')).then_some(Settings { night, day, accent })
+}
+
+/// `accent default` or `accent <degrees>`: `Ok(None)` for the default, an
+/// error for anything else.
+fn parse_accent(line: &str) -> Result<Option<Hue>, ()> {
+    let value = line.strip_prefix("accent ").ok_or(())?;
+    if value == DEFAULT_ACCENT {
+        return Ok(None);
+    }
+    let degrees = value.parse().map_err(|_| ())?;
+    Hue::from_degrees(degrees).map(Some).ok_or(())
 }
 
 fn parse_choice(line: &str, name: &str) -> Option<Choice> {
@@ -214,21 +243,42 @@ mod tests {
     }
 
     #[test]
+    fn every_accent_survives_the_file_format() {
+        for accent in Hue::all().map(Some).chain([None]) {
+            let settings = Settings::default().with_accent(accent);
+            assert_eq!(parse(&format(settings)), Some(settings));
+        }
+    }
+
+    #[test]
     fn anything_unexpected_is_rejected() {
         let good = format(Settings::default());
-        assert_eq!(good, "abyss-theme 1\nnight 215 100\nday 200 100\n");
+        assert_eq!(
+            good,
+            "abyss-theme 2\nnight 215 100\nday 200 100\naccent default\n"
+        );
+        let accented = format(Settings::default().with_accent(Hue::from_degrees(125)));
+        assert_eq!(
+            accented,
+            "abyss-theme 2\nnight 215 100\nday 200 100\naccent 125\n"
+        );
         for bad in [
             "",
+            "abyss-theme 1\nnight 215 100\nday 200 100\n",
             "abyss-theme 2\nnight 215 100\nday 200 100\n",
-            "abyss-theme 1\nnight 210 100\nday 200 100\n", // a hue not on offer
-            "abyss-theme 1\nnight 365 100\nday 200 100\n",
-            "abyss-theme 1\nnight 215 75\nday 200 100\n", // a tint not on offer
-            "abyss-theme 1\nnight 215 100 1\nday 200 100\n",
-            "abyss-theme 1\nnight 215  100\nday 200 100\n",
-            "abyss-theme 1\nnight -215 100\nday 200 100\n",
-            "abyss-theme 1\nday 200 100\nnight 215 100\n",
-            "abyss-theme 1\nnight 215 100\n",
-            "abyss-theme 1\nnight 215 100\nday 200 100\nextra\n",
+            "abyss-theme 3\nnight 215 100\nday 200 100\naccent default\n",
+            "abyss-theme 2\nnight 210 100\nday 200 100\naccent default\n", // a hue not on offer
+            "abyss-theme 2\nnight 365 100\nday 200 100\naccent default\n",
+            "abyss-theme 2\nnight 215 75\nday 200 100\naccent default\n", // a tint not on offer
+            "abyss-theme 2\nnight 215 100 1\nday 200 100\naccent default\n",
+            "abyss-theme 2\nnight 215  100\nday 200 100\naccent default\n",
+            "abyss-theme 2\nnight -215 100\nday 200 100\naccent default\n",
+            "abyss-theme 2\nday 200 100\nnight 215 100\naccent default\n",
+            "abyss-theme 2\nnight 215 100\nday 200 100\naccent 120\n", // not on offer
+            "abyss-theme 2\nnight 215 100\nday 200 100\naccent Default\n",
+            "abyss-theme 2\nnight 215 100\nday 200 100\naccent  125\n",
+            "abyss-theme 2\nnight 215 100\nday 200 100\naccent default",
+            "abyss-theme 2\nnight 215 100\nday 200 100\naccent default\nextra\n",
         ] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }

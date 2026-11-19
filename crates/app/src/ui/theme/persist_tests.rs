@@ -106,7 +106,7 @@ fn each_choice_saves_only_its_own_file(cx: &mut TestAppContext) {
     assert_eq!(settings::load(&theme), custom());
 
     cx.update(|cx| {
-        Themes::reset_hues(cx);
+        Themes::reset_colours(cx);
         assert_eq!(Themes::colourway(cx), Colourway::Abyss);
     });
     cx.run_until_parked();
@@ -123,7 +123,7 @@ fn the_last_choice_is_the_one_on_disk(cx: &mut TestAppContext) {
         Themes::set_colourway(Colourway::Abyss, cx);
         Themes::set(custom(), cx);
         Themes::set_colourway(Colourway::Sky, cx);
-        Themes::reset_hues(cx);
+        Themes::reset_colours(cx);
         Themes::set(custom(), cx);
         Themes::set_colourway(Colourway::Ultramarine, cx);
         Themes::set_colourway(Colourway::Abyss, cx);
