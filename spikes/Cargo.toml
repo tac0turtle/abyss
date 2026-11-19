@@ -1,0 +1,17 @@
+# Stage 3 task 0 spikes (docs/plans/stage-3-spikes.md). Throwaway programs that
+# gather evidence about macOS behaviour; none of this ships. Its own workspace,
+# so it is not a default member of the app workspace and `cargo build` at the
+# repository root never touches it. Cargo.lock starts as a copy of the root
+# lock, so the pinned gpui, objc2 and security-framework versions match the app.
+[workspace]
+resolver = "3"
+members = ["app-spike", "gpui-spike"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "917559da35dd4d626205da705b071c800c9c2553" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "917559da35dd4d626205da705b071c800c9c2553", features = ["font-kit", "runtime_shaders"] }

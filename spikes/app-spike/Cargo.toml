@@ -1,0 +1,17 @@
+[package]
+name = "abyss-spike"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Sandbox, keychain, NSWorkspace and notification spikes in one binary, so the
+# same executable can be signed with and without the sandbox entitlement.
+[dependencies]
+abyss-core = { path = "../../crates/core" }
+libc = "0.2"
+block2 = "0.6.2"
+objc2 = { version = "0.6.5", features = ["exception"] }
+objc2-foundation = "0.3.2"
+objc2-app-kit = "0.3.2"
+objc2-user-notifications = { version = "0.3.2", features = ["block2"] }
