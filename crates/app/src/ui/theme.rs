@@ -193,33 +193,110 @@ pub(crate) struct Theme {
     pub(crate) text: Rgba,
     /// Text on a `text` fill.
     pub(crate) on_text: Rgba,
-    /// The fill of an incoming message and of input fields; `text` reads on
-    /// it over every surface.
+    /// The fill of an incoming message and of input fields; `on_incoming`
+    /// reads on it over every surface.
     pub(crate) incoming: Rgba,
+    /// Text on an `incoming` fill.
+    pub(crate) on_incoming: Rgba,
+    /// The fill of the user's own messages.
+    pub(crate) own: Rgba,
+    /// Text on an `own` fill.
+    pub(crate) on_own: Rgba,
+    /// The fill of buttons, the floating controls and the tab rail's rule.
+    pub(crate) accent: Rgba,
+    /// Text on an `accent` fill.
+    pub(crate) on_accent: Rgba,
     /// The mark's tones, outermost first.
     pub(crate) mark: [Rgba; MARK_STEPS],
-    /// Text and background of a hidden spoiler (the same, opaque color).
-    pub(crate) hidden: Rgba,
+    /// Text and background of a hidden spoiler (the same, opaque color), on
+    /// an incoming message and on the user's own.
+    spoilers: [Rgba; 2],
+    /// The opacity of quiet text inside an incoming message and inside the
+    /// user's own.
+    quiet: [f32; 2],
+}
+
+/// Which side of the conversation a message bubble is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Side {
+    Incoming,
+    Outgoing,
+}
+
+impl Side {
+    fn index(self) -> usize {
+        match self {
+            Self::Incoming => 0,
+            Self::Outgoing => 1,
+        }
+    }
 }
 
 impl Theme {
     pub(crate) fn new(mode: Mode, choice: Choice) -> Self {
         let spec = mode.spec();
         let color = |t: Tone| oklch(t, choice.hue.degrees(), choice.tint.factor());
+        let (text, on_text, hidden) = (color(spec.text), color(spec.on_text), color(HIDDEN));
+        // abyss has no accent: the user's own words, buttons and marks all
+        // take the text color, and everything is told apart by contrast.
         Self {
             surfaces: spec.surfaces.map(color),
             flip: spec.flip,
-            text: color(spec.text),
-            on_text: color(spec.on_text),
+            text,
+            on_text,
             incoming: Rgba {
                 r: 1.,
                 g: 1.,
                 b: 1.,
                 a: spec.incoming,
             },
+            on_incoming: text,
+            own: text,
+            on_own: on_text,
+            accent: text,
+            on_accent: on_text,
             mark: MARK.map(color),
-            hidden: color(HIDDEN),
+            spoilers: [hidden; 2],
+            quiet: [QUIET; 2],
         }
+    }
+
+    /// The fill of a message bubble on `side`.
+    pub(crate) fn bubble(&self, side: Side) -> Rgba {
+        match side {
+            Side::Incoming => self.incoming,
+            Side::Outgoing => self.own,
+        }
+    }
+
+    /// The text color inside a message bubble on `side`.
+    pub(crate) fn bubble_ink(&self, side: Side) -> Rgba {
+        match side {
+            Side::Incoming => self.on_incoming,
+            Side::Outgoing => self.on_own,
+        }
+    }
+
+    /// The opacity of quiet text (times, states, quotes) inside a message
+    /// bubble on `side`.
+    pub(crate) fn quiet_in(&self, side: Side) -> f32 {
+        self.quiet.get(side.index()).copied().unwrap_or(QUIET)
+    }
+
+    /// A hidden spoiler's color inside a message bubble on `side`.
+    pub(crate) fn spoiler(&self, side: Side) -> Rgba {
+        self.spoilers.get(side.index()).copied().unwrap_or_default()
+    }
+
+    /// The rule that marks the selected row on the surface at `depth`.
+    pub(crate) fn row_mark(&self, depth: Depth) -> Rgba {
+        self.text_on(depth)
+    }
+
+    /// An unread badge's fill and text on the surface at `depth`. The unread
+    /// dot is the fill alone.
+    pub(crate) fn badge(&self, depth: Depth) -> (Rgba, Rgba) {
+        (self.text_on(depth), self.surface(depth))
     }
 
     /// The surface at `depth`.
@@ -435,21 +512,102 @@ mod tests {
         (0..=DEEPEST).map(Depth)
     }
 
+    fn sides() -> [Side; 2] {
+        [Side::Incoming, Side::Outgoing]
+    }
+
     /// Every way text can sit on this theme: on a surface, in an incoming
     /// message over that surface, and in the user's own message; each at full
-    /// and at quiet strength.
+    /// and at its quiet strength.
     fn weakest_pair(theme: &Theme) -> f32 {
-        let pair = |ink: Rgba, ground: Rgba| {
-            contrast(ink, ground).min(contrast(over(quiet(ink), ground), ground))
+        let pair = |ink: Rgba, ground: Rgba, quiet: f32| {
+            contrast(ink, ground).min(contrast(over(faded(ink, quiet), ground), ground))
         };
+        let (incoming, own) = (Side::Incoming, Side::Outgoing);
         depths()
             .flat_map(|d| {
                 let surface = theme.surface(d);
-                let wash = over(theme.incoming, surface);
-                [pair(theme.text_on(d), surface), pair(theme.text, wash)]
+                let wash = over(theme.bubble(incoming), surface);
+                [
+                    pair(theme.text_on(d), surface, QUIET),
+                    pair(theme.bubble_ink(incoming), wash, theme.quiet_in(incoming)),
+                ]
             })
-            .chain([pair(theme.on_text, theme.text)])
+            .chain([pair(
+                theme.bubble_ink(own),
+                theme.bubble(own),
+                theme.quiet_in(own),
+            )])
             .fold(f32::INFINITY, f32::min)
+    }
+
+    /// How far a message bubble on `side` stands out from the surface at
+    /// `depth` beneath it, as a contrast ratio.
+    fn separation(theme: &Theme, side: Side, depth: Depth) -> f32 {
+        let surface = theme.surface(depth);
+        contrast(over(theme.bubble(side), surface), surface)
+    }
+
+    fn every_abyss_theme() -> impl Iterator<Item = (Mode, Choice, Theme)> {
+        Mode::ALL.into_iter().flat_map(|mode| {
+            Hue::all().flat_map(move |hue| {
+                Tint::all().map(move |tint| {
+                    let choice = Choice { hue, tint };
+                    (mode, choice, Theme::new(mode, choice))
+                })
+            })
+        })
+    }
+
+    /// The roles are named for what they paint, but under abyss each one is
+    /// exactly the color that call site painted before roles existed, so
+    /// abyss renders unchanged (colourways plan, task 1).
+    #[test]
+    fn abyss_roles_are_the_colors_they_replace() {
+        for (mode, choice, theme) in every_abyss_theme() {
+            let hidden = oklch(HIDDEN, choice.hue.degrees(), choice.tint.factor());
+            let at = format!("{mode:?} {choice:?}");
+            assert_eq!(theme.accent, theme.text, "{at}");
+            assert_eq!(theme.on_accent, theme.on_text, "{at}");
+            assert_eq!(theme.bubble(Side::Outgoing), theme.text, "{at}");
+            assert_eq!(theme.bubble_ink(Side::Outgoing), theme.on_text, "{at}");
+            assert_eq!(theme.bubble(Side::Incoming), theme.incoming, "{at}");
+            assert_eq!(theme.bubble_ink(Side::Incoming), theme.text, "{at}");
+            for side in sides() {
+                assert_eq!(theme.quiet_in(side).to_bits(), QUIET.to_bits(), "{at}");
+                assert_eq!(theme.spoiler(side), hidden, "{at}");
+            }
+            for d in depths() {
+                assert_eq!(theme.row_mark(d), theme.text_on(d), "{at} {d:?}");
+                assert_eq!(
+                    theme.badge(d),
+                    (theme.text_on(d), theme.surface(d)),
+                    "{at} {d:?}"
+                );
+            }
+        }
+    }
+
+    /// abyss's weakest bubble against the surface beneath it, per mode: the
+    /// floor every colourway's bubbles must clear (colourways plan, section
+    /// 6). Measured here so a change to abyss that lowers it is caught.
+    #[test]
+    fn abyss_bubbles_stand_out_from_their_surfaces() {
+        let floor = |mode: Mode| match mode {
+            Mode::Day => 1.068,
+            Mode::Night => 1.175,
+        };
+        for (mode, choice, theme) in every_abyss_theme() {
+            for side in sides() {
+                for d in depths() {
+                    let apart = separation(&theme, side, d);
+                    assert!(
+                        apart >= floor(mode),
+                        "{mode:?} {choice:?} {side:?} {d:?}: {apart}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

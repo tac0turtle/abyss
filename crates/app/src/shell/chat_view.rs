@@ -16,7 +16,7 @@ use jiff::tz::TimeZone;
 
 use super::session::Session;
 use super::topic_view::topic_row;
-use super::view::{centered, field, muted};
+use super::view::{centered, field, muted, muted_in};
 use super::{Root, State};
 use crate::chat::inline::Inline;
 use crate::chat::list::{ArchiveEntry, Shown, SidebarRow, Tab, View};
@@ -25,7 +25,7 @@ use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
 use crate::chat::{ChatShell, Composer, Pane, Row, copy, format, list as chat_list, topics};
 use crate::ui::mark::mark;
-use crate::ui::theme::{self, Depth, Theme, Themes};
+use crate::ui::theme::{self, Depth, Side, Theme, Themes};
 
 const CHAT_ROW_HEIGHT: f32 = 56.;
 /// A chat row's avatar disc.
@@ -47,14 +47,15 @@ fn fonts() -> Fonts {
 /// Rich-text colors for text set in `ink`. All one color: a link is marked
 /// by its underline and a mention by its weight. A hidden spoiler is an
 /// opaque block, so the text under it cannot show through.
-fn palette(ink: Rgba, theme: &Theme) -> Palette {
+fn palette(side: Side, theme: &Theme) -> Palette {
+    let ink = theme.bubble_ink(side);
     Palette {
         text: ink.into(),
-        muted: theme::quiet(ink).into(),
+        muted: theme::faded(ink, theme.quiet_in(side)).into(),
         link: ink.into(),
         mention: ink.into(),
         code_bg: theme::faded(ink, 0.1).into(),
-        spoiler: theme.hidden.into(),
+        spoiler: theme.spoiler(side).into(),
     }
 }
 
@@ -252,9 +253,10 @@ fn chat_rows(
                         return empty_row(ix);
                     };
                     let id = ("inline-topic", u64::from(topic.id.get().cast_unsigned()));
-                    let ink = theme.text_on(depth_of(topics::activity(topic), now, &tz));
+                    let depth = depth_of(topics::activity(topic), now, &tz);
+                    let ink = theme.text_on(depth);
                     let mark = if selected {
-                        ink.into()
+                        theme.row_mark(depth).into()
                     } else {
                         transparent_black()
                     };
@@ -399,9 +401,8 @@ impl ChatRow<'_> {
         let chat = self.chat;
         let id = chat.id;
         let (surface, ink) = (theme.surface(self.depth), theme.text_on(self.depth));
-        // The selected chat is marked by a rule in its own text color.
         let mark: Hsla = if self.selected {
-            ink.into()
+            theme.row_mark(self.depth).into()
         } else {
             transparent_black()
         };
@@ -430,7 +431,7 @@ impl ChatRow<'_> {
                     .min_w_0()
                     .truncate(),
             )
-            .children(unread_badge(chat, surface, ink));
+            .children(unread_badge(chat, theme.badge(self.depth)));
         div()
             .id(ix)
             .w_full()
@@ -487,21 +488,21 @@ fn disclosure(inline: Inline, cx: &mut Context<'_, Root>) -> Stateful<Div> {
 }
 
 /// A chat row's unread count, as displayed (core's read overlay applied).
-fn unread_badge(chat: &ChatSummary, surface: Rgba, ink: Rgba) -> Option<Div> {
+fn unread_badge(chat: &ChatSummary, badge: (Rgba, Rgba)) -> Option<Div> {
     let unread = chat.displayed_unread();
-    (unread > 0).then(|| count_badge(unread, chat.unread_mentions, surface, ink))
+    (unread > 0).then(|| count_badge(unread, chat.unread_mentions, badge))
 }
 
-/// An unread count, marked when it holds mentions: the row's own two
-/// colors, swapped.
-pub(super) fn count_badge(unread: u32, mentions: u32, surface: Rgba, ink: Rgba) -> Div {
+/// An unread count, marked when it holds mentions, in a `(fill, ink)` pair
+/// from [`Theme::badge`].
+pub(super) fn count_badge(unread: u32, mentions: u32, (fill, ink): (Rgba, Rgba)) -> Div {
     let mention = if mentions > 0 { "@ " } else { "" };
     div()
         .px_2()
         .flex_none()
         .rounded_full()
-        .bg(ink)
-        .text_color(surface)
+        .bg(fill)
+        .text_color(ink)
         .text_xs()
         .child(format!("{mention}{}", copy::unread_badge(unread)))
 }
@@ -625,8 +626,8 @@ fn jump_button(theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
     pill(
         "jump-to-latest",
         copy::JUMP_TO_LATEST,
-        theme.text,
-        theme.on_text,
+        theme.accent,
+        theme.on_accent,
     )
     .absolute()
     .bottom_3()
@@ -645,7 +646,7 @@ pub(super) fn retry_button(
     theme: &Theme,
     cx: &mut Context<'_, Root>,
 ) -> Stateful<Div> {
-    pill(id, label, theme.text, theme.on_text)
+    pill(id, label, theme.accent, theme.on_accent)
         .debug_selector(|| id.to_owned())
         .absolute()
         .left_3()
@@ -774,32 +775,6 @@ fn unread_divider(ink: Rgba) -> Div {
         .child(rule())
 }
 
-/// Which side of the pane a bubble sits on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Side {
-    Incoming,
-    Outgoing,
-}
-
-impl Side {
-    /// The user's own words carry the most contrast on screen; whatever
-    /// arrives sits on a quiet wash.
-    fn fill(self, theme: &Theme) -> Rgba {
-        match self {
-            Self::Incoming => theme.incoming,
-            Self::Outgoing => theme.text,
-        }
-    }
-
-    /// The text color inside a bubble on this side.
-    fn ink(self, theme: &Theme) -> Rgba {
-        match self {
-            Self::Incoming => theme.text,
-            Self::Outgoing => theme.on_text,
-        }
-    }
-}
-
 /// A message bubble, right-aligned for outgoing messages. A `header` (the
 /// sender, in groups) sits on its own tinted band above the body, set off by
 /// a hairline, so who spoke never blends into what was said.
@@ -809,7 +784,7 @@ fn in_bubble(
     header: Option<AnyElement>,
     content: Vec<AnyElement>,
 ) -> AnyElement {
-    let ink = side.ink(theme);
+    let ink = theme.bubble_ink(side);
     let band = header.map(|h| {
         div()
             .w_full()
@@ -834,7 +809,7 @@ fn in_bubble(
     let inner = div()
         .max_w(px(BUBBLE_MAX_WIDTH))
         .rounded(px(theme::RADIUS))
-        .bg(side.fill(theme))
+        .bg(theme.bubble(side))
         .text_color(ink)
         .flex()
         .flex_col()
@@ -860,7 +835,7 @@ fn media_chip(label: &str, ink: Rgba) -> Div {
         .child(format!("[{label}]"))
 }
 
-fn reply_quote(target: &Message, ink: Rgba) -> Div {
+fn reply_quote(target: &Message, side: Side, theme: &Theme) -> Div {
     let text: SharedString = match &target.body {
         Body::Text(rt) => chat_list::preview_text(Some(&abyss_core::model::Preview::Text(
             abyss_core::sanitize::clean(rt.text(), abyss_core::sanitize::MAX_PREVIEW_BYTES),
@@ -871,9 +846,9 @@ fn reply_quote(target: &Message, ink: Rgba) -> Div {
     div()
         .pl_2()
         .border_l_2()
-        .border_color(ink)
+        .border_color(theme.bubble_ink(side))
         .text_xs()
-        .opacity(theme::QUIET)
+        .opacity(theme.quiet_in(side))
         .truncate()
         .child(text)
 }
@@ -902,7 +877,7 @@ impl RowCtx {
         } else {
             Side::Incoming
         };
-        let ink = side.ink(&self.theme);
+        let ink = self.theme.bubble_ink(side);
         let body = match &m.body {
             Body::Service(text) => {
                 return div()
@@ -912,17 +887,19 @@ impl RowCtx {
                     .child(muted(text.clone()).text_sm().italic())
                     .into_any_element();
             }
-            Body::Text(rt) => self.rich(m.id, rt, spoilers, ink),
+            Body::Text(rt) => self.rich(m.id, rt, spoilers, side),
             Body::Media { kind, caption } => div()
                 .flex()
                 .flex_col()
                 .gap_1()
                 .child(media_chip(&copy::media_label(kind), ink))
                 .children(
-                    (!caption.text().is_empty()).then(|| self.rich(m.id, caption, spoilers, ink)),
+                    (!caption.text().is_empty()).then(|| self.rich(m.id, caption, spoilers, side)),
                 )
                 .into_any_element(),
-            Body::Unsupported => muted(copy::UNSUPPORTED).italic().into_any_element(),
+            Body::Unsupported => muted_in(copy::UNSUPPORTED, side, &self.theme)
+                .italic()
+                .into_any_element(),
         };
         let sender = m
             .sender
@@ -944,19 +921,23 @@ impl RowCtx {
             time.to_string()
         };
         let mut content: Vec<AnyElement> = Vec::with_capacity(3);
-        content.extend(reply.map(|r| reply_quote(r, ink).into_any_element()));
+        content.extend(reply.map(|r| reply_quote(r, side, &self.theme).into_any_element()));
         content.push(body);
-        content.push(muted(footer).text_xs().into_any_element());
+        content.push(
+            muted_in(footer, side, &self.theme)
+                .text_xs()
+                .into_any_element(),
+        );
         in_bubble(side, &self.theme, sender, content)
     }
 
     /// Formatted text: a link click copies its target (links never open), a
     /// spoiler click reveals the message's spoilers.
-    fn rich(&self, id: MsgId, rt: &RichText, spoilers: Spoilers, ink: Rgba) -> AnyElement {
+    fn rich(&self, id: MsgId, rt: &RichText, spoilers: Spoilers, side: Side) -> AnyElement {
         let this = self.this.clone();
         let element_id =
             ElementId::NamedInteger("msg".into(), u64::try_from(id.0).unwrap_or_default());
-        rich::style(rt, &fonts(), &palette(ink, &self.theme), spoilers)
+        rich::style(rt, &fonts(), &palette(side, &self.theme), spoilers)
             .interactive(element_id, move |click, window, cx| {
                 on_text_click(&this, id, &click, window, cx);
             })
@@ -968,14 +949,14 @@ impl RowCtx {
 /// where core accepts them; text core refused offers Put back and Dismiss.
 fn echo_row(e: &Echo, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     let local_id = e.local_id;
-    // Actions sit inside the user's own bubble, so their colors are swapped.
-    let (fill, ink) = (theme.on_text, theme.text);
+    // Actions sit inside the user's own bubble, so its colors are swapped.
+    let (fill, ink) = (theme.on_own, theme.own);
     let status = div()
         .flex()
         .gap_2()
         .items_center()
         .justify_end()
-        .child(muted(copy::send_label(e, Instant::now())).text_xs());
+        .child(muted_in(copy::send_label(e, Instant::now()), Side::Outgoing, theme).text_xs());
     let retry = e.can_retry().then(|| {
         let retry = cx.listener(move |root, _: &ClickEvent, window, cx| {
             root.with_session(|s, cx| s.retry_send(local_id, window, cx), cx);
@@ -1017,11 +998,7 @@ fn echo_row(e: &Echo, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
         .children(discard)
         .children(returned.into_iter().flatten())
         .children(stranded.into_iter().flatten());
-    let text = rich::plain(
-        &e.text,
-        &fonts(),
-        &palette(Side::Outgoing.ink(theme), theme),
-    );
+    let text = rich::plain(&e.text, &fonts(), &palette(Side::Outgoing, theme));
     let body = StyledText::new(text.text).with_runs(text.runs);
     in_bubble(
         Side::Outgoing,

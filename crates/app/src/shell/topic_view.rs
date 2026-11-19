@@ -210,7 +210,7 @@ pub(super) fn topic_row(
                 .min_w_0()
                 .truncate(),
         )
-        .children(unread_mark(UnreadMark::of(topic), surface, ink));
+        .children(unread_mark(UnreadMark::of(topic), theme.badge(depth)));
     div()
         .id(id)
         .w_full()
@@ -251,10 +251,16 @@ fn glyph(ink: Rgba) -> Div {
         .child(copy::TOPIC_GLYPH)
 }
 
-fn unread_mark(mark: UnreadMark, surface: Rgba, ink: Rgba) -> Option<Div> {
+fn unread_mark(mark: UnreadMark, badge: (Rgba, Rgba)) -> Option<Div> {
     match mark {
         UnreadMark::None => None,
-        UnreadMark::Count { unread, mentions } => Some(count_badge(unread, mentions, surface, ink)),
-        UnreadMark::Dot => Some(div().size(px(DOT_SIZE)).flex_none().rounded_full().bg(ink)),
+        UnreadMark::Count { unread, mentions } => Some(count_badge(unread, mentions, badge)),
+        UnreadMark::Dot => Some(
+            div()
+                .size(px(DOT_SIZE))
+                .flex_none()
+                .rounded_full()
+                .bg(badge.0),
+        ),
     }
 }

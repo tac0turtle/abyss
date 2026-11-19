@@ -20,7 +20,7 @@ use crate::chat::inline::Inline;
 use crate::chat::list::Step;
 use crate::ui::copy;
 use crate::ui::mark::mark;
-use crate::ui::theme::{self, Depth, Mode, Theme, Themes};
+use crate::ui::theme::{self, Depth, Mode, Side, Theme, Themes};
 
 mod onboarding;
 
@@ -132,6 +132,12 @@ pub(super) fn title(text: impl Into<SharedString>) -> Div {
 /// Quiet text: whatever color it inherits, at reduced strength.
 pub(super) fn muted(text: impl Into<SharedString>) -> Div {
     div().opacity(theme::QUIET).child(text.into())
+}
+
+/// Quiet text inside a message bubble on `side`, at that bubble's quiet
+/// strength.
+pub(super) fn muted_in(text: impl Into<SharedString>, side: Side, theme: &Theme) -> Div {
+    div().opacity(theme.quiet_in(side)).child(text.into())
 }
 
 fn failure_screen(failure: &Failure) -> impl IntoElement {
@@ -480,7 +486,7 @@ pub(super) fn field(input: AnyElement, theme: &Theme) -> Div {
         .border_color(theme::line(theme.text))
         .rounded(px(theme::RADIUS))
         .bg(theme.incoming)
-        .text_color(theme.text)
+        .text_color(theme.on_incoming)
         .child(input)
 }
 
@@ -491,8 +497,8 @@ pub(super) fn button(id: &'static str, label: &'static str, theme: &Theme) -> St
         .px_4()
         .py_2()
         .rounded(px(theme::RADIUS))
-        .bg(theme.text)
-        .text_color(theme.on_text)
+        .bg(theme.accent)
+        .text_color(theme.on_accent)
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .child(label)

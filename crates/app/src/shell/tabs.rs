@@ -146,7 +146,7 @@ enum Mark {
 
 fn rail_item(id: ElementId, mark: Mark, theme: &Theme) -> Stateful<Div> {
     let rule: Hsla = match mark {
-        Mark::On => theme.text.into(),
+        Mark::On => theme.accent.into(),
         Mark::Off => transparent_black(),
     };
     div()
