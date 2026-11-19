@@ -627,7 +627,14 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll(cx.listener(Self::on_scroll))
             .child(TextElement { input: cx.entity() })
-            .children(counter.map(|c| div().flex().justify_end().text_xs().opacity(0.6).child(c)))
+            .children(counter.map(|c| {
+                div()
+                    .flex()
+                    .justify_end()
+                    .text_xs()
+                    .opacity(crate::ui::theme::QUIET)
+                    .child(c)
+            }))
     }
 }
 

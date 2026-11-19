@@ -244,7 +244,7 @@ fn glyph(ink: Rgba) -> Div {
         .size(px(36.))
         .flex_none()
         .rounded_full()
-        .bg(theme::faded(ink, 0.14))
+        .bg(theme::faded(ink, theme::DISC))
         .flex()
         .justify_center()
         .items_center()

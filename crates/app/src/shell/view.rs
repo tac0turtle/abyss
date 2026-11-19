@@ -490,7 +490,7 @@ pub(super) fn field(input: AnyElement, theme: &Theme) -> Div {
         .child(input)
 }
 
-/// The strongest fill on screen, the same as the user's own messages.
+/// A primary action, in the theme's `accent`.
 pub(super) fn button(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div> {
     div()
         .id(id)

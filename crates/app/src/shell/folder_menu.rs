@@ -278,7 +278,7 @@ fn entry(
         .items_center()
         .rounded(px(theme::RADIUS))
         .cursor_pointer()
-        .hover(|d| d.bg(theme::faded(theme.text, 0.08)))
+        .hover(|d| d.bg(theme::faded(theme.text, theme::MENU_HOVER)))
         .child(label)
         .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
             root.with_session(|s, cx| on_click(s, window, cx), cx);

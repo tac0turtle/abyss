@@ -481,7 +481,10 @@ impl EntityInputHandler for PasswordInput {
 fn masked_runs(input: &PasswordInput, style: &TextStyle) -> (SharedString, Vec<TextRun>) {
     let len = input.edit.len();
     let (text, color) = if len == 0 {
-        (input.placeholder.clone(), style.color.opacity(0.4))
+        (
+            input.placeholder.clone(),
+            style.color.opacity(crate::ui::theme::PLACEHOLDER),
+        )
     } else if input.reveal == Reveal::Shown {
         (
             SharedString::from(input.edit.reveal().to_owned()),
@@ -595,7 +598,7 @@ impl Element for PasswordElement {
                     point(x(sel.start), bounds.top()),
                     point(x(sel.end), bounds.bottom()),
                 ),
-                style.color.opacity(0.2),
+                style.color.opacity(crate::ui::theme::SELECTION),
             );
             (Some(quad), None)
         };

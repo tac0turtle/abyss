@@ -1,17 +1,28 @@
-//! The tonal theme (`docs/brand/brand.md`): one hue per mode, no accent
-//! color, and surfaces that darken with age.
+//! The theme: a [`Colourway`] and, under abyss, the user's hues
+//! (`docs/brand/brand.md`, `docs/plans/colourways.md`).
 //!
-//! The user chooses a hue and a tint amount for night and for day
-//! ([`Settings`]). Lightness is fixed here and is never theirs to change:
-//! that is what keeps every text pair readable whatever they pick, and the
-//! tests check each pair for every choice on offer.
+//! **abyss** is tonal: one hue per mode, no accent color, and surfaces that
+//! darken with age. The user chooses a hue and a tint amount for night and
+//! for day ([`Settings`]). Lightness is fixed here and is never theirs to
+//! change: that is what keeps every text pair readable whatever they pick.
+//!
+//! **Ultramarine** and **Sky** are flat (`flat.rs`): one surface, a colored
+//! fill for the user's own messages, and an accent.
+//!
+//! Views paint with the theme's roles, never with derivations of their own,
+//! and the tests check every pair the roles paint, for every colourway and
+//! every abyss choice on offer.
 
+pub(crate) mod colourway;
+mod flat;
 pub(crate) mod settings;
 
 use std::path::PathBuf;
 
 use gpui::{App, AppContext, BorrowAppContext, Global, Rgba, Task, Window, WindowAppearance};
 
+pub(crate) use self::colourway::Colourway;
+use self::flat::Flat;
 pub(crate) use self::settings::{Choice, Hue, Settings, Tint};
 
 /// Messages, times and states.
@@ -27,6 +38,20 @@ pub(crate) const RADIUS: f32 = 12.;
 pub(crate) const QUIET: f32 = 0.74;
 /// Opacity of a hairline drawn in the text color.
 const LINE: f32 = 0.24;
+/// Opacity of the wash behind inline code, in the text's own color.
+pub(crate) const CODE_WASH: f32 = 0.1;
+/// Opacity of the wash behind a group message's sender name.
+pub(crate) const HEADER_WASH: f32 = 0.06;
+/// Opacity of the disc behind an avatar's initials or a topic's glyph.
+pub(crate) const DISC: f32 = 0.14;
+/// Opacity of the wash under a hovered tab.
+pub(crate) const TAB_HOVER: f32 = 0.06;
+/// Opacity of the wash under a hovered menu entry.
+pub(crate) const MENU_HOVER: f32 = 0.08;
+/// Opacity of an input's placeholder: a hint, so it needs 3:1, not 4.5:1.
+pub(crate) const PLACEHOLDER: f32 = 0.5;
+/// Opacity of the wash behind selected text in an input.
+pub(crate) const SELECTION: f32 = 0.2;
 
 const STEPS: usize = 7;
 const DEEPEST: u8 = 6;
@@ -132,6 +157,9 @@ struct Spec {
     flip: usize,
     /// Opacity of the white wash behind an incoming message.
     incoming: f32,
+    /// A hidden spoiler on an incoming message: far enough from the wash it
+    /// sits on to show at every depth (3:1).
+    spoiler: Tone,
 }
 
 const NIGHT: Spec = Spec {
@@ -148,6 +176,7 @@ const NIGHT: Spec = Spec {
     on_text: tone(0.18, 0.03),
     flip: STEPS,
     incoming: 0.08,
+    spoiler: tone(0.65, 0.030),
 };
 
 const DAY: Spec = Spec {
@@ -164,6 +193,7 @@ const DAY: Spec = Spec {
     on_text: tone(0.97, 0.006),
     flip: 4,
     incoming: 0.80,
+    spoiler: tone(0.55, 0.030),
 };
 
 /// The mark and everything public use these six tones, surface to floor.
@@ -179,8 +209,8 @@ const MARK: [Tone; MARK_STEPS] = [
 /// The tone a choice is previewed in: mid water.
 const SWATCH: Tone = tone(0.56, 0.050);
 
-/// A hidden spoiler: an opaque block midway between the two text colors, so
-/// it shows on an incoming message and on the user's own alike.
+/// A hidden spoiler on the user's own message: an opaque block between the
+/// two text colors.
 const HIDDEN: Tone = tone(0.60, 0.030);
 
 /// The colors of one mode, for one choice of hue and tint.
@@ -188,11 +218,15 @@ const HIDDEN: Tone = tone(0.60, 0.030);
 pub(crate) struct Theme {
     surfaces: [Rgba; STEPS],
     flip: usize,
-    /// Text, and the fill of the user's own messages and of buttons: the
-    /// strongest contrast on screen.
+    /// One surface at every depth, and marks in the accent (Ultramarine and
+    /// Sky); otherwise the strata, and marks in each row's own ink (abyss).
+    flat: bool,
+    /// Text on the surface. In abyss it is also the source of the `own` and
+    /// `accent` fills; views paint those through their roles.
     pub(crate) text: Rgba,
-    /// Text on a `text` fill.
-    pub(crate) on_text: Rgba,
+    /// Text on a `text` fill: abyss's `on_own` and `on_accent`. Private, so
+    /// no view paints it outside a role.
+    on_text: Rgba,
     /// The fill of an incoming message and of input fields; `on_incoming`
     /// reads on it over every surface.
     pub(crate) incoming: Rgba,
@@ -233,15 +267,26 @@ impl Side {
 }
 
 impl Theme {
-    pub(crate) fn new(mode: Mode, choice: Choice) -> Self {
+    /// The theme `colourway` paints in `mode`; `choice` (the user's hue and
+    /// tint) counts only under abyss.
+    pub(crate) fn new(mode: Mode, colourway: Colourway, choice: Choice) -> Self {
+        match colourway {
+            Colourway::Abyss => Self::abyss(mode, choice),
+            Colourway::Ultramarine => flat::theme(Flat::Ultramarine, mode),
+            Colourway::Sky => flat::theme(Flat::Sky, mode),
+        }
+    }
+
+    fn abyss(mode: Mode, choice: Choice) -> Self {
         let spec = mode.spec();
         let color = |t: Tone| oklch(t, choice.hue.degrees(), choice.tint.factor());
-        let (text, on_text, hidden) = (color(spec.text), color(spec.on_text), color(HIDDEN));
+        let (text, on_text) = (color(spec.text), color(spec.on_text));
         // abyss has no accent: the user's own words, buttons and marks all
         // take the text color, and everything is told apart by contrast.
         Self {
             surfaces: spec.surfaces.map(color),
             flip: spec.flip,
+            flat: false,
             text,
             on_text,
             incoming: Rgba {
@@ -256,7 +301,7 @@ impl Theme {
             accent: text,
             on_accent: on_text,
             mark: MARK.map(color),
-            spoilers: [hidden; 2],
+            spoilers: [color(spec.spoiler), color(HIDDEN)],
             quiet: [QUIET; 2],
         }
     }
@@ -290,13 +335,21 @@ impl Theme {
 
     /// The rule that marks the selected row on the surface at `depth`.
     pub(crate) fn row_mark(&self, depth: Depth) -> Rgba {
-        self.text_on(depth)
+        if self.flat {
+            self.accent
+        } else {
+            self.text_on(depth)
+        }
     }
 
     /// An unread badge's fill and text on the surface at `depth`. The unread
     /// dot is the fill alone.
     pub(crate) fn badge(&self, depth: Depth) -> (Rgba, Rgba) {
-        (self.text_on(depth), self.surface(depth))
+        if self.flat {
+            (self.accent, self.on_accent)
+        } else {
+            (self.text_on(depth), self.surface(depth))
+        }
     }
 
     /// The surface at `depth`.
@@ -326,13 +379,30 @@ pub(crate) fn tint_swatch(choice: Choice) -> Rgba {
     oklch(SWATCH, choice.hue.degrees(), choice.tint.factor())
 }
 
+/// Where the choices are kept. `None` keeps that choice for this run only.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Stores {
+    /// abyss's hues (`settings.rs`).
+    pub(crate) theme: Option<PathBuf>,
+    /// The colourway (`colourway.rs`).
+    pub(crate) colourway: Option<PathBuf>,
+}
+
+/// One file to write: each choice is saved only when it changes, so picking
+/// a colourway never touches the saved hues (colourways plan, section 3).
+#[derive(Clone, Debug)]
+enum Save {
+    Hues(PathBuf, Settings),
+    Colourway(PathBuf, Colourway),
+}
+
 /// The user's choices and the two themes built from them; an app global.
 pub(crate) struct Themes {
+    colourway: Colourway,
     settings: Settings,
     night: Theme,
     day: Theme,
-    /// Where the choice is kept; `None` keeps it for this run only.
-    store: Option<PathBuf>,
+    stores: Stores,
     /// The save in flight. Each save waits for the one before, so the last
     /// choice made is the last one written.
     saving: Option<Task<()>>,
@@ -341,24 +411,36 @@ pub(crate) struct Themes {
 impl Global for Themes {}
 
 impl Themes {
-    /// Themes for `settings`, saved to `store` when they change.
-    pub(crate) fn new(settings: Settings, store: Option<PathBuf>) -> Self {
+    /// Themes for `colourway` and `settings`, saved to `stores` when they
+    /// change.
+    pub(crate) fn new(colourway: Colourway, settings: Settings, stores: Stores) -> Self {
         Self {
+            colourway,
             settings,
-            night: Theme::new(Mode::Night, settings.night),
-            day: Theme::new(Mode::Day, settings.day),
-            store,
+            night: Theme::new(Mode::Night, colourway, settings.night),
+            day: Theme::new(Mode::Day, colourway, settings.day),
+            stores,
             saving: None,
         }
     }
 
-    /// Installs the saved choice, or the defaults. Call once at startup.
+    /// Installs the saved choices, or the defaults. Call once at startup.
+    /// Nothing is written here: a missing colourway file just means the
+    /// default.
     pub(crate) fn init(cx: &mut App) {
-        let store = settings::default_path();
-        let settings = store
+        let stores = Stores {
+            theme: settings::default_path(),
+            colourway: colourway::default_path(),
+        };
+        let settings = stores
+            .theme
             .as_deref()
             .map_or_else(Settings::default, settings::load);
-        cx.set_global(Self::new(settings, store));
+        let colourway = stores
+            .colourway
+            .as_deref()
+            .map_or(Colourway::DEFAULT, |path| colourway::load(path).colourway());
+        cx.set_global(Self::new(colourway, settings, stores));
     }
 
     /// The theme for the window's current system appearance. Views that can
@@ -366,15 +448,21 @@ impl Themes {
     pub(crate) fn of(window: &Window, cx: &App) -> Theme {
         let mode = Mode::of(window);
         cx.try_global::<Self>().map_or_else(
-            || Theme::new(mode, Settings::default().get(mode)),
+            || Theme::new(mode, Colourway::DEFAULT, Settings::default().get(mode)),
             |t| t.theme(mode),
         )
     }
 
-    /// The user's choices, or the defaults before [`Themes::init`].
+    /// abyss's hues, or the defaults before [`Themes::init`].
     pub(crate) fn settings(cx: &App) -> Settings {
         cx.try_global::<Self>()
             .map_or_else(Settings::default, |t| t.settings)
+    }
+
+    /// The colourway showing, or the default before [`Themes::init`].
+    pub(crate) fn colourway(cx: &App) -> Colourway {
+        cx.try_global::<Self>()
+            .map_or(Colourway::DEFAULT, |t| t.colourway)
     }
 
     fn theme(&self, mode: Mode) -> Theme {
@@ -384,33 +472,71 @@ impl Themes {
         }
     }
 
-    /// Replaces the choices, repaints every window and saves.
+    /// Replaces abyss's hues, repaints every window and saves them.
     pub(crate) fn set(settings: Settings, cx: &mut App) {
-        if !cx.has_global::<Self>() {
-            cx.set_global(Self::new(Settings::default(), None));
-        }
-        cx.update_global::<Self, _>(|themes, cx| {
-            if themes.settings == settings {
-                return;
-            }
-            let saving = themes.saving.take();
-            *themes = Self::new(settings, themes.store.take());
-            themes.saving = saving;
-            themes.save(cx);
+        Self::change(cx, |themes| {
+            (themes.settings != settings).then(|| {
+                themes.settings = settings;
+                themes.stores.theme.clone().map(|p| Save::Hues(p, settings))
+            })
         });
-        cx.refresh_windows();
     }
 
-    fn save(&mut self, cx: &App) {
-        let Some(path) = self.store.clone() else {
-            return;
-        };
-        let (settings, before) = (self.settings, self.saving.take());
+    /// Puts abyss's hues back to their defaults, staying in abyss: Reset in
+    /// the picker. Never changes the colourway.
+    pub(crate) fn reset_hues(cx: &mut App) {
+        Self::set(Settings::default(), cx);
+    }
+
+    /// Switches the colourway, repaints every window and saves it. The saved
+    /// hues are left alone.
+    pub(crate) fn set_colourway(colourway: Colourway, cx: &mut App) {
+        Self::change(cx, |themes| {
+            (themes.colourway != colourway).then(|| {
+                themes.colourway = colourway;
+                themes
+                    .stores
+                    .colourway
+                    .clone()
+                    .map(|p| Save::Colourway(p, colourway))
+            })
+        });
+    }
+
+    /// Applies `update` (which returns `None` when nothing changed, and the
+    /// file to write if there is one), rebuilds both themes and saves.
+    fn change(cx: &mut App, update: impl FnOnce(&mut Self) -> Option<Option<Save>>) {
+        if !cx.has_global::<Self>() {
+            let defaults = Self::new(Colourway::DEFAULT, Settings::default(), Stores::default());
+            cx.set_global(defaults);
+        }
+        let changed = cx.update_global::<Self, _>(|themes, cx| {
+            let Some(save) = update(themes) else {
+                return false;
+            };
+            themes.night = Theme::new(Mode::Night, themes.colourway, themes.settings.night);
+            themes.day = Theme::new(Mode::Day, themes.colourway, themes.settings.day);
+            if let Some(save) = save {
+                themes.save(save, cx);
+            }
+            true
+        });
+        if changed {
+            cx.refresh_windows();
+        }
+    }
+
+    fn save(&mut self, save: Save, cx: &App) {
+        let before = self.saving.take();
         self.saving = Some(cx.background_spawn(async move {
             if let Some(before) = before {
                 before.await;
             }
-            if let Err(error) = settings::save(&path, settings) {
+            let result = match &save {
+                Save::Hues(path, settings) => settings::save(path, *settings),
+                Save::Colourway(path, colourway) => colourway::save(path, *colourway),
+            };
+            if let Err(error) = result {
                 // The path holds the user's name; the kind is enough.
                 tracing::warn!(kind = ?error.kind(), "couldn't save the theme choice");
             }
@@ -464,211 +590,4 @@ fn encode(linear: f32) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use gpui::rgb;
-
-    use super::*;
-
-    /// WCAG AA for body text.
-    const AA: f32 = 4.5;
-
-    fn default_theme(mode: Mode) -> Theme {
-        Theme::new(mode, Settings::default().get(mode))
-    }
-
-    fn luminance(color: Rgba) -> f32 {
-        let linear = |c: f32| {
-            if c <= 0.040_45 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
-    }
-
-    fn contrast(a: Rgba, b: Rgba) -> f32 {
-        let (a, b) = (luminance(a), luminance(b));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
-    }
-
-    /// `top` painted over an opaque `under`.
-    fn over(top: Rgba, under: Rgba) -> Rgba {
-        let mix = |t: f32, u: f32| t * top.a + u * (1. - top.a);
-        Rgba {
-            r: mix(top.r, under.r),
-            g: mix(top.g, under.g),
-            b: mix(top.b, under.b),
-            a: 1.,
-        }
-    }
-
-    fn close(a: Rgba, b: Rgba) -> bool {
-        let near = |x: f32, y: f32| (x - y).abs() <= 1.5 / 255.;
-        near(a.r, b.r) && near(a.g, b.g) && near(a.b, b.b)
-    }
-
-    fn depths() -> impl Iterator<Item = Depth> {
-        (0..=DEEPEST).map(Depth)
-    }
-
-    fn sides() -> [Side; 2] {
-        [Side::Incoming, Side::Outgoing]
-    }
-
-    /// Every way text can sit on this theme: on a surface, in an incoming
-    /// message over that surface, and in the user's own message; each at full
-    /// and at its quiet strength.
-    fn weakest_pair(theme: &Theme) -> f32 {
-        let pair = |ink: Rgba, ground: Rgba, quiet: f32| {
-            contrast(ink, ground).min(contrast(over(faded(ink, quiet), ground), ground))
-        };
-        let (incoming, own) = (Side::Incoming, Side::Outgoing);
-        depths()
-            .flat_map(|d| {
-                let surface = theme.surface(d);
-                let wash = over(theme.bubble(incoming), surface);
-                [
-                    pair(theme.text_on(d), surface, QUIET),
-                    pair(theme.bubble_ink(incoming), wash, theme.quiet_in(incoming)),
-                ]
-            })
-            .chain([pair(
-                theme.bubble_ink(own),
-                theme.bubble(own),
-                theme.quiet_in(own),
-            )])
-            .fold(f32::INFINITY, f32::min)
-    }
-
-    /// How far a message bubble on `side` stands out from the surface at
-    /// `depth` beneath it, as a contrast ratio.
-    fn separation(theme: &Theme, side: Side, depth: Depth) -> f32 {
-        let surface = theme.surface(depth);
-        contrast(over(theme.bubble(side), surface), surface)
-    }
-
-    fn every_abyss_theme() -> impl Iterator<Item = (Mode, Choice, Theme)> {
-        Mode::ALL.into_iter().flat_map(|mode| {
-            Hue::all().flat_map(move |hue| {
-                Tint::all().map(move |tint| {
-                    let choice = Choice { hue, tint };
-                    (mode, choice, Theme::new(mode, choice))
-                })
-            })
-        })
-    }
-
-    /// The roles are named for what they paint, but under abyss each one is
-    /// exactly the color that call site painted before roles existed, so
-    /// abyss renders unchanged (colourways plan, task 1).
-    #[test]
-    fn abyss_roles_are_the_colors_they_replace() {
-        for (mode, choice, theme) in every_abyss_theme() {
-            let hidden = oklch(HIDDEN, choice.hue.degrees(), choice.tint.factor());
-            let at = format!("{mode:?} {choice:?}");
-            assert_eq!(theme.accent, theme.text, "{at}");
-            assert_eq!(theme.on_accent, theme.on_text, "{at}");
-            assert_eq!(theme.bubble(Side::Outgoing), theme.text, "{at}");
-            assert_eq!(theme.bubble_ink(Side::Outgoing), theme.on_text, "{at}");
-            assert_eq!(theme.bubble(Side::Incoming), theme.incoming, "{at}");
-            assert_eq!(theme.bubble_ink(Side::Incoming), theme.text, "{at}");
-            for side in sides() {
-                assert_eq!(theme.quiet_in(side).to_bits(), QUIET.to_bits(), "{at}");
-                assert_eq!(theme.spoiler(side), hidden, "{at}");
-            }
-            for d in depths() {
-                assert_eq!(theme.row_mark(d), theme.text_on(d), "{at} {d:?}");
-                assert_eq!(
-                    theme.badge(d),
-                    (theme.text_on(d), theme.surface(d)),
-                    "{at} {d:?}"
-                );
-            }
-        }
-    }
-
-    /// abyss's weakest bubble against the surface beneath it, per mode: the
-    /// floor every colourway's bubbles must clear (colourways plan, section
-    /// 6). Measured here so a change to abyss that lowers it is caught.
-    #[test]
-    fn abyss_bubbles_stand_out_from_their_surfaces() {
-        let floor = |mode: Mode| match mode {
-            Mode::Day => 1.068,
-            Mode::Night => 1.175,
-        };
-        for (mode, choice, theme) in every_abyss_theme() {
-            for side in sides() {
-                for d in depths() {
-                    let apart = separation(&theme, side, d);
-                    assert!(
-                        apart >= floor(mode),
-                        "{mode:?} {choice:?} {side:?} {d:?}: {apart}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn defaults_match_the_brand_sheet() {
-        let night = default_theme(Mode::Night);
-        assert!(close(night.surface(Depth::NOW), rgb(0x0c_333c)));
-        assert!(close(night.surface(Depth(DEEPEST)), rgb(0x00_0e13)));
-        assert!(close(night.text, rgb(0xdd_ebee)));
-        let day = default_theme(Mode::Day);
-        assert!(close(day.surface(Depth::NOW), rgb(0xf1_f6f7)));
-        assert!(close(day.surface(Depth(DEEPEST)), rgb(0x0b_2f31)));
-        assert!(close(day.text, rgb(0x0b_2425)));
-        // The mark at the night default is the public ramp, surface to floor.
-        assert!(close(night.mark[0], rgb(0xdd_ebee)));
-        assert!(close(night.mark[5], rgb(0x00_1318)));
-    }
-
-    /// The property the picker relies on: lightness alone decides contrast,
-    /// so nothing on offer can make text unreadable.
-    #[test]
-    fn every_text_pair_reads_for_every_choice_on_offer() {
-        for mode in Mode::ALL {
-            for hue in Hue::all() {
-                for tint in Tint::all() {
-                    let weakest = weakest_pair(&Theme::new(mode, Choice { hue, tint }));
-                    assert!(weakest >= AA, "{mode:?} {hue:?} {tint:?}: {weakest}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn old_things_sink() {
-        for mode in Mode::ALL {
-            let theme = default_theme(mode);
-            let tones: Vec<f32> = depths().map(|d| luminance(theme.surface(d))).collect();
-            assert!(tones.is_sorted_by(|a, b| a > b), "{mode:?}: {tones:?}");
-        }
-    }
-
-    #[test]
-    fn depth_follows_age_in_days() {
-        let steps =
-            |days: &[i64]| -> Vec<u8> { days.iter().map(|d| Depth::from_days(*d).0).collect() };
-        assert_eq!(steps(&[-3, 0, 1, 2, 6, 7, 29]), [0, 0, 1, 2, 2, 3, 3]);
-        assert_eq!(steps(&[30, 89, 90, 364, 365, i64::MAX]), [4, 4, 5, 5, 6, 6]);
-    }
-
-    #[test]
-    fn swatches_stay_tellable_apart_without_tint() {
-        let none = |hue| Choice {
-            hue,
-            tint: Tint::all().next().unwrap(),
-        };
-        let mut hues = Hue::all();
-        let (a, b) = (hues.next().unwrap(), hues.nth(11).unwrap());
-        assert_ne!(swatch(none(a)), swatch(none(b)));
-        assert_eq!(
-            tint_swatch(none(a)),
-            tint_swatch(none(b)),
-            "no tint is grey"
-        );
-    }
-}
+mod tests;

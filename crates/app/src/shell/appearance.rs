@@ -1,6 +1,7 @@
-//! Settings, including the user's hue and tint for night and for day
-//! (`docs/brand/brand.md`). The app behind the panel is the preview; a choice
-//! applies and saves as it is made.
+//! Settings: the colourway and, under abyss, the user's hue and tint for
+//! night and for day (`docs/brand/brand.md`, `docs/plans/colourways.md`).
+//! The app behind the panel is the preview; a choice applies and saves as it
+//! is made.
 
 use gpui::{
     AnyElement, ClickEvent, Context, Div, FontWeight, Hsla, MouseButton, MouseDownEvent, Rgba,
@@ -10,13 +11,15 @@ use gpui::{
 use super::Root;
 use super::view::{button, muted};
 use crate::ui::copy;
-use crate::ui::theme::{self, Choice, Depth, Hue, Mode, Settings, Theme, Themes, Tint};
+use crate::ui::theme::{self, Choice, Colourway, Depth, Hue, Mode, Settings, Theme, Themes, Tint};
 
 const PANEL_WIDTH: f32 = 580.;
 const LABEL_WIDTH: f32 = 40.;
 const CHIP_HEIGHT: f32 = 26.;
 const HUE_CHIP_WIDTH: f32 = 15.;
 const TINT_CHIP_WIDTH: f32 = 44.;
+const COLOURWAY_SWATCH_WIDTH: f32 = 120.;
+const COLOURWAY_SWATCH_HEIGHT: f32 = 44.;
 /// How much of the app shows through behind the panel.
 const VEIL: f32 = 0.6;
 
@@ -27,7 +30,16 @@ pub(super) fn panel(
     settings: Settings,
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
-    let sections = Mode::ALL.map(|mode| mode_section(mode, showing, settings, theme, cx));
+    let colourway = Themes::colourway(cx);
+    let abyss = (colourway == Colourway::Abyss).then(|| {
+        let sections = Mode::ALL.map(|mode| mode_section(mode, showing, settings, theme, cx));
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(muted(copy::APPEARANCE_NOTE).text_sm())
+            .children(sections)
+    });
     let card = div()
         .id("settings-panel")
         .w(px(PANEL_WIDTH))
@@ -54,10 +66,11 @@ pub(super) fn panel(
                 .font_weight(FontWeight::MEDIUM)
                 .child(copy::APPEARANCE),
         )
-        .child(muted(copy::APPEARANCE_NOTE).text_sm())
-        .children(sections)
+        .child(muted(copy::COLOURWAY_NOTE).text_sm())
+        .child(colourway_row(colourway, showing, settings, theme, cx))
+        .children(abyss)
         .child(storage_section(theme, cx))
-        .child(footer(theme, cx));
+        .child(footer(colourway, theme, cx));
     div()
         .id("settings-backdrop")
         .absolute()
@@ -78,6 +91,78 @@ pub(super) fn panel(
         )
         .child(card)
         .into_any_element()
+}
+
+fn colourway_name(colourway: Colourway) -> &'static str {
+    match colourway {
+        Colourway::Ultramarine => copy::ULTRAMARINE,
+        Colourway::Sky => copy::SKY,
+        Colourway::Abyss => copy::ABYSS_COLOURWAY,
+    }
+}
+
+fn colourway_id(colourway: Colourway) -> &'static str {
+    match colourway {
+        Colourway::Ultramarine => "colourway-ultramarine",
+        Colourway::Sky => "colourway-sky",
+        Colourway::Abyss => "colourway-abyss",
+    }
+}
+
+/// The colourways on offer, each shown as its own-message fill on its
+/// surface in the mode showing. The chosen one is marked by a ring in the
+/// text color and a heavier label, never by color alone.
+fn colourway_row(
+    chosen: Colourway,
+    showing: Mode,
+    settings: Settings,
+    theme: &Theme,
+    cx: &mut Context<'_, Root>,
+) -> Div {
+    let swatches = Colourway::ALL.map(|colourway| {
+        let looks = Theme::new(showing, colourway, settings.get(showing));
+        let selected = colourway == chosen;
+        let ring: Hsla = if selected {
+            theme.text.into()
+        } else {
+            theme::line(theme.text).into()
+        };
+        let sample = div()
+            .w(px(COLOURWAY_SWATCH_WIDTH))
+            .h(px(COLOURWAY_SWATCH_HEIGHT))
+            .p_2()
+            .flex()
+            .justify_end()
+            .items_end()
+            .rounded(px(theme::RADIUS))
+            .border_2()
+            .border_color(ring)
+            .bg(looks.surface(Depth::NOW))
+            .child(div().w(px(48.)).h(px(14.)).rounded_full().bg(looks.own));
+        let weight = if selected {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        };
+        div()
+            .id(colourway_id(colourway))
+            .debug_selector(move || colourway_id(colourway).to_owned())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .cursor_pointer()
+            .child(sample)
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(weight)
+                    .child(colourway_name(colourway)),
+            )
+            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                Themes::set_colourway(colourway, cx);
+            }))
+    });
+    div().flex().gap_3().children(swatches)
 }
 
 fn mode_name(mode: Mode) -> &'static str {
@@ -196,19 +281,10 @@ impl Chip {
     }
 }
 
-fn footer(theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
-    let reset = div()
-        .id("appearance-reset")
-        .px_4()
-        .py_2()
-        .rounded(px(theme::RADIUS))
-        .border_1()
-        .border_color(theme::line(theme.text))
-        .cursor_pointer()
-        .child(copy::RESET)
-        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-            Themes::set(Settings::default(), cx);
-        }));
+/// Reset (abyss only: it puts abyss's hues back and stays in abyss) on the
+/// left, Done on the right; the left slot stays when Reset is hidden.
+fn footer(colourway: Colourway, theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
+    let reset = (colourway == Colourway::Abyss).then(|| reset_button(theme, cx));
     let done = button("appearance-done", copy::DONE, theme).on_click(cx.listener(
         |root, _: &ClickEvent, _, cx| {
             root.toggle_appearance(cx);
@@ -218,8 +294,24 @@ fn footer(theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
         .flex()
         .justify_between()
         .items_center()
-        .child(reset)
+        .child(div().children(reset))
         .child(done)
+}
+
+fn reset_button(theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
+    div()
+        .id("appearance-reset")
+        .debug_selector(|| "appearance-reset".to_owned())
+        .px_4()
+        .py_2()
+        .rounded(px(theme::RADIUS))
+        .border_1()
+        .border_color(theme::line(theme.text))
+        .cursor_pointer()
+        .child(copy::RESET)
+        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+            Themes::reset_hues(cx);
+        }))
 }
 
 fn storage_section(theme: &Theme, cx: &mut Context<'_, Root>) -> Div {

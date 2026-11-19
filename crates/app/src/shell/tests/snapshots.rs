@@ -18,6 +18,9 @@
 //! Every run renders the same pixels: the clock and the time zone are pinned
 //! ([`format::forced`]) and the theme is kept in memory at its defaults, so
 //! two runs on one machine can be compared byte for byte.
+//!
+//! Every scene is shot in each colourway: abyss under its plain names, the
+//! others prefixed with their name (`sky-chat-day.png`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,7 +38,8 @@ use crate::chat::list::{Shown, Tab};
 use crate::chat::{demo, format};
 use crate::shell::Root;
 use crate::shell::session::Started;
-use crate::ui::theme::{self, Mode, Settings, Themes};
+use crate::ui::theme::colourway::Colourway;
+use crate::ui::theme::{self, Mode, Settings, Stores, Themes};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -61,17 +65,25 @@ struct Shot {
     root: WindowHandle<Root>,
     harness: Harness,
     dir: PathBuf,
+    /// Put before every file name: empty for abyss.
+    prefix: String,
 }
 
 impl Shot {
-    fn open(dir: &Path) -> Result<Self> {
+    fn open(dir: &Path, colourway: Colourway) -> Result<Self> {
         let mut cx = HeadlessAppContext::with_platform(
             Arc::new(gpui_apple::AppleTextSystem::new()),
             Arc::new(()),
             gpui_platform::current_headless_renderer,
         );
         // Defaults, kept in memory: never the user's saved choice.
-        cx.update(|cx| cx.set_global(Themes::new(Settings::default(), None)));
+        cx.update(|cx| {
+            cx.set_global(Themes::new(
+                colourway,
+                Settings::default(),
+                Stores::default(),
+            ));
+        });
         let (commands, events, harness) = link();
         let started = Started {
             commands,
@@ -87,6 +99,10 @@ impl Shot {
             root,
             harness,
             dir: dir.to_path_buf(),
+            prefix: match colourway {
+                Colourway::Abyss => String::new(),
+                other => format!("{}-", other.key()),
+            },
         })
     }
 
@@ -125,7 +141,7 @@ impl Shot {
         }
         let image = self.cx.capture_screenshot(self.any())?;
         theme::forced::set(None);
-        let path = self.dir.join(name);
+        let path = self.dir.join(format!("{}{name}", self.prefix));
         image.save(&path)?;
         println!(
             "wrote {} ({}x{})",
@@ -196,8 +212,8 @@ impl Shot {
     }
 }
 
-fn signin(dir: &Path) -> Result<()> {
-    let mut shot = Shot::open(dir)?;
+fn signin(dir: &Path, colourway: Colourway) -> Result<()> {
+    let mut shot = Shot::open(dir, colourway)?;
     // No credentials on first launch: onboarding starts at Welcome.
     shot.core_says(Event::Auth(AuthState::NeedCredentials {
         error: None,
@@ -210,18 +226,19 @@ fn signin(dir: &Path) -> Result<()> {
     shot.save(Mode::Night, "signin-night.png")
 }
 
-fn chat(dir: &Path) -> Result<()> {
-    let mut shot = Shot::open(dir)?;
+fn chat(dir: &Path, colourway: Colourway) -> Result<()> {
+    let mut shot = Shot::open(dir, colourway)?;
     shot.sign_in()?;
     shot.open_showcase()?;
     shot.save(Mode::Day, "chat-day.png")?;
     shot.save(Mode::Night, "chat-night.png")?;
     shot.toggle_appearance()?;
+    shot.save(Mode::Day, "appearance-day.png")?;
     shot.save(Mode::Night, "appearance-night.png")
 }
 
-fn list_deep(dir: &Path) -> Result<()> {
-    let mut shot = Shot::open(dir)?;
+fn list_deep(dir: &Path, colourway: Colourway) -> Result<()> {
+    let mut shot = Shot::open(dir, colourway)?;
     shot.sign_in()?;
     // A frame first, so the list's hitbox exists for the scroll to land on.
     shot.save(Mode::Day, "list-top-day.png")?;
@@ -234,8 +251,8 @@ fn list_deep(dir: &Path) -> Result<()> {
 }
 
 /// The archive opened from the main list's entry.
-fn archive(dir: &Path) -> Result<()> {
-    let mut shot = Shot::open(dir)?;
+fn archive(dir: &Path, colourway: Colourway) -> Result<()> {
+    let mut shot = Shot::open(dir, colourway)?;
     shot.sign_in()?;
     shot.root.update(&mut shot.cx, |root, window, cx| {
         root.with_session(|s, cx| s.show_chats(Shown::Archive, window, cx), cx);
@@ -246,8 +263,8 @@ fn archive(dir: &Path) -> Result<()> {
 }
 
 /// A built-in tab selected in the strip (plan section 17.2): the forums.
-fn tabs(dir: &Path) -> Result<()> {
-    let mut shot = Shot::open(dir)?;
+fn tabs(dir: &Path, colourway: Colourway) -> Result<()> {
+    let mut shot = Shot::open(dir, colourway)?;
     shot.sign_in()?;
     shot.root.update(&mut shot.cx, |root, window, cx| {
         root.with_session(
@@ -262,7 +279,7 @@ fn tabs(dir: &Path) -> Result<()> {
 
 /// The demo forum shown in the pane, its topics under its sidebar row
 /// (plan section 17.3), pinned first, with one of them open.
-fn inline_topics(dir: &Path) -> Result<()> {
+fn inline_topics(dir: &Path, colourway: Colourway) -> Result<()> {
     use abyss_core::model::TopicOrder;
     use abyss_core::store::TopicsGen;
 
@@ -270,7 +287,7 @@ fn inline_topics(dir: &Path) -> Result<()> {
         kind: abyss_core::model::PeerKind::Channel,
         id: 2,
     };
-    let mut shot = Shot::open(dir)?;
+    let mut shot = Shot::open(dir, colourway)?;
     shot.sign_in()?;
     shot.root.update(&mut shot.cx, |root, window, cx| {
         root.with_session(|s, cx| s.select_chat(forum, window, cx), cx);
@@ -319,8 +336,8 @@ fn inline_topics(dir: &Path) -> Result<()> {
 /// The showcase opened at its first unread message (plan section 17.5):
 /// core's page around the read position, the divider at the top of the
 /// list. Unverified: written on Linux, where the snapshots don't build.
-fn unread_divider(dir: &Path) -> Result<()> {
-    let mut shot = Shot::open(dir)?;
+fn unread_divider(dir: &Path, colourway: Colourway) -> Result<()> {
+    let mut shot = Shot::open(dir, colourway)?;
     shot.sign_in()?;
     shot.root.update(&mut shot.cx, |root, window, cx| {
         root.with_session(|s, cx| s.select_chat(SHOWCASE, window, cx), cx);
@@ -350,8 +367,8 @@ fn unread_divider(dir: &Path) -> Result<()> {
 }
 
 /// A chat folder's tab selected: its pinned chat first, then its own.
-fn folder(dir: &Path) -> Result<()> {
-    let mut shot = Shot::open(dir)?;
+fn folder(dir: &Path, colourway: Colourway) -> Result<()> {
+    let mut shot = Shot::open(dir, colourway)?;
     shot.sign_in()?;
     shot.root.update(&mut shot.cx, |root, window, cx| {
         root.with_session(
@@ -377,6 +394,8 @@ fn folder(dir: &Path) -> Result<()> {
     shot.save(Mode::Night, "menu-night.png")
 }
 
+mod scenes;
+
 #[test]
 fn snapshots() -> Result<()> {
     let Some(dir) = std::env::var_os(DIR_VAR).map(PathBuf::from) else {
@@ -384,19 +403,40 @@ fn snapshots() -> Result<()> {
         return Ok(());
     };
     std::fs::create_dir_all(&dir)?;
-    format::forced::set(Some((NOW, jiff::tz::TimeZone::UTC)));
-    let result = all(&dir);
-    format::forced::set(None);
-    result
+    let _pinned = Pinned::new();
+    all(&dir)
+}
+
+/// The pinned clock, released on drop: on an error and on a panic alike, so
+/// a test run on the same thread afterwards sees the real one.
+struct Pinned;
+
+impl Pinned {
+    fn new() -> Self {
+        format::forced::set(Some((NOW, jiff::tz::TimeZone::UTC)));
+        Self
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        format::forced::set(None);
+        theme::forced::set(None);
+    }
 }
 
 fn all(dir: &Path) -> Result<()> {
-    signin(dir)?;
-    chat(dir)?;
-    archive(dir)?;
-    tabs(dir)?;
-    inline_topics(dir)?;
-    unread_divider(dir)?;
-    folder(dir)?;
-    list_deep(dir)
+    for colourway in Colourway::ALL {
+        signin(dir, colourway)?;
+        chat(dir, colourway)?;
+        archive(dir, colourway)?;
+        tabs(dir, colourway)?;
+        inline_topics(dir, colourway)?;
+        unread_divider(dir, colourway)?;
+        folder(dir, colourway)?;
+        scenes::group(dir, colourway)?;
+        scenes::hover(dir, colourway)?;
+    }
+    // Age only shows in abyss: every flat surface is the same.
+    list_deep(dir, Colourway::Abyss)
 }

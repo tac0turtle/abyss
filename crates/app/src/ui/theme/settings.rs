@@ -237,6 +237,8 @@ mod tests {
     #[test]
     fn saves_privately_and_loads_back() {
         let dir = scratch("roundtrip");
+        // The trusted parent exists; the app directory under it is created.
+        fs::create_dir(&dir).unwrap();
         let path = dir.join("nested").join(FILE);
         let settings = Settings::default().with(Mode::Day, every_choice()[3]);
         save(&path, settings).unwrap();
@@ -244,7 +246,8 @@ mod tests {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
-        assert!(!path.with_extension("tmp").exists());
+        let left = fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(left, 1, "no staging file is left behind");
         // Saving again replaces the file.
         save(&path, Settings::default()).unwrap();
         assert_eq!(load(&path), Settings::default());

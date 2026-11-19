@@ -149,6 +149,21 @@ impl CacheLocation {
     }
 }
 
+/// The app's directory in Application Support, under the home directory
+/// from [`home_dir`]: the one place its path is built. The theme, colourway,
+/// sidebar and Keychain-preference files live in it, and the real cache below
+/// it.
+pub(crate) fn app_dir() -> Option<PathBuf> {
+    home_dir().map(|home| app_dir_in(&home))
+}
+
+/// The app's directory under `home`.
+pub(crate) fn app_dir_in(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join(APP_ID)
+}
+
 /// The user's home directory from the user database (`getpwuid_r` for the
 /// real uid), or `None`. `HOME` is not consulted.
 pub(crate) fn home_dir() -> Option<PathBuf> {

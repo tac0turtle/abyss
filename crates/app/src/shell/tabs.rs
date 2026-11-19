@@ -163,7 +163,7 @@ fn rail_item(id: ElementId, mark: Mark, theme: &Theme) -> Stateful<Div> {
         .truncate()
         .text_center()
         .cursor_pointer()
-        .hover(|d| d.bg(theme::faded(theme.text, 0.06)))
+        .hover(|d| d.bg(theme::faded(theme.text, theme::TAB_HOVER)))
         .when(mark == Mark::Off, |d| {
             d.text_color(theme::quiet(theme.text))
         })

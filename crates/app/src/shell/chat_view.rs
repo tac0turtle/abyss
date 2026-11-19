@@ -34,8 +34,6 @@ const AVATAR_SIZE: f32 = 36.;
 const ROW_PADDING: f32 = 12.;
 const SIDEBAR_WIDTH: f32 = 300.;
 const BUBBLE_MAX_WIDTH: f32 = 560.;
-/// Strength of the ink wash behind a bubble's sender band.
-const HEADER_WASH: f32 = 0.06;
 
 fn fonts() -> Fonts {
     Fonts {
@@ -44,7 +42,7 @@ fn fonts() -> Fonts {
     }
 }
 
-/// Rich-text colors for text set in `ink`. All one color: a link is marked
+/// Rich-text colors inside a message from `side`. All one color: a link is marked
 /// by its underline and a mention by its weight. A hidden spoiler is an
 /// opaque block, so the text under it cannot show through.
 fn palette(side: Side, theme: &Theme) -> Palette {
@@ -54,7 +52,7 @@ fn palette(side: Side, theme: &Theme) -> Palette {
         muted: theme::faded(ink, theme.quiet_in(side)).into(),
         link: ink.into(),
         mention: ink.into(),
-        code_bg: theme::faded(ink, 0.1).into(),
+        code_bg: theme::faded(ink, theme::CODE_WASH).into(),
         spoiler: theme.spoiler(side).into(),
     }
 }
@@ -313,7 +311,7 @@ fn empty_row(ix: usize) -> Stateful<Div> {
 
 /// An inline row under the pane's forum (plan section 17.3): as tall as a
 /// chat row, so the sidebar stays a uniform list, indented by the avatar's
-/// width, with a chat row's selection rule (`mark`: the ink or nothing).
+/// width, with a chat row's selection rule (`mark`: the theme's `row_mark`, or nothing).
 fn inline_band(row: Stateful<Div>, ink: Rgba, mark: Hsla) -> Stateful<Div> {
     row.w_full()
         .h(px(CHAT_ROW_HEIGHT))
@@ -513,7 +511,7 @@ fn avatar(chat: &ChatSummary, ink: Rgba) -> Div {
         .size(px(AVATAR_SIZE))
         .flex_none()
         .rounded_full()
-        .bg(theme::faded(ink, 0.14))
+        .bg(theme::faded(ink, theme::DISC))
         .text_sm()
         .flex()
         .justify_center()
@@ -623,11 +621,14 @@ pub(super) fn pane_header(chat: &ChatSummary) -> Div {
 }
 
 fn jump_button(theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
-    pill(
-        "jump-to-latest",
-        copy::JUMP_TO_LATEST,
-        theme.accent,
-        theme.on_accent,
+    floating(
+        pill(
+            "jump-to-latest",
+            copy::JUMP_TO_LATEST,
+            theme.accent,
+            theme.on_accent,
+        ),
+        theme,
     )
     .absolute()
     .bottom_3()
@@ -646,7 +647,7 @@ pub(super) fn retry_button(
     theme: &Theme,
     cx: &mut Context<'_, Root>,
 ) -> Stateful<Div> {
-    pill(id, label, theme.accent, theme.on_accent)
+    floating(pill(id, label, theme.accent, theme.on_accent), theme)
         .debug_selector(|| id.to_owned())
         .absolute()
         .left_3()
@@ -655,6 +656,13 @@ pub(super) fn retry_button(
             cx.stop_propagation();
             root.with_session(|s, cx| s.retry_loads(window, cx), cx);
         }))
+}
+
+/// A control that floats over panes of any depth and over messages: a ring
+/// in `on_accent` keeps its edge showing over whatever is beneath, where the
+/// accent alone might match it (colourways plan, section 2).
+fn floating(control: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
+    control.border_2().border_color(theme.on_accent)
 }
 
 /// A small action in `ink` on `fill`.
@@ -794,7 +802,7 @@ fn in_bubble(
             // GPUI clips children to a rectangle, not the bubble's rounded
             // corners, so the band rounds its own top to match.
             .rounded_t(px(theme::RADIUS))
-            .bg(theme::faded(ink, HEADER_WASH))
+            .bg(theme::faded(ink, theme::HEADER_WASH))
             .border_b_1()
             .border_color(theme::line(ink))
             .child(h)

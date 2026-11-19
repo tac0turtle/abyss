@@ -169,7 +169,10 @@ fn row_rect(x0: Pixels, x1: Pixels, top: Pixels, lh: Pixels) -> Bounds<Pixels> {
 fn display_runs(input: &TextInput, style: &TextStyle) -> (SharedString, Vec<TextRun>) {
     let content = input.buffer.text();
     let (text, color) = if content.is_empty() {
-        (input.placeholder.clone(), style.color.opacity(0.4))
+        (
+            input.placeholder.clone(),
+            style.color.opacity(crate::ui::theme::PLACEHOLDER),
+        )
     } else {
         (SharedString::from(input.display_text()), style.color)
     };
@@ -317,7 +320,7 @@ impl Element for TextElement {
                 .map(|r| {
                     fill(
                         Bounds::new(r.origin + origin, r.size),
-                        style.color.opacity(0.2),
+                        style.color.opacity(crate::ui::theme::SELECTION),
                     )
                 })
                 .collect(),

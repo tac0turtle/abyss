@@ -19,7 +19,7 @@ impl Global for Preferences {}
 
 impl Preferences {
     pub(crate) fn init(cx: &mut App) {
-        let path = app_dir().map(|dir| dir.join("keychain-preference"));
+        let path = crate::storage::app_dir().map(|dir| dir.join("keychain-preference"));
         let loaded = path.as_deref().map_or_else(
             || Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
             |path| {
@@ -39,7 +39,9 @@ impl Preferences {
     pub(crate) fn config(cx: &App) -> Result<SecretStorageConfig, StartError> {
         let prefs = cx.try_global::<Self>().ok_or(StartError::SecretStorage)?;
         Ok(SecretStorageConfig {
-            dir: app_dir().ok_or(StartError::SecretStorage)?.join("private"),
+            dir: crate::storage::app_dir()
+                .ok_or(StartError::SecretStorage)?
+                .join("private"),
             use_keychain: prefs.use_keychain.ok_or(StartError::SecretStorage)?,
         })
     }
@@ -78,10 +80,6 @@ impl Preferences {
         .detach();
         cx.refresh_windows();
     }
-}
-
-fn app_dir() -> Option<PathBuf> {
-    Some(crate::storage::home_dir()?.join("Library/Application Support/dev.abyss"))
 }
 
 fn parse(bytes: Option<&[u8]>) -> std::io::Result<bool> {

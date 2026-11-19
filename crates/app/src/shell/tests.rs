@@ -161,6 +161,64 @@ fn appearance_choice_rethemes_the_window_and_reset_restores_it(cx: &mut TestAppC
     root.read_with(cx, |root, _| assert!(!root.appearance_open));
 }
 
+/// The picker switches colourways by click; abyss's hues and Reset belong
+/// to abyss alone, and Reset never leaves it.
+#[gpui::test]
+fn colourway_picker_switches_and_reset_stays_in_abyss(cx: &mut TestAppContext) {
+    use gpui::Modifiers;
+
+    use crate::ui::theme::colourway::Colourway;
+    use crate::ui::theme::{Choice, Hue, Mode, Settings, Theme, Themes, Tint};
+
+    let (root, cx) =
+        cx.add_window_view(|window, cx| Root::new(Err(LaunchError::FakeNotBuilt), window, cx));
+    root.update(cx, Root::toggle_appearance);
+    cx.run_until_parked();
+    let showing = cx.update(|window, _| Mode::of(window));
+    let click = |cx: &mut VisualTestContext, id: &'static str| {
+        let at = cx.debug_bounds(id).unwrap().center();
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_click(at, Modifiers::none());
+        cx.run_until_parked();
+    };
+    let shown = |cx: &mut VisualTestContext| cx.update(|window, cx| Themes::of(window, cx));
+    assert_eq!(cx.update(|_, cx| Themes::colourway(cx)), Colourway::Abyss);
+    assert!(
+        cx.debug_bounds("appearance-reset").is_some(),
+        "abyss resets"
+    );
+
+    let choice = Choice {
+        hue: Hue::all().next().unwrap(),
+        tint: Tint::all().last().unwrap(),
+    };
+    let hues = Settings::default().with(showing, choice);
+    cx.update(|_, cx| Themes::set(hues, cx));
+    cx.run_until_parked();
+
+    for (colourway, id) in [
+        (Colourway::Ultramarine, "colourway-ultramarine"),
+        (Colourway::Sky, "colourway-sky"),
+    ] {
+        click(cx, id);
+        assert_eq!(cx.update(|_, cx| Themes::colourway(cx)), colourway);
+        let expected = Theme::new(showing, colourway, choice);
+        assert_eq!(shown(cx), expected);
+        assert!(cx.debug_bounds("appearance-reset").is_none(), "abyss only");
+        assert_eq!(cx.update(|_, cx| Themes::settings(cx)), hues, "kept");
+    }
+
+    click(cx, "colourway-abyss");
+    assert_eq!(shown(cx), Theme::new(showing, Colourway::Abyss, choice));
+    click(cx, "appearance-reset");
+    assert_eq!(cx.update(|_, cx| Themes::colourway(cx)), Colourway::Abyss);
+    assert_eq!(cx.update(|_, cx| Themes::settings(cx)), Settings::default());
+    assert_eq!(
+        shown(cx),
+        Theme::new(showing, Colourway::Abyss, Settings::default().get(showing))
+    );
+}
+
 #[gpui::test]
 fn settings_stays_open_inside_and_closes_on_a_backdrop_click(cx: &mut TestAppContext) {
     use gpui::{Modifiers, point, px};
