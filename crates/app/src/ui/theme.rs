@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use gpui::{App, AppContext, BorrowAppContext, Global, Rgba, Task, Window, WindowAppearance};
 
-pub(crate) use self::colourway::{Colourway, FirstLaunch};
+pub(crate) use self::colourway::Colourway;
 use self::flat::Flat;
 pub(crate) use self::settings::{Choice, Hue, Settings, Tint};
 
@@ -424,12 +424,11 @@ impl Themes {
         }
     }
 
-    /// Installs the saved choices, or the defaults. Call once at startup,
-    /// before the window opens: a first launch decides its colourway here
-    /// (see [`colourway::decide`]).
-    pub(crate) fn init(policy: FirstLaunch, cx: &mut App) {
+    /// Installs the saved choices, or the defaults. Call once at startup.
+    /// Nothing is written here.
+    pub(crate) fn init(cx: &mut App) {
         if let Some(app_dir) = crate::storage::app_dir() {
-            Self::init_in(&app_dir, policy, cx);
+            Self::init_in(&app_dir, cx);
         } else {
             tracing::warn!("the home directory is unknown; theme choices last this run");
             let defaults = Self::new(Colourway::DEFAULT, Settings::default(), Stores::default());
@@ -438,7 +437,7 @@ impl Themes {
     }
 
     /// [`Themes::init`] with the app's directory at `app_dir`.
-    pub(crate) fn init_in(app_dir: &Path, policy: FirstLaunch, cx: &mut App) {
+    pub(crate) fn init_in(app_dir: &Path, cx: &mut App) {
         let stores = Stores {
             theme: Some(settings::path_in(app_dir)),
             colourway: Some(colourway::path_in(app_dir)),
@@ -447,7 +446,10 @@ impl Themes {
             .theme
             .as_deref()
             .map_or_else(Settings::default, settings::load);
-        let colourway = colourway::decide(app_dir, policy);
+        let colourway = stores
+            .colourway
+            .as_deref()
+            .map_or(Colourway::DEFAULT, |path| colourway::load(path).colourway());
         cx.set_global(Self::new(colourway, settings, stores));
     }
 

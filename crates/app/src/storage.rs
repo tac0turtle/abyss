@@ -168,11 +168,6 @@ fn application_support(home: &Path) -> PathBuf {
     home.join("Library").join("Application Support")
 }
 
-/// The real cache directory inside the app's directory `app_dir`.
-pub(crate) fn cache_dir_in(app_dir: &Path) -> PathBuf {
-    app_dir.join(CACHE_DIR)
-}
-
 /// The user's home directory from the user database (`getpwuid_r` for the
 /// real uid), or `None`. `HOME` is not consulted.
 pub(crate) fn home_dir() -> Option<PathBuf> {

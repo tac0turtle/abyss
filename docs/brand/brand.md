@@ -43,11 +43,11 @@ Rules keep their workshop numbers, so a reference such as "rule 3" still holds.
 
 **Three colourways**, picked at the top of Appearance. Each defines a night and a day theme, and the system appearance picks between them.
 
-- **Ultramarine:** flat neutrals and a saturated blue (oklch 0.53 0.20 265) for the user's own messages and the accent. The default for a new install.
+- **Ultramarine:** flat neutrals and a saturated blue (oklch 0.53 0.20 265) for the user's own messages and the accent. The default.
 - **Sky:** flat, slightly cool surfaces, white incoming messages by day, and a sky-blue accent.
 - **abyss:** the strata below. The user chooses its hue and tint; the rest of this section up to the public ramp describes it.
 
-The choice is saved as two lines of text in `~/Library/Application Support/dev.abyss/colourway` (`abyss-colourway 1`, then `ultramarine`, `sky` or `abyss`), readable only by the user, beside the `theme` file that keeps abyss's hues. The first real launch without it decides once and writes it: an install that already has a `theme` file or a message cache keeps abyss; a new one gets Ultramarine. A damaged file means Ultramarine and is left alone until the user picks.
+The choice is saved as two lines of text in `~/Library/Application Support/dev.abyss/colourway` (`abyss-colourway 1`, then `ultramarine`, `sky` or `abyss`), readable only by the user, beside the `theme` file that keeps abyss's hues. Nothing is written until the user picks; a missing or damaged file means Ultramarine.
 
 **Contrast in the flat colourways.** The weakest text pair is 4.53 in Ultramarine (quiet text on the own-message blue, both modes) and 5.03 in Sky (night; 5.11 by day). The flat colourways' values live in `crates/app/src/ui/theme/flat.rs`.
 
