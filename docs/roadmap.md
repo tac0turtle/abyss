@@ -1,6 +1,6 @@
 # abyss roadmap
 
-Status as of 2026-11-17. This is the index of what is done, what is next and what is still undecided. Each stage's detailed plan lives in its own `docs/plans/stage-N.md`, written when that stage starts.
+Status as of 2026-11-19. This is the index of what is done, what is next and what is still undecided. Each stage's detailed plan lives in its own `docs/plans/stage-N.md`, written when that stage starts.
 
 ## v1 scope
 
@@ -20,13 +20,14 @@ Message links are copy-only. The only URL abyss ever opens is the hardcoded `htt
 | Stage | Scope | Status |
 |---|---|---|
 | 1 | Sign-in and onboarding, chat list, text history with formatting, sending, live updates, logout, encrypted message cache | Code done and reviewed against the fake backend; live verification (task 12) open |
-| 2 | Forum topics; chat-list tabs, inline topics and unread views; chat folders and the archive | Code done and reviewed against the fake backend (tasks 1–11, 13–18); live verification (task 12) open |
+| 2 | Forum topics; chat-list tabs, inline topics and unread views; chat folders and the archive | Code done and reviewed against the fake backend (tasks 1–11, 13–18); macOS close-out done; live verification (task 12) open |
 | 3 | Notifications, Developer ID signing and notarization, App Sandbox, accessibility | Not started; the bundle (`scripts/bundle.sh`) is signed ad hoc |
 | 4 | Media download and decode: chat images, then avatars (letter avatars and stripped thumbnails included) | Not started; images come last in v1 |
 
 Notes:
 - **Stage 1** is specified in [plans/stage-1.md](plans/stage-1.md). Its review log (section 15) runs through round 37.
-- **Stage 2** is specified in [plans/stage-2.md](plans/stage-2.md) (sections 0–16 forum topics, section 17 tabs/inline topics/unread views) and [plans/folders.md](plans/folders.md) (archive, folder tabs, folder editing). Each task's review is in its log. Task 12 adds live checks U1–U5 and L1–L8. Still to do on macOS: the strict clippy run, generating the new snapshots (tabs, inline topics, unread divider, folder menu), and a visual check of the new UI.
+- **Stage 2** is specified in [plans/stage-2.md](plans/stage-2.md) (sections 0–16 forum topics, section 17 tabs/inline topics/unread views) and [plans/folders.md](plans/folders.md) (archive, folder tabs, folder editing). Each task's review is in its log. Task 12 adds live checks U1–U5 and L1–L8. The macOS close-out is done (2026-11-19): strict clippy passes with and without `--features fake` and with `--features snapshots`; the snapshots (tabs, inline topics, unread divider, folder menu) are regenerated against the vertical sidebar rail; and the new UI passed a visual check.
+- **Colourways** (Signal- and Telegram-like themes, Signal-like as the new default; amends the brand's colour rules) are planned in [plans/colourways.md](plans/colourways.md), reviewed clean after five rounds (GPT-6 Astra and Gemini 4 Neon); tasks 0 to 3 not started.
 - **Stage 3:** until signing lands, every rebuild of the ad-hoc-signed dev binary triggers Keychain ACL prompts (stage-1.md section 14, risk 3).
 - **Archive and chat folders:** proposed in [plans/folders.md](plans/folders.md) as three PRs: the archive as its own view (A), chat folders read-only (B), then archiving and folder editing (C).
 - **Risk (folders, part C):** folder edits are recovered best-effort after an unknown outcome. An uncertain write that the server applies after the next edit's fetch can lose one of the two changes, because `messages.updateDialogFilter` replaces the whole folder with no version check (folders.md, part C, "Risks"). After an uncertain write, the next folder edit waits for the instance's retirement to complete, like every other client operation under the single rebuild mechanism; a retirement that hangs holds it too.
