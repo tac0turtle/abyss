@@ -165,6 +165,8 @@ mod tests {
         symlink(parent.path().join("nowhere"), &app).unwrap();
         assert_ne!(read(&file).unwrap_err().kind(), io::ErrorKind::NotFound);
         assert!(remove(&file).is_err());
+        assert!(write(&file, "x\n").is_err());
+        assert!(!parent.path().join("nowhere").exists(), "link followed");
         fs::remove_file(&app).unwrap();
         fs::write(&app, "").unwrap();
         assert!(write(&file, "x\n").is_err());
