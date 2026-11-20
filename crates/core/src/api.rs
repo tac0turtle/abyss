@@ -79,6 +79,11 @@ pub enum Command {
     /// topics flood wait, only the retained copy is shown and the load ends
     /// with `LoadEnded { Topics, FloodWait }` at once.
     OpenForum(ChatId),
+    /// Shows a forum's topic list and opens its topic in one command.
+    OpenForumTopic {
+        chat: ChatId,
+        topic: TopicId,
+    },
     /// Leaves a forum's topic list; the list stays retained (LRU).
     CloseForum(ChatId),
     /// The next topics page of the shown forum. Answered by `TopicsPaging`
@@ -161,6 +166,11 @@ impl std::fmt::Debug for Command {
                 .finish(),
             Self::ViewingTail(t) => f.debug_tuple("ViewingTail").field(t).finish(),
             Self::OpenForum(c) => f.debug_tuple("OpenForum").field(c).finish(),
+            Self::OpenForumTopic { chat, topic } => f
+                .debug_struct("OpenForumTopic")
+                .field("chat", chat)
+                .field("topic", topic)
+                .finish(),
             Self::CloseForum(c) => f.debug_tuple("CloseForum").field(c).finish(),
             Self::LoadTopics(c) => f.debug_tuple("LoadTopics").field(c).finish(),
             Self::SetPeerFolder { chat, folder } => f
@@ -317,6 +327,43 @@ pub enum HistoryDir {
     Around,
 }
 
+/// Content eligible for system notification delivery.
+#[derive(PartialEq, Eq)]
+pub enum Notice {
+    Message {
+        chat: ChatId,
+        topic: Option<TopicId>,
+        msg: MsgId,
+        chat_title: String,
+        sender: Option<String>,
+        count: u32,
+    },
+    Summary,
+}
+
+impl std::fmt::Debug for Notice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message { count, .. } => f
+                .debug_struct("MessageNotice")
+                .field("count", count)
+                .finish_non_exhaustive(),
+            Self::Summary => f.write_str("SummaryNotice"),
+        }
+    }
+}
+
+impl Notice {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Message {
+                chat_title, sender, ..
+            } => chat_title.capacity() + sender.as_ref().map_or(0, String::capacity),
+            Self::Summary => 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     Auth(AuthState),
@@ -346,6 +393,21 @@ pub enum Event {
     /// moves an unpinned chat to the top of the unpinned section exactly when
     /// `last_id` grew; read-state changes keep `last_id`.
     ChatBumped(ChatSummary),
+    /// A notification candidate, stamped with the account epoch by the event channel.
+    Notify(Notice),
+    /// A confirmed read, including topics whose rows aren't loaded in the app.
+    InboxRead {
+        thread: ThreadKey,
+        max_id: MsgId,
+    },
+    /// Confirmed deletions for notification removal, even outside retained windows.
+    /// An absent chat denotes account-wide message ids and excludes channels.
+    NotifyDeleted {
+        chat: Option<ChatId>,
+        ids: Vec<MsgId>,
+    },
+    /// The app must confirm notification removal before local session deletion.
+    ClearNotifications(NotificationCleanup),
     /// The account's chat folders, in server order, replacing the UI's
     /// copy. Sent after each first dialogs page and whenever they change;
     /// empty after a logout.
@@ -478,6 +540,16 @@ pub enum Event {
     Error(UserError),
 }
 
+/// Acknowledges that both pending and delivered notifications have been cleared.
+#[derive(Debug)]
+pub struct NotificationCleanup(pub(crate) tokio::sync::oneshot::Sender<()>);
+
+impl NotificationCleanup {
+    pub fn complete(self) {
+        let _ = self.0.send(());
+    }
+}
+
 impl Event {
     /// Approximate heap bytes this event retains, for the event byte budget.
     pub fn retained_bytes(&self) -> usize {
@@ -488,6 +560,7 @@ impl Event {
         BASE + match self {
             Event::DialogsReset(v) | Event::DialogsAppended(v) => chats(v),
             Event::ChatBumped(c) => c.retained_bytes(),
+            Event::Notify(n) => n.retained_bytes(),
             Event::ChatFolders(v) => {
                 std::mem::size_of_val(v.as_slice())
                     + v.iter().map(ChatFolder::retained_bytes).sum::<usize>()
@@ -499,7 +572,9 @@ impl Event {
                     + removed.capacity() * std::mem::size_of::<MsgId>()
             }
             Event::Edited(m) => m.retained_bytes(),
-            Event::Deleted { ids, .. } => ids.capacity() * std::mem::size_of::<MsgId>(),
+            Event::Deleted { ids, .. } | Event::NotifyDeleted { ids, .. } => {
+                ids.capacity() * std::mem::size_of::<MsgId>()
+            }
             Event::SendsCovered { sends, .. } => sends.capacity() * std::mem::size_of::<LocalId>(),
             Event::TopicsReset { topics, .. } | Event::TopicsAppended { topics, .. } => {
                 topics.capacity() * std::mem::size_of::<Topic>()

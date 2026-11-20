@@ -28,15 +28,17 @@ const ITEMS: [SecretItem; 4] = [
 ];
 
 /// Storage selected at launch. Changes take effect on the next launch.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SecretStorageConfig {
     /// Private app directory, separate from the erasable message cache.
     pub dir: PathBuf,
     /// Opt in to Keychain storage. Defaults to false in the app.
     pub use_keychain: bool,
+    /// The Keychain namespace paired with this app directory.
+    pub keychain_namespace: super::KeychainNamespace,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct State {
     keychain: bool,
     cleanup: bool,
@@ -107,20 +109,22 @@ impl<S: SecretStore> SwitchingStore<S> {
         let path = self.config.dir.join(FILE);
         let mut state = match read_private(&path).map_err(StoreError::from)? {
             Some(bytes) => decode(&bytes)?,
-            None => {
-                // Legacy versions stored everything in Keychain. Import once;
-                // an unreadable item blocks startup rather than losing it.
-                State {
-                    keychain: self.config.use_keychain || self.keychain.has_items()?,
-                    cleanup: false,
-                    values: Default::default(),
-                }
-            }
+            // Only an existing manifest can authorize a move between stores.
+            // A manifest that is missing while the preference asks for the
+            // Keychain is recreated pointing at it: in that mode the Keychain
+            // is the store of record, and its namespace belongs to this
+            // installation regime and user (review A29). That is a recovery of
+            // the same installation's items, never an import from another
+            // namespace. A missing manifest under the local default stays
+            // empty and never reads the Keychain.
+            None => State {
+                keychain: self.config.use_keychain,
+                cleanup: false,
+                values: Default::default(),
+            },
         };
         self.cleanup(&mut state)?;
         if state.keychain == self.config.use_keychain {
-            // Also establish an authoritative manifest for a legacy Keychain
-            // installation before its first subsequent write or logout.
             self.save(&state)?;
         } else {
             self.migrate(&mut state)?;

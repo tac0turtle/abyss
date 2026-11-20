@@ -50,6 +50,11 @@ pub(super) fn user_error(e: CallError) -> UserError {
 /// The call error an outcome carries, for stall and migration detection.
 fn call_error(outcome: &Outcome) -> Option<CallError> {
     match outcome {
+        // Account loss is handled before applying a settings reply.
+        Outcome::NotifySettings {
+            res: Err(CallError::Timeout),
+            ..
+        } => Some(CallError::Timeout),
         Outcome::Dialogs { res: Err(e), .. }
         | Outcome::PeerDialogs { res: Err(e), .. }
         | Outcome::History { res: Err(e), .. }
@@ -136,8 +141,9 @@ impl Coverage {
 
 impl HistoryReply {
     /// Up to which id a tail is authoritative: the newest id the server sent,
-    /// and the newest the window held when it was requested. Window messages
-    /// above it arrived later and are kept; at or below it, the server decides.
+    /// and the newest seen in the window or awaiting a notice when requested.
+    /// Above it, live messages and notice contributors arrived later and are
+    /// kept. At or below it, within the tail's coverage, the server decides.
     pub(super) fn authoritative_top(&self) -> Option<MsgId> {
         self.covered.map(|c| c.newest).max(self.floor)
     }
@@ -169,12 +175,10 @@ struct HistoryReq {
 impl<B: Backend> Actor<B> {
     pub(super) async fn on_done(&mut self, done: Done) {
         let current = done.cgen == self.cgen;
-        if let Some(permit) = done.parked {
-            // Stale completions only arrive from a retirement, right before its
-            // parked permits are recycled.
-            if current {
-                self.admission.park(permit);
-            }
+        // Stale completions only arrive from a retirement, right before its
+        // parked permits are recycled.
+        if current && let Some(permit) = done.parked {
+            self.admission.park(permit);
         }
         let err = call_error(&done.outcome).filter(|_| current);
         match done.outcome {
@@ -193,12 +197,17 @@ impl<B: Backend> Actor<B> {
                 self.on_folder_write(write, done.cgen, moved, res).await;
             }
             _ if !current => {}
-            Outcome::Dialogs { step, stamps, res } => {
-                self.on_dialogs(step, stamps, res).await;
-                if step == DialogsStep::First {
-                    self.snapshot_done(Snapshot::Dialogs).await;
-                }
-            }
+            Outcome::NotifySettings {
+                target,
+                stamps,
+                res,
+            } => self.on_notify_snapshot(target, stamps.badge, res).await,
+            Outcome::Dialogs {
+                req,
+                step,
+                stamps,
+                res,
+            } => self.on_dialogs(req, step, stamps, res).await,
             Outcome::History {
                 load,
                 dir,
@@ -276,6 +285,7 @@ impl<B: Backend> Actor<B> {
             anchored: self.anchored.take_if(|a| a.load == load),
         };
         let restore = self.restoring.take_if(|l| *l == load).is_some();
+        let applied = res.is_ok() && self.is_current(load.thread, load.view);
         match res {
             Ok(HistoryPage { messages, has_more }) => {
                 // Normalized before anything reads it: coverage, the window
@@ -321,7 +331,7 @@ impl<B: Backend> Actor<B> {
             }
         }
         if boot.is_some() {
-            self.snapshot_done(Snapshot::Tail(load)).await;
+            self.snapshot_done(Snapshot::Tail { load, applied });
         }
     }
 
@@ -351,30 +361,31 @@ impl<B: Backend> Actor<B> {
 
     async fn on_dialogs(
         &mut self,
+        req: ReqId,
         step: DialogsStep,
         stamps: Stamps,
         res: CallResult<DialogsPage>,
     ) {
-        self.dialogs_busy = false;
-        let mut refetch = false;
-        match res {
+        let guard = match res {
             Ok(DialogsPage { mut chats, next }) => {
                 // What the page states about kinds, before the guard.
                 let stated = self.stated(&chats);
                 // Each field keeps a value set after this page was
                 // dispatched (a live folder move, a read, a newer
-                // `peer_dialogs` result). A folder it disagreed with asks
-                // for the first page again; a page that may predate an
-                // evicted unlisted move is dropped, and refetched.
+                // `peer_dialogs` result). A folder or mute disagreement
+                // asks for the first page again; a page that may predate an
+                // evicted unlisted field is dropped and refetched.
                 let guarded = self.guard_snapshot(&mut chats, stamps.badge);
-                refetch = guarded != Guarded::Apply;
                 if guarded == Guarded::Discard {
-                    tracing::debug!("a dialogs page older than an evicted folder move dropped");
+                    tracing::debug!("a dialogs page older than an evicted field update dropped");
                     // Nothing changes; the UI's request is answered, and
                     // the refetch (below) follows.
                     let has_more = !self.dialogs_loaded || self.dialogs_next.is_some();
                     self.emit(Event::DialogsPaging { has_more }).await;
                 } else {
+                    if let Some(boot) = self.boot.as_mut().filter(|b| b.awaits_dialogs(req)) {
+                        boot.note_dialogs(&chats);
+                    }
                     self.apply_dialogs_page(step, chats, next).await;
                     // An authoritative page: it settles queued fences it
                     // postdates and applies a known chat's flag change.
@@ -382,19 +393,16 @@ impl<B: Backend> Actor<B> {
                         self.stated_kind(s, stamps.badge).await;
                     }
                 }
+                Some(guarded)
             }
             Err(e) => {
                 self.error(user_error(e)).await;
                 self.load_ended(LoadTarget::Dialogs, Some(user_error(e)))
                     .await;
+                None
             }
-        }
-        if refetch {
-            self.refetch_first_dialogs().await;
-        }
-        if std::mem::take(&mut self.dialogs_queued) {
-            self.load_dialogs().await;
-        }
+        };
+        self.dialogs_finished(req, guard).await;
     }
 
     /// What a snapshot states about each chat's kind, and what core knew
@@ -425,9 +433,6 @@ impl<B: Backend> Actor<B> {
         };
         let event = match step {
             DialogsStep::First => {
-                if let Some(boot) = self.boot.as_mut() {
-                    boot.note_dialogs(&chats);
-                }
                 // Chats kept from later pages stay provisionally, but
                 // pagination restarts from the fresh cursor: a chat that
                 // appeared below the first page meanwhile is only found by
@@ -469,6 +474,7 @@ impl<B: Backend> Actor<B> {
             return;
         }
         let job = Job::Dialogs {
+            req: self.request_id(),
             cursor: None,
             stamps: Stamps::default(),
         };
@@ -640,7 +646,10 @@ impl<B: Backend> Actor<B> {
         if !self.is_current(thread, view) {
             self.release_history(load);
             if snapshot {
-                self.snapshot_done(Snapshot::Tail(load)).await;
+                self.snapshot_done(Snapshot::Tail {
+                    load,
+                    applied: false,
+                });
             }
             return;
         }
@@ -805,13 +814,16 @@ impl<B: Backend> Actor<B> {
         let Some(w) = self.windows.get(thread) else {
             return;
         };
+        let deleted = super::merge::tail_deletions(w.messages(), &page, range);
         let late = w
             .messages()
             .iter()
             .filter(|m| top.is_none_or(|t| m.id > t))
             .cloned();
         page.messages.extend(late);
+        self.reconcile_notice_tail(thread, range, &page.messages);
         let written = self.write_tail(thread, since, &page, range).await;
+        self.apply_tail_deletions(thread.chat, &deleted).await;
         let Some(view) = self.windows.invalidate(thread) else {
             return;
         };
@@ -894,12 +906,20 @@ impl<B: Backend> Actor<B> {
 
     pub(super) async fn on_update(&mut self, update: Update, origin: Origin<'_>) {
         match update {
-            Update::NewMessage(m) => self.on_new_message(m, origin).await,
+            Update::NewMessage(new) => {
+                let flags = super::notices::Flags::from(&new);
+                self.on_new_message(new.message, flags, new.chat.as_ref(), origin)
+                    .await;
+            }
+            Update::NotifySettings { target, until } => {
+                self.on_notify_settings(target, until).await;
+            }
             Update::Edited(m) => self.on_edited(m).await,
             Update::Deleted {
                 chat: Some(chat),
                 ids,
             } => {
+                self.notify_deleted(Some(chat), &ids).await;
                 // Deleting an unread message changes the server's counts,
                 // and no read update may follow (plan section 6.3).
                 self.badge_trigger(chat).await;
@@ -910,6 +930,7 @@ impl<B: Backend> Actor<B> {
                 }
             }
             Update::Deleted { chat: None, ids } => {
+                self.notify_deleted(None, &ids).await;
                 let removed = self.windows.delete_unscoped(&ids);
                 self.cache_write(CacheCmd::DeleteUnscoped(ids)).await;
                 for (chat, ids) in removed {
@@ -921,15 +942,33 @@ impl<B: Backend> Actor<B> {
                 topic: None,
                 still_unread,
                 max_id,
-            } => self.chat_read(chat, still_unread, max_id).await,
+            } => {
+                self.notify_inbox_read(ThreadKey::whole(chat), max_id).await;
+                self.chat_read(chat, still_unread, max_id).await;
+            }
             // Topic reads on another device: the topics were triggered when
             // received (`topics::topics_on_update`); the badge refreshes.
             Update::ReadInbox {
                 chat,
-                topic: Some(_),
+                topic: Some(topic),
+                max_id,
                 ..
             }
-            | Update::ReadTopicMax { chat, .. } => self.badge_trigger(chat).await,
+            | Update::ReadTopicMax {
+                chat,
+                topic,
+                max_id,
+            } => {
+                self.notify_inbox_read(
+                    ThreadKey {
+                        chat,
+                        topic: Some(topic),
+                    },
+                    max_id,
+                )
+                .await;
+                self.badge_trigger(chat).await;
+            }
             Update::MessageId { random_id, id } => self.on_message_id(random_id, id).await,
             // Topic edits and pins reached the retained topic lists when
             // they were received (`topics::topics_on_update`).
@@ -1002,8 +1041,19 @@ impl<B: Backend> Actor<B> {
 
     /// A new message bumps its chat; routed to a thread, it also reaches
     /// that thread's window and, under the continuity gate, its cache.
-    async fn on_new_message(&mut self, m: Message, origin: Origin<'_>) {
+    async fn on_new_message(
+        &mut self,
+        m: Message,
+        flags: super::notices::Flags,
+        peer: Option<&(crate::model::ChatKind, String)>,
+        origin: Origin<'_>,
+    ) {
         let (route, m) = self.route_live(m);
+        if origin.notify {
+            self.consider_notice(&m, route, flags, peer);
+        } else {
+            self.remember_replayed_notice(&m, flags);
+        }
         let thread = match route {
             Route::Thread(key) => Some(key),
             Route::ForumSuspected(chat) => {
@@ -1019,7 +1069,11 @@ impl<B: Backend> Actor<B> {
         if forum && !m.outgoing {
             self.badge_trigger(chat).await;
         }
-        let unread = if forum || m.outgoing || thread.is_some_and(|t| self.tail_visible(t)) {
+        let unread = if origin.source == super::boot::Source::CatchUp
+            || forum
+            || m.outgoing
+            || thread.is_some_and(|t| self.tail_visible(t))
+        {
             Unread::Unchanged
         } else {
             Unread::Increment
@@ -1027,10 +1081,10 @@ impl<B: Backend> Actor<B> {
         // A replayed message the dialogs snapshot already reflects (by top
         // message id, not by timestamp) must not bump the chat again and count
         // as unread twice. `Dialogs::bump` applies the same rule live.
-        let reflected = match origin {
-            Origin::Live => false,
-            Origin::Replay(tops) => tops.get(&chat).is_some_and(|top| *top >= m.id),
-        };
+        let reflected = origin
+            .tops
+            .and_then(|tops| tops.get(&chat))
+            .is_some_and(|top| *top >= m.id);
         if !reflected && let Bump::Updated(summary) = self.dialogs.bump(chat, Last::of(&m), unread)
         {
             if unread == Unread::Increment {

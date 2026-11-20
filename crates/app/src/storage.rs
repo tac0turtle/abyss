@@ -1,17 +1,24 @@
-//! Where the encrypted message cache lives (plan section 16, tasks 9b, 9c).
+//! Where the encrypted message cache lives (plan section 16, tasks 9b, 9c;
+//! Stage 3 plan section 2.2).
 //!
-//! - **Real backend:** `<home>/Library/Application Support/dev.abyss/cache`.
-//!   `dev.abyss` is the app id, the same namespace as the Keychain items
-//!   (`dev.abyss.session`, `dev.abyss.cachekey`). The home directory is the
-//!   user database's (`getpwuid_r` for the real uid), not `HOME`, so the
-//!   environment cannot point the cache elsewhere; it must be absolute, and
-//!   `Library/Application Support` under it must already exist.
+//! - **Real backend:** `<support>/dev.abyss/cache`, where `<support>` is the
+//!   user's Application Support directory from [`support_dir`]
+//!   (`NSFileManager URLsForDirectory:inDomains:`). Foundation resolves the
+//!   directory through the user database and, in the App Sandbox, the
+//!   container, never through `HOME`. It must be absolute and already exist.
+//! - **Two regimes.** The bundle runs sandboxed, so `<support>` is
+//!   `~/Library/Containers/dev.abyss/Data/Library/Application Support`. A bare
+//!   `cargo dev` or `cargo run` binary is not sandboxed and gets the real
+//!   `~/Library/Application Support`. Each regime has its own Keychain
+//!   namespace. If a key remains after its database is removed, core opens
+//!   a new cache (`a_keychain_key_with_no_database_...`).
 //! - **`--fake`:** no cache, unless `ABYSS_FAKE_CACHE=1`. Then each run gets
 //!   a fresh directory `$TMPDIR/dev.abyss.fake/run-<pid>-<nanos>/cache`,
 //!   created exclusively, so a fake run never adopts existing files (such as
 //!   a `cache.db` symlink planted there). A `TMPDIR` that resolves inside the
-//!   real app directory is refused. The fake keeps its key in memory, so the
-//!   opt-in exercises open, bind, writes and the exit drain under the real
+//!   real app directory is refused. Fake runs are dev runs and stay
+//!   unsandboxed. The fake keeps its key in memory, so the opt-in exercises
+//!   open, bind, writes and the exit drain under the real
 //!   GPUI quit, not persistence (tested in core,
 //!   `cached_history_survives_a_core_restart`).
 //!
@@ -23,7 +30,7 @@
 //! `SQLITE_OPEN_NOFOLLOW`. A failure is logged and the run continues without
 //! a cache; it never blocks login. Paths are never logged (plan section 11).
 //!
-//! **Threat model.** The home directory and Application Support are trusted:
+//! **Threat model.** The user's Application Support (or the container) is trusted:
 //! they belong to the user, and no hostile process runs as the same uid (one
 //! that did could read the Keychain item's owner's memory anyway). The checks
 //! here catch mistakes and stale or planted state from *other* users or
@@ -41,7 +48,7 @@ use std::path::{Path, PathBuf};
 use abyss_core::CacheConfig;
 
 /// The app id: the directory in Application Support.
-const APP_ID: &str = "dev.abyss";
+pub(crate) const APP_ID: &str = "dev.abyss";
 /// The fake's directory under `TMPDIR`; never [`APP_ID`].
 #[cfg(feature = "fake")]
 const FAKE_APP_ID: &str = "dev.abyss.fake";
@@ -58,8 +65,6 @@ pub(crate) const TMPDIR_VAR: &str = "TMPDIR";
 pub(crate) const FAKE_CACHE_VAR: &str = "ABYSS_FAKE_CACHE";
 /// The private mode of every directory we create.
 const PRIVATE: u32 = 0o700;
-/// Upper bound on the `getpwuid_r` buffer (doubling from 1 KiB).
-const MAX_PW_BUF: usize = 64 * 1024;
 
 /// Where a cache goes: an existing root, and the directories created below
 /// it (app id, a fake's run, then cache).
@@ -81,13 +86,14 @@ struct FakeRun {
 }
 
 impl CacheLocation {
-    /// The real backend's cache, under `home` (from [`home_dir`]).
-    pub(crate) fn real(home: Option<PathBuf>) -> Result<Self, StorageError> {
-        let home = home
-            .filter(|h| h.is_absolute())
-            .ok_or(StorageError::NoHome)?;
+    /// The real backend's cache, under `support`, the Application Support
+    /// directory from [`support_dir`] (the container's when sandboxed).
+    pub(crate) fn real(support: Option<PathBuf>) -> Result<Self, StorageError> {
+        let support = support
+            .filter(|s| s.is_absolute())
+            .ok_or(StorageError::NoRoot)?;
         Ok(Self {
-            root: application_support(&home),
+            root: support,
             app: APP_ID,
             #[cfg(feature = "fake")]
             fake: None,
@@ -95,14 +101,14 @@ impl CacheLocation {
     }
 
     /// The fake's cache: `None` unless `enabled` is exactly `1`, or without
-    /// an absolute `tmpdir`. `home` locates the real tree to stay out of;
-    /// without it isolation can't be checked, so there is no fake cache
-    /// (round 29).
+    /// an absolute `tmpdir`. `support` is the real Application Support, which
+    /// locates the real tree to stay out of; without it isolation can't be
+    /// checked, so there is no fake cache (round 29).
     #[cfg(feature = "fake")]
     pub(crate) fn fake(
         enabled: Option<&std::ffi::OsStr>,
         tmpdir: Option<std::ffi::OsString>,
-        home: Option<PathBuf>,
+        support: Option<PathBuf>,
     ) -> Option<Self> {
         if enabled != Some(std::ffi::OsStr::new("1")) {
             return None;
@@ -114,8 +120,10 @@ impl CacheLocation {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let Ok(real) = Self::real(home) else {
-            tracing::warn!("{FAKE_CACHE_VAR} is set but the home directory is unknown; no cache");
+        let Ok(real) = Self::real(support) else {
+            tracing::warn!(
+                "{FAKE_CACHE_VAR} is set but the Application Support directory is unknown; no cache"
+            );
             return None;
         };
         let real_app = real.app_dir();
@@ -149,71 +157,53 @@ impl CacheLocation {
     }
 }
 
-/// The app's directory in Application Support, under the home directory
-/// from [`home_dir`]: the one place its path is built. The theme, colourway,
+/// The app's directory in Application Support, under the root from
+/// [`support_dir`]: the one place its path is built. The theme, colourway,
 /// sidebar and Keychain-preference files live in it, and the real cache below
 /// it.
 pub(crate) fn app_dir() -> Option<PathBuf> {
-    home_dir().map(|home| app_dir_in(&home))
+    support_dir().map(|support| support.join(APP_ID))
 }
 
-/// The app's directory under `home`.
-pub(crate) fn app_dir_in(home: &Path) -> PathBuf {
-    application_support(home).join(APP_ID)
+/// Select the bundle's storage even if the full notification guard fails.
+#[cfg(target_os = "macos")]
+pub(crate) fn has_app_bundle_id() -> bool {
+    objc2_foundation::NSBundle::mainBundle()
+        .bundleIdentifier()
+        .is_some_and(|id| id.to_string() == APP_ID)
 }
 
-/// `Library/Application Support` under `home`: the root of both the app's
-/// directory and the real cache's location.
-fn application_support(home: &Path) -> PathBuf {
-    home.join("Library").join("Application Support")
-}
-
-/// The user's home directory from the user database (`getpwuid_r` for the
-/// real uid), or `None`. `HOME` is not consulted.
-pub(crate) fn home_dir() -> Option<PathBuf> {
-    // SAFETY: `getuid` has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    let mut len = 1024;
-    while len <= MAX_PW_BUF {
-        match lookup_home(uid, len) {
-            Err(libc::ERANGE) => len = len.saturating_mul(2),
-            Ok(home) => return home.filter(|h| h.is_absolute()),
-            Err(_) => return None,
-        }
+/// The user's Application Support directory, or `None`: the container's
+/// `Library/Application Support` when the process is sandboxed, the real one
+/// when it is not. Foundation answers from the user database and the
+/// container, so `HOME` is not consulted. The path is absolute; it is not
+/// created or checked here ([`prepare`] checks everything below it).
+#[cfg(target_os = "macos")]
+pub(crate) fn support_dir() -> Option<PathBuf> {
+    use objc2_foundation::{NSFileManager, NSSearchPathDirectory, NSSearchPathDomainMask};
+    let urls = NSFileManager::defaultManager().URLsForDirectory_inDomains(
+        NSSearchPathDirectory::ApplicationSupportDirectory,
+        NSSearchPathDomainMask::UserDomainMask,
+    );
+    let url = urls.firstObject()?;
+    if !url.isFileURL() {
+        return None;
     }
+    let path = PathBuf::from(url.path()?.to_string());
+    path.is_absolute().then_some(path)
+}
+
+/// Only macOS has the lookup; elsewhere there is no cache.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn support_dir() -> Option<PathBuf> {
     None
-}
-
-/// One `getpwuid_r` call with a `len`-byte buffer: the errno on failure.
-fn lookup_home(uid: libc::uid_t, len: usize) -> Result<Option<PathBuf>, i32> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut buf: Vec<libc::c_char> = vec![0; len];
-    // SAFETY: `passwd` is plain data (integers and pointers), so all zero
-    // bytes are a valid value; `getpwuid_r` overwrites it.
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut found: *mut libc::passwd = std::ptr::null_mut();
-    // SAFETY: every pointer is valid for the call: `pwd` and `found` are
-    // live locals, and `buf` is a live buffer of exactly `len` bytes.
-    let rc = unsafe { libc::getpwuid_r(uid, &raw mut pwd, buf.as_mut_ptr(), len, &raw mut found) };
-    if rc != 0 {
-        return Err(rc);
-    }
-    if found.is_null() || pwd.pw_dir.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: on success `pw_dir` points to a NUL-terminated string inside
-    // `buf`, which outlives this borrow.
-    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
-    Ok(Some(PathBuf::from(std::ffi::OsStr::from_bytes(
-        dir.to_bytes(),
-    ))))
 }
 
 /// Why there is no cache this run. Names a component, never a path.
 #[derive(Debug)]
 pub(crate) enum StorageError {
-    /// No absolute home directory.
-    NoHome,
+    /// No absolute Application Support directory.
+    NoRoot,
     /// The root is missing or not a directory.
     Root(io::Error),
     /// A fake root inside the real app directory.
@@ -235,7 +225,7 @@ pub(crate) enum StorageError {
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoHome => f.write_str("no absolute home directory"),
+            Self::NoRoot => f.write_str("no absolute Application Support directory"),
             Self::Root(e) => write!(f, "the cache's parent directory is unusable: {e}"),
             #[cfg(feature = "fake")]
             Self::Overlap => f.write_str("the fake cache would be inside the real one"),

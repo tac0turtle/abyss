@@ -18,7 +18,7 @@ async fn overflow(h: &Harness, chat: ChatId, round: i32) {
         let topic = 1000 * (round + 1) + i;
         let mut m = message_in(topic_key(chat, topic), 100_000 * (round + 1) + i, "x");
         m.date = NOW;
-        h.fake.push_update(Update::NewMessage(m)).await;
+        h.fake.push_update(Update::NewMessage(m.into())).await;
     }
 }
 

@@ -8,12 +8,19 @@
 //!   lies on a UTF-8 char boundary;
 //! - every `Run::link` indexes into `links`.
 //!
-//! Inputs exceeding the processing budget degrade to unformatted text.
+//! Inputs exceeding the processing budget degrade to unformatted text, but
+//! never to revealed spoilers: spoiler ranges are kept independently of every
+//! other formatting, and when they cannot be established the whole text is
+//! hidden as one spoiler instead (see [`RichText::from_entities`]).
 
 /// Maximum rendered text, in bytes. Longer text is truncated at a char boundary.
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
 /// Maximum number of entities processed per message.
 pub const MAX_ENTITIES: usize = 256;
+/// What stands for hidden spoiler text wherever a message is quoted or
+/// summarised: a reply's quote, the chat list, and a screen reader. (Banners
+/// carry no message text at all, D10.)
+pub const SPOILER_EXCERPT: &str = "Hidden spoiler";
 /// Maximum number of link entities per message.
 pub const MAX_LINKS: usize = 64;
 /// Maximum aggregate bytes of hidden link targets (`TextUrl`) per message.
@@ -119,19 +126,40 @@ impl RichText {
 
     /// Validates `entities` against `text` and produces a disjoint run partition.
     /// Invalid entities are dropped; over-budget input degrades to plain text.
+    ///
+    /// Spoilers are the exception to both: a hidden range must never become
+    /// readable because something else was dropped. They are resolved apart
+    /// from the other entities, so an over-budget text, entity list or link
+    /// set keeps them, and a range that does not land on character boundaries
+    /// widens to the nearest ones. When the spoilers themselves cannot be
+    /// established (more than [`MAX_ENTITIES`] of them, or one with a negative
+    /// offset or length) the whole text is one spoiler: redacted, not shown.
     pub fn from_entities(text: &str, entities: &[RawEntity]) -> Self {
-        if text.len() > MAX_TEXT_BYTES || entities.len() > MAX_ENTITIES {
-            return Self::plain(text);
+        let kept = clamp_to_boundary(text, MAX_TEXT_BYTES);
+        let map = Utf16Map::new(kept);
+        let Some(mut spans) = spoiler_spans(entities, &map) else {
+            return Self::all_hidden(kept);
+        };
+        let over_budget = text.len() > MAX_TEXT_BYTES || entities.len() > MAX_ENTITIES;
+        if over_budget {
+            return build(kept, &spans);
         }
-        let map = Utf16Map::new(text);
-        let spans: Vec<Span<'_>> = entities
-            .iter()
-            .filter_map(|e| Span::resolve(e, &map))
-            .collect();
+        let spoilers = spans.len();
+        spans.extend(entities.iter().filter_map(|e| Span::resolve(e, &map)));
         if !links_within_budget(&spans) {
-            return Self::plain(text);
+            spans.truncate(spoilers);
         }
         build(text, &spans)
+    }
+
+    /// The whole text as one spoiler: what a message becomes when its spoiler
+    /// ranges cannot be established. Revealing it is the reader's choice.
+    pub(crate) fn all_hidden(text: &str) -> Self {
+        let mut rt = Self::plain(text);
+        for run in &mut rt.runs {
+            run.style = run.style.union(Style::SPOILER);
+        }
+        rt
     }
 
     pub fn text(&self) -> &str {
@@ -140,6 +168,33 @@ impl RichText {
 
     pub fn runs(&self) -> &[Run] {
         &self.runs
+    }
+
+    /// The one excerpt every surface that quotes or summarises this text must
+    /// use: the text with each spoiler (adjacent spoiler runs are one) replaced
+    /// by [`SPOILER_EXCERPT`]. A spoiler stays hidden here even once the
+    /// message itself was revealed: an excerpt has nothing to click.
+    pub fn excerpt(&self) -> std::borrow::Cow<'_, str> {
+        if !self.runs.iter().any(|r| r.style.contains(Style::SPOILER)) {
+            return std::borrow::Cow::Borrowed(&self.text);
+        }
+        let mut out = String::with_capacity(self.text.len());
+        let mut pos = 0usize;
+        let mut hiding = false;
+        for run in &self.runs {
+            let end = pos.saturating_add(run.len);
+            if run.style.contains(Style::SPOILER) {
+                if !hiding {
+                    out.push_str(SPOILER_EXCERPT);
+                }
+                hiding = true;
+            } else {
+                hiding = false;
+                out.push_str(self.text.get(pos..end).unwrap_or_default());
+            }
+            pos = end;
+        }
+        std::borrow::Cow::Owned(out)
     }
 
     pub fn links(&self) -> &[LinkTarget] {
@@ -259,6 +314,25 @@ impl Utf16Map {
     fn byte(&self, utf16: usize) -> Option<usize> {
         self.byte_at.get(utf16).copied().flatten()
     }
+
+    /// The text's length in UTF-16 code units.
+    fn len16(&self) -> usize {
+        self.byte_at.len().saturating_sub(1)
+    }
+
+    /// The byte offset at `utf16`, or at the character boundary before it when
+    /// it falls inside a surrogate pair.
+    fn byte_floor(&self, utf16: usize) -> Option<usize> {
+        self.byte(utf16)
+            .or_else(|| self.byte(utf16.checked_sub(1)?))
+    }
+
+    /// The byte offset at `utf16`, or at the character boundary after it when
+    /// it falls inside a surrogate pair.
+    fn byte_ceil(&self, utf16: usize) -> Option<usize> {
+        self.byte(utf16)
+            .or_else(|| self.byte(utf16.checked_add(1)?))
+    }
 }
 
 /// A validated entity in byte coordinates.
@@ -291,11 +365,12 @@ impl<'a> Span<'a> {
             EntityKind::Strike => (Style::STRIKE, None),
             EntityKind::Code => (Style::CODE, None),
             EntityKind::Pre => (Style::PRE, None),
-            EntityKind::Spoiler => (Style::SPOILER, None),
             EntityKind::Mention => (Style::MENTION, None),
             EntityKind::Url => (Style::default(), Some(SpanLink::Visible)),
             EntityKind::TextUrl(url) => (Style::default(), Some(SpanLink::Hidden(url))),
-            EntityKind::Other => return None,
+            // Spoilers are resolved apart, by `spoiler_spans`, so that no
+            // budget can drop one.
+            EntityKind::Spoiler | EntityKind::Other => return None,
         };
         Some(Span {
             start,
@@ -304,6 +379,35 @@ impl<'a> Span<'a> {
             link,
         })
     }
+}
+
+/// Every spoiler entity as a byte span, widened outward to character
+/// boundaries and clamped to the text. `None` when they cannot be established:
+/// more than [`MAX_ENTITIES`] of them, or one with a negative offset or
+/// length. A spoiler that is empty or starts past the text hides nothing and is
+/// skipped. The scan is linear in `entities` and keeps at most `MAX_ENTITIES`.
+fn spoiler_spans<'a>(entities: &[RawEntity], map: &Utf16Map) -> Option<Vec<Span<'a>>> {
+    let mut spans = Vec::new();
+    for e in entities.iter().filter(|e| e.kind == EntityKind::Spoiler) {
+        let start16 = usize::try_from(e.offset).ok()?;
+        let len16 = usize::try_from(e.length).ok()?;
+        if len16 == 0 || start16 >= map.len16() {
+            continue;
+        }
+        if spans.len() >= MAX_ENTITIES {
+            return None;
+        }
+        let end16 = start16.saturating_add(len16).min(map.len16());
+        let start = map.byte_floor(start16)?;
+        let end = map.byte_ceil(end16)?;
+        spans.push(Span {
+            start,
+            end,
+            style: Style::SPOILER,
+            link: None,
+        });
+    }
+    Some(spans)
 }
 
 /// Builds the run partition. `spans` is bounded by `MAX_ENTITIES`, so the
@@ -694,5 +798,170 @@ mod accounting_tests {
             rt.retained_bytes()
                 >= rt.text.capacity() + rt.runs.capacity() * std::mem::size_of::<Run>()
         );
+    }
+}
+
+#[cfg(test)]
+mod excerpt_tests {
+    use super::*;
+
+    const SENTINEL: &str = "hunter2-sentinel";
+
+    fn spoiler(text: &str, from: &str, kind: &[EntityKind]) -> RichText {
+        let offset = text.find(from).unwrap();
+        let entities: Vec<RawEntity> = kind
+            .iter()
+            .map(|k| RawEntity {
+                offset: i32::try_from(text[..offset].encode_utf16().count()).unwrap(),
+                length: i32::try_from(from.encode_utf16().count()).unwrap(),
+                kind: k.clone(),
+            })
+            .collect();
+        RichText::from_entities(text, &entities)
+    }
+
+    #[test]
+    fn plain_text_is_borrowed_unchanged() {
+        let rt = RichText::plain("hello");
+        assert!(matches!(rt.excerpt(), std::borrow::Cow::Borrowed("hello")));
+    }
+
+    #[test]
+    fn a_spoiler_is_replaced_and_its_text_never_appears() {
+        let text = format!("the code is {SENTINEL} ok");
+        let rt = spoiler(&text, SENTINEL, &[EntityKind::Spoiler]);
+        assert_eq!(rt.excerpt(), format!("the code is {SPOILER_EXCERPT} ok"));
+    }
+
+    #[test]
+    fn overlapping_styles_and_links_under_a_spoiler_are_one_placeholder() {
+        let text = format!("x {SENTINEL} y");
+        let rt = spoiler(
+            &text,
+            SENTINEL,
+            &[
+                EntityKind::Spoiler,
+                EntityKind::Bold,
+                EntityKind::TextUrl("https://example.test/".into()),
+            ],
+        );
+        let excerpt = rt.excerpt();
+        assert_eq!(excerpt, format!("x {SPOILER_EXCERPT} y"));
+        assert!(!excerpt.contains(SENTINEL));
+    }
+
+    #[test]
+    fn a_wholly_spoilered_text_is_only_the_placeholder() {
+        let rt = spoiler(SENTINEL, SENTINEL, &[EntityKind::Spoiler]);
+        assert_eq!(rt.excerpt(), SPOILER_EXCERPT);
+    }
+
+    fn raw(offset: i32, length: i32, kind: EntityKind) -> RawEntity {
+        RawEntity {
+            offset,
+            length,
+            kind,
+        }
+    }
+
+    /// The text `SENTINEL` hidden in `prefix SENTINEL suffix`, plus `extra`.
+    fn hidden_among(extra: &[RawEntity]) -> (String, Vec<RawEntity>) {
+        let text = format!("pre {SENTINEL} post{}", " x".repeat(MAX_ENTITIES + 2));
+        let start = i32::try_from("pre ".len()).unwrap();
+        let len = i32::try_from(SENTINEL.len()).unwrap();
+        let mut entities = vec![raw(start, len, EntityKind::Spoiler)];
+        entities.extend_from_slice(extra);
+        (text, entities)
+    }
+
+    fn assert_hidden(rt: &RichText) {
+        let excerpt = rt.excerpt();
+        assert!(!excerpt.contains(SENTINEL), "revealed: {excerpt}");
+        assert!(excerpt.contains(SPOILER_EXCERPT));
+    }
+
+    #[test]
+    fn a_spoiler_survives_too_many_entities() {
+        let bold: Vec<RawEntity> = (0..=MAX_ENTITIES)
+            .map(|i| raw(i32::try_from(i + 40).unwrap(), 1, EntityKind::Bold))
+            .collect();
+        let (text, entities) = hidden_among(&bold);
+        assert!(entities.len() > MAX_ENTITIES);
+        let rt = RichText::from_entities(&text, &entities);
+        assert_hidden(&rt);
+        assert!(
+            rt.excerpt()
+                .starts_with(&format!("pre {SPOILER_EXCERPT} post"))
+        );
+    }
+
+    #[test]
+    fn a_spoiler_survives_too_many_links_and_an_oversized_link_target() {
+        let urls: Vec<RawEntity> = (0..=MAX_LINKS)
+            .map(|i| raw(i32::try_from(i + 40).unwrap(), 1, EntityKind::Url))
+            .collect();
+        let (text, entities) = hidden_among(&urls);
+        let rt = RichText::from_entities(&text, &entities);
+        assert!(rt.links().is_empty(), "the links are over budget");
+        assert_hidden(&rt);
+
+        let huge = EntityKind::TextUrl("h".repeat(MAX_URL_BYTES + 1));
+        let (text, entities) = hidden_among(&[raw(40, 2, huge)]);
+        let rt = RichText::from_entities(&text, &entities);
+        assert!(rt.links().is_empty());
+        assert_hidden(&rt);
+    }
+
+    #[test]
+    fn a_spoiler_survives_an_oversized_text_and_is_clamped_at_the_cut() {
+        let (text, entities) = hidden_among(&[]);
+        let long = format!("{text}{}", "y".repeat(MAX_TEXT_BYTES));
+        let rt = RichText::from_entities(&long, &entities);
+        assert_eq!(rt.text().len(), MAX_TEXT_BYTES);
+        assert_hidden(&rt);
+
+        // A spoiler that starts before the cut and ends after it hides to the cut.
+        let secret = format!("{}{SENTINEL}", "a".repeat(MAX_TEXT_BYTES - 4));
+        let len = i32::try_from(secret.len()).unwrap();
+        let rt = RichText::from_entities(&secret, &[raw(0, len, EntityKind::Spoiler)]);
+        assert_eq!(rt.excerpt(), SPOILER_EXCERPT);
+    }
+
+    #[test]
+    fn spoilers_that_cannot_be_established_hide_the_whole_text() {
+        let many: Vec<RawEntity> = (0..=MAX_ENTITIES)
+            .map(|i| raw(i32::try_from(i).unwrap(), 1, EntityKind::Spoiler))
+            .collect();
+        let text = format!("{SENTINEL}{}", "z".repeat(MAX_ENTITIES));
+        for entities in [
+            many,
+            vec![raw(-1, 3, EntityKind::Spoiler)],
+            vec![raw(2, -1, EntityKind::Spoiler)],
+        ] {
+            let rt = RichText::from_entities(&text, &entities);
+            assert_eq!(rt.text(), text);
+            assert_eq!(rt.excerpt(), SPOILER_EXCERPT, "{entities:?}");
+            assert!(rt.runs().iter().all(|r| r.style.contains(Style::SPOILER)));
+        }
+    }
+
+    #[test]
+    fn a_spoiler_inside_a_surrogate_pair_widens_to_the_whole_character() {
+        // "a😀b": the pair is units 1..3. A spoiler over unit 2 only must still
+        // hide the emoji, and one ending at unit 2 must too.
+        for (offset, length) in [(2, 1), (0, 2), (2, 2)] {
+            let rt =
+                RichText::from_entities("a\u{1F600}b", &[raw(offset, length, EntityKind::Spoiler)]);
+            assert!(!rt.excerpt().contains('\u{1F600}'), "{offset}+{length}");
+        }
+        // An empty spoiler, or one past the end, hides nothing and changes nothing.
+        let rt = RichText::from_entities(
+            "abc",
+            &[
+                raw(1, 0, EntityKind::Spoiler),
+                raw(9, 2, EntityKind::Spoiler),
+            ],
+        );
+        assert_eq!(rt.excerpt(), "abc");
     }
 }

@@ -668,7 +668,7 @@ Manual checks remaining: scroll smoothness with 1,000 dialogs (`--fake` seeds 1,
 - `rich.rs`: `RichText` spans become `TextRun`s for `StyledText::with_runs`, each run as long as its own piece, so the partition is exact by construction; a malformed one falls back to plain text rather than panicking. Bold, italic, underline, strike, code/pre (monospace with background), mention (colored), spoiler (hidden until clicked, per message, bounded set). Links render as text; a hidden `TextUrl` target is appended as ` (target)`, sanitized and cut at 256 bytes. Clicking a link copies the exact target to the clipboard and shows "Link copied"; nothing opens a browser. Tests: per-feature cases, a 2,000-case generated partition fuzz (surrogate-splitting and out-of-range offsets), and the headless `with_runs` render through `InteractiveText` in `TestAppContext`.
 - Rows show sender names in groups, day separators, time, an "edited" marker, service messages, reply quotes, and inert media chips (kind, file name, size); nothing is downloaded.
 - `sends.rs`: composer submit sends `SendText` with a UI-allocated `LocalId` and shows an echo row (at most 256) showing Sending, Sent, Sent unconfirmed, Not sent (Failed) or Not sure it was sent (Unknown). Failed and Unknown get Retry (`RetrySend`) and Discard (`DiscardSend`). A Sent echo leaves when its server id appears in the window; SentUnconfirmed and older Sent echoes leave when a new tail arrives. A full command queue shows Busy and keeps the composer text.
-- Mark read: after each frame, the newest message row inside the viewport is found; `MarkRead` is sent when it is above the last sent mark and the window is active.
+- Mark read: after each frame, the newest message row inside the viewport is found; `MarkRead` is sent when it is above the last sent mark and the window is active and no modal overlay covers the pane (Stage 3 §3.4).
 - Window activation sends `Command::Window(Active/Inactive)`; GPUI's `on_system_wake` calls `CoreHandle::notify_wake()` (new defaulted `CoreLink::notify_wake`).
 - `demo.rs` (`--fake`): 1,000 dialogs of every kind and a 2,000-message "Formatting showcase" chat (entities, emoji, RTL, 4,100-char text, every media kind, service, unsupported, edits).
 
@@ -824,7 +824,7 @@ Manual checks remaining (task 12):
 - IME behavior in the masked `api_hash` field.
 
 Open items:
-- The `api_hash` `TextInput` holds a plain `String` that is not zeroized. The platform `text_for_range` may expose the unmasked text to IME and accessibility. Use a `SecretBuf`-style input like `PasswordInput` when the design pass touches it.
+- The `api_hash` `TextInput` holds a plain `String` that is not zeroized. The platform `text_for_range` may expose the unmasked text to IME and accessibility. Use a `SecretBuf`-style input like `PasswordInput` when the design pass touches it. **Resolved in Stage 3 task 4** (stage-3.md section 4.1): the `api_hash` field now uses the zeroizing `PasswordInput`, and IME and accessibility get only bullets, even while the hash is shown on screen.
 - Log out has no confirmation, even though it deletes local data.
 
 **Task 4c status (2026-11-16): round 9 re-check fixes to the core actor, done against the fake.** Regression tests are in `crates/core/src/actor/tests/review4c.rs` unless noted; findings 1–4 fail on the old code (checked by reverting each fix), finding 5 fills a test gap.

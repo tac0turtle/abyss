@@ -40,6 +40,10 @@ pub(crate) trait EventSource {
     fn poll_recv(&mut self, task: &mut task::Context<'_>) -> Poll<Option<Event>>;
     /// An already queued event, without waiting.
     fn try_recv(&mut self) -> Option<Event>;
+    /// The stamp of the event just taken, even when a batch spans a logout.
+    fn account_epoch(&self) -> u64 {
+        0
+    }
 }
 
 impl CoreLink for CoreSender {
@@ -65,6 +69,10 @@ impl EventSource for CoreEvents {
     fn try_recv(&mut self) -> Option<Event> {
         CoreEvents::try_recv(self)
     }
+
+    fn account_epoch(&self) -> u64 {
+        CoreEvents::account_epoch(self)
+    }
 }
 
 /// The UI's command link to core, shared by the views that send commands. It
@@ -73,19 +81,19 @@ pub(crate) type SharedCore = Rc<RefCell<Box<dyn CoreLink>>>;
 
 /// Receives batches of events on the main thread.
 pub(crate) trait EventSink: 'static + Sized {
-    fn apply(&mut self, events: Vec<Event>, window: &mut Window, cx: &mut Context<'_, Self>);
+    fn apply(&mut self, events: Vec<(u64, Event)>, window: &mut Window, cx: &mut Context<'_, Self>);
     /// Core's event stream ended.
     fn core_stopped(&mut self, window: &mut Window, cx: &mut Context<'_, Self>);
 }
 
 /// The first event plus whatever else is already queued, up to [`DRAIN_MAX`].
-pub(crate) fn drain(events: &mut dyn EventSource, first: Event) -> Vec<Event> {
+pub(crate) fn drain(events: &mut dyn EventSource, first: Event) -> Vec<(u64, Event)> {
     // Most wakes carry one or two events; the batch grows up to DRAIN_MAX.
     let mut batch = Vec::with_capacity(16);
-    batch.push(first);
+    batch.push((events.account_epoch(), first));
     while batch.len() < DRAIN_MAX {
         match events.try_recv() {
-            Some(event) => batch.push(event),
+            Some(event) => batch.push((events.account_epoch(), event)),
             None => break,
         }
     }

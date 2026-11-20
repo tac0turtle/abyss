@@ -2,7 +2,7 @@
 //!
 //! Attributes on every item, and why:
 //! - `kSecClassGenericPassword`, service `<namespace>.session` or
-//!   `<namespace>.cachekey` (`dev.abyss.*` in production), account `abyss`:
+//!   `<namespace>.cachekey` (separate bundle and bare namespaces), account `abyss`:
 //!   one fixed item per secret, so a write replaces and a delete removes
 //!   exactly that item.
 //! - `kSecAttrSynchronizable = false`, set on writes **and** queries: the item
@@ -40,7 +40,7 @@ use security_framework_sys::keychain_item::{
 };
 use zeroize::Zeroizing;
 
-use super::{SecretItem, SecretStore, StoreError};
+use super::{KeychainNamespace, SecretItem, SecretStore, StoreError};
 
 // SAFETY: these are the documented immutable `CFStringRef` constants exported
 // by Security.framework (macOS 10.15+, below our deployment target). The
@@ -59,12 +59,10 @@ unsafe extern "C" {
     safe static kSecUseDataProtectionKeychain: CFStringRef;
     safe static kSecValueData: CFStringRef;
     safe static kSecReturnData: CFStringRef;
+    #[cfg(test)]
     safe static kSecReturnAttributes: CFStringRef;
-    safe static kSecUseAuthenticationUI: CFStringRef;
-    safe static kSecUseAuthenticationUIFail: CFStringRef;
 }
 
-const PRODUCTION_NAMESPACE: &str = "dev.abyss";
 const ACCOUNT: &str = "abyss";
 
 /// Which macOS keychain holds the items.
@@ -92,10 +90,9 @@ impl Default for KeychainStore {
 }
 
 impl KeychainStore {
-    /// Production items `dev.abyss.session` and `dev.abyss.cachekey` in the
-    /// login keychain.
+    /// Bare installation items in the login keychain.
     pub fn new() -> Self {
-        Self::with_namespace(PRODUCTION_NAMESPACE, KeychainLocation::File)
+        Self::with_namespace(KeychainNamespace::Bare.as_str(), KeychainLocation::File)
     }
 
     /// Items `<namespace>.session` and `<namespace>.cachekey`. Tests use a
@@ -166,40 +163,6 @@ impl KeychainStore {
 }
 
 impl SecretStore for KeychainStore {
-    fn has_items(&self) -> Result<bool, StoreError> {
-        for item in [
-            SecretItem::Session,
-            SecretItem::CacheKey,
-            SecretItem::ApiCredentials,
-            SecretItem::LogoutPending,
-        ] {
-            let mut query = self.identity(item);
-            query.push((
-                key(kSecReturnAttributes),
-                CFBoolean::true_value().into_CFType(),
-            ));
-            query.push((
-                key(kSecUseAuthenticationUI),
-                key(kSecUseAuthenticationUIFail).into_CFType(),
-            ));
-            let query = dict(&query);
-            let mut out: CFTypeRef = std::ptr::null();
-            // SAFETY: query and out live for the call. Any returned value
-            // follows the Create rule; it is released without reading data.
-            let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &raw mut out) };
-            if !out.is_null() {
-                // SAFETY: a non-null result is an owned CF object.
-                drop(unsafe { CFType::wrap_under_create_rule(out) });
-            }
-            if status == errSecItemNotFound {
-                continue;
-            }
-            check(status)?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
     fn get(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
         let mut query = self.identity(item);
         query.push((key(kSecReturnData), CFBoolean::true_value().into_CFType()));

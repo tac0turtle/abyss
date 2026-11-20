@@ -4,10 +4,12 @@
 use std::time::Instant;
 
 use abyss_core::api::{ConnState, SendState};
-use abyss_core::model::{ChatKind, MediaKind, ThreadKey};
+use abyss_core::model::{ChatKind, ChatSummary, MediaKind, ThreadKey};
 use gpui::SharedString;
 
 use super::sends::{Echo, Phase};
+use super::topics::UnreadMark;
+use crate::ui::a11y::compose;
 
 /// The wordmark above the chat list: lowercase, no article.
 pub(crate) const WORDMARK: &str = "abyss";
@@ -99,6 +101,7 @@ pub(crate) const PUT_BACK_DONE: &str = "Not sent and not kept. Your text is back
 pub(crate) const LINK_COPIED: &str = "Link copied. abyss never opens links from messages.";
 /// A topic thread's way back to its forum's topic list (also Cmd+[).
 pub(crate) const TOPICS_BACK: &str = "‹ Topics";
+pub(crate) const TOPICS_BACK_LABEL: &str = "Back to topics";
 pub(crate) const LOADING_TOPICS: &str = "Loading topics…";
 /// The open topic was deleted or hidden.
 pub(crate) const TOPIC_REMOVED: &str =
@@ -123,6 +126,153 @@ pub(crate) const EXPANDED: &str = "▾";
 pub(crate) const COLLAPSED: &str = "▸";
 /// The sidebar row after a forum's inline topics when it has more.
 pub(crate) const MORE_TOPICS: &str = "More topics";
+
+/// The sidebar's tab strip, and the open chat's lists, as a screen reader names them.
+pub(crate) const CHAT_TABS: &str = "Chat tabs";
+/// The sidebar's heading; its list is named by the tab it shows.
+pub(crate) const CHATS_HEADING: &str = "Chats";
+/// The archive's way back, which shows "‹ Archive".
+pub(crate) const ARCHIVE_BACK_LABEL: &str = "Back to all chats";
+pub(crate) const MESSAGE_LIST: &str = "Messages";
+/// The unread filter's name, which adds the unread chats of the shown view.
+pub(crate) const UNREAD_FILTER_NAME: &str = "Unread";
+pub(crate) const NEW_MESSAGE: &str = "New message";
+/// A sender is "You" for the user's own messages.
+pub(crate) const YOU: &str = "You";
+pub(crate) const SEND_MESSAGE: &str = "Send message";
+/// The buttons of a message without a server copy, named for what they do to
+/// it; they show only "Retry", "Discard" and so on.
+pub(crate) const RETRY_SEND: &str = "Retry sending";
+pub(crate) const DISCARD_SEND: &str = "Discard unsent message";
+pub(crate) const PUT_BACK_LABEL: &str = "Put back in composer";
+pub(crate) const DISMISS_RETURNED: &str = "Dismiss returned message";
+pub(crate) const COPY_UNSENT: &str = "Copy unsent text";
+pub(crate) const DISMISS_STRANDED: &str = "Dismiss stranded message";
+/// The disclosure button's name, by what it does.
+pub(crate) const EXPAND_TOPICS: &str = "Show topics";
+pub(crate) const COLLAPSE_TOPICS: &str = "Hide topics";
+
+fn plural(n: u32, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// A tab's name with how many unread chats it holds.
+pub(crate) fn tab_label(name: &str, unread_chats: usize) -> String {
+    match unread_chats {
+        0 => name.to_owned(),
+        n => format!("{name}, {n} unread"),
+    }
+}
+
+/// The unread filter's name: "Unread, 4", the unread chats of the shown view.
+pub(crate) fn unread_filter_label(unread_chats: usize) -> String {
+    format!("{UNREAD_FILTER_NAME}, {unread_chats}")
+}
+
+/// What the sidebar's list holds, by its heading's name.
+pub(crate) fn chat_list_label(view: &str) -> String {
+    format!("Chats, {view}")
+}
+
+pub(crate) fn topic_list_label(forum: &str) -> String {
+    format!("Topics in {forum}")
+}
+
+pub(crate) fn history_label(thread: &str) -> String {
+    format!("{MESSAGE_LIST} in {thread}")
+}
+
+/// A chat row: "title, 3 unread, 1 mention, muted, pinned, group, last:
+/// preview, time". Telegram's summary carries no sender for the last message.
+pub(crate) fn chat_row_label(chat: &ChatSummary, preview: &str, time: &str, now: i64) -> String {
+    let unread = chat.displayed_unread();
+    let unread = (unread > 0).then(|| format!("{} unread", unread_badge(unread)));
+    let mentions =
+        (chat.unread_mentions > 0).then(|| plural(chat.unread_mentions, "mention", "mentions"));
+    let last = (!preview.is_empty()).then(|| format!("last: {preview}"));
+    compose([
+        chat.title.as_str(),
+        unread.as_deref().unwrap_or_default(),
+        mentions.as_deref().unwrap_or_default(),
+        if chat.muted_at(now) { "muted" } else { "" },
+        if chat.pinned { "pinned" } else { "" },
+        kind_label(chat.kind).unwrap_or_default(),
+        last.as_deref().unwrap_or_default(),
+        time,
+    ])
+}
+
+/// A topic row, with the marks it shows.
+pub(crate) fn topic_row_label(
+    title: &str,
+    mark: UnreadMark,
+    (closed, pinned): (bool, bool),
+    preview: &str,
+    time: &str,
+) -> String {
+    let (unread, mentions) = match mark {
+        UnreadMark::None => (None, None),
+        UnreadMark::Dot => (Some("new messages".to_owned()), None),
+        UnreadMark::Count { unread, mentions } => (
+            Some(format!("{} unread", unread_badge(unread))),
+            (mentions > 0).then(|| plural(mentions, "mention", "mentions")),
+        ),
+    };
+    let last = (!preview.is_empty()).then(|| format!("last: {preview}"));
+    compose([
+        title,
+        unread.as_deref().unwrap_or_default(),
+        mentions.as_deref().unwrap_or_default(),
+        if closed { CLOSED_TOPIC } else { "" },
+        if pinned { PINNED_TOPIC } else { "" },
+        last.as_deref().unwrap_or_default(),
+        time,
+    ])
+}
+
+/// The archive's entry: its name and its summary line.
+pub(crate) fn archive_row_label(chats: usize, unread: usize) -> String {
+    compose([ARCHIVE, &archive_summary(chats, unread)])
+}
+
+/// The composer's name: the chat's, and the topic's in a forum.
+pub(crate) fn composer_label(chat: &str, topic: Option<&str>) -> String {
+    match topic {
+        Some(topic) => format!("Message to {chat}, topic {topic}"),
+        None => format!("Message to {chat}"),
+    }
+}
+
+/// A media placeholder says what it stands for and that it is not shown.
+pub(crate) fn media_not_shown(kind: &MediaKind) -> String {
+    format!("{}, not shown", media_label(kind))
+}
+
+/// "New message from Alice", for the live region.
+pub(crate) fn new_message_from(sender: Option<&str>) -> SharedString {
+    match sender {
+        Some(name) if !name.is_empty() => format!("{NEW_MESSAGE} from {name}").into(),
+        _ => NEW_MESSAGE.into(),
+    }
+}
+
+/// A message: "sender, in reply to: excerpt, text, time, edited". A media
+/// placeholder takes the text's place, and its caption follows it. `tail` is
+/// the time, then `EDITED` for an edited message.
+pub(crate) fn message_label(
+    sender: &str,
+    reply: Option<&str>,
+    body: &[&str],
+    tail: [&str; 2],
+) -> String {
+    let reply = reply.map(|excerpt| format!("in reply to: {excerpt}"));
+    compose(
+        std::iter::once(sender)
+            .chain(reply.as_deref())
+            .chain(body.iter().copied())
+            .chain(tail),
+    )
+}
 
 /// Where a discarded draft of `thread` was written: a topic of the chat
 /// (titled `chat`), or the chat.
@@ -291,6 +441,106 @@ pub(crate) fn unread_badge(unread: u32) -> SharedString {
         "999+".into()
     } else {
         unread.to_string().into()
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use abyss_core::model::{ChatId, MsgId, PeerKind, ReadState};
+
+    use super::*;
+
+    fn chat(unread: u32, mentions: u32) -> ChatSummary {
+        ChatSummary {
+            id: ChatId {
+                kind: PeerKind::Chat,
+                id: 7,
+            },
+            title: "Family".into(),
+            kind: ChatKind::Group,
+            pinned: true,
+            read: ReadState {
+                unread,
+                read_inbox_max: MsgId(0),
+            },
+            unread_mentions: mentions,
+            last: None,
+            last_date: 0,
+            last_id: None,
+            can_send: true,
+            muted_until: Some(i64::from(i32::MAX)),
+            scope_muted_until: 0,
+            folder: abyss_core::model::PeerFolder::Main,
+            reading: None,
+            topic_unread: None,
+        }
+    }
+
+    #[test]
+    fn a_chat_row_names_everything_it_shows() {
+        let label = chat_row_label(&chat(3, 1), "see you", "14:05", 100);
+        assert_eq!(
+            label,
+            "Family, 3 unread, 1 mention, muted, pinned, group, last: see you, 14:05"
+        );
+    }
+
+    #[test]
+    fn a_quiet_chat_row_skips_what_is_absent() {
+        let mut quiet = chat(0, 0);
+        quiet.pinned = false;
+        quiet.muted_until = Some(0);
+        assert_eq!(chat_row_label(&quiet, "", "Mon", 100), "Family, group, Mon");
+        let busy = chat_row_label(&chat(1000, 2), "", "", 100);
+        assert!(busy.contains("999+ unread, 2 mentions"), "{busy}");
+    }
+
+    #[test]
+    fn a_topic_row_names_its_marks() {
+        let mark = UnreadMark::Count {
+            unread: 2,
+            mentions: 0,
+        };
+        assert_eq!(
+            topic_row_label("Rules", mark, (true, true), "read first", "Tue"),
+            "Rules, 2 unread, closed, pinned, last: read first, Tue"
+        );
+        assert_eq!(
+            topic_row_label("General", UnreadMark::Dot, (false, false), "", "09:10"),
+            "General, new messages, 09:10"
+        );
+    }
+
+    #[test]
+    fn a_message_label_follows_the_visible_order() {
+        assert_eq!(
+            message_label("Ana", None, &["hello"], ["14:05", EDITED]),
+            "Ana, hello, 14:05, edited"
+        );
+        assert_eq!(
+            message_label(
+                "You",
+                Some("ok?"),
+                &["Photo, not shown", "look"],
+                ["14:06", ""]
+            ),
+            "You, in reply to: ok?, Photo, not shown, look, 14:06"
+        );
+        assert_eq!(media_not_shown(&MediaKind::Photo), "Photo, not shown");
+    }
+
+    #[test]
+    fn tabs_and_the_composer_are_named() {
+        assert_eq!(tab_label("Work", 0), "Work");
+        assert_eq!(tab_label("Work", 4), "Work, 4 unread");
+        assert_eq!(unread_filter_label(4), "Unread, 4");
+        assert_eq!(composer_label("Family", None), "Message to Family");
+        assert_eq!(
+            composer_label("Forum", Some("Rules")),
+            "Message to Forum, topic Rules"
+        );
+        assert_eq!(new_message_from(Some("Ana")), "New message from Ana");
+        assert_eq!(new_message_from(None), "New message");
     }
 }
 

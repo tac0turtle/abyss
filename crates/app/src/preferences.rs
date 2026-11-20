@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 
 use abyss_core::StartError;
-use abyss_core::secret::{SecretStorageConfig, private_directory, read_private, write_private};
+use abyss_core::secret::{
+    KeychainNamespace, SecretStorageConfig, private_directory, read_private, write_private,
+};
 use gpui::{App, AppContext, BorrowAppContext, Global};
 
 #[derive(Default)]
@@ -38,11 +40,20 @@ impl Preferences {
 
     pub(crate) fn config(cx: &App) -> Result<SecretStorageConfig, StartError> {
         let prefs = cx.try_global::<Self>().ok_or(StartError::SecretStorage)?;
+        #[cfg(target_os = "macos")]
+        let bundled = crate::storage::has_app_bundle_id();
+        #[cfg(not(target_os = "macos"))]
+        let bundled = false;
         Ok(SecretStorageConfig {
             dir: crate::storage::app_dir()
                 .ok_or(StartError::SecretStorage)?
                 .join("private"),
             use_keychain: prefs.use_keychain.ok_or(StartError::SecretStorage)?,
+            keychain_namespace: if bundled {
+                KeychainNamespace::Bundle
+            } else {
+                KeychainNamespace::Bare
+            },
         })
     }
 

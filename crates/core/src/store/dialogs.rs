@@ -83,6 +83,26 @@ impl Last {
     }
 }
 
+/// Separates an explicit request to inherit from a missing record.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PeerMute {
+    Inherit,
+    Until(i64),
+}
+
+impl PeerMute {
+    pub(super) fn of(until: Option<i64>) -> Self {
+        until.map_or(Self::Inherit, Self::Until)
+    }
+
+    pub(crate) fn until(self) -> Option<i64> {
+        match self {
+            Self::Inherit => None,
+            Self::Until(until) => Some(until),
+        }
+    }
+}
+
 /// Whether more dialogs pages follow the one being applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rest {
@@ -101,6 +121,51 @@ pub enum Unread {
 impl Dialogs {
     pub fn as_slice(&self) -> &[ChatSummary] {
         &self.list
+    }
+
+    /// An absent record means unknown, distinct from confirmed inheritance.
+    pub(crate) fn peer_mute(&self, id: ChatId) -> Option<PeerMute> {
+        self.get(id).map_or_else(
+            || self.fields.unlisted_mute(id),
+            |row| Some(PeerMute::of(row.muted_until)),
+        )
+    }
+
+    pub(crate) fn set_peer_mute_snapshot(
+        &mut self,
+        id: ChatId,
+        until: Option<i64>,
+        stamp: BadgeSeq,
+    ) -> Option<&ChatSummary> {
+        if self.fields.accepts_mute_snapshot(id, stamp) {
+            self.set_mute(id, until, stamp)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_mute(
+        &mut self,
+        id: ChatId,
+        until: Option<i64>,
+        now: BadgeSeq,
+    ) -> Option<&ChatSummary> {
+        let row = self.list.iter_mut().find(|row| row.id == id);
+        self.fields
+            .mute_changed(id, now, row.is_none().then_some(PeerMute::of(until)));
+        let row = row.filter(|row| row.muted_until != until)?;
+        row.muted_until = until;
+        Some(row)
+    }
+
+    pub fn set_scope_mutes(&mut self, mut deadline: impl FnMut(ChatKind) -> i64) -> bool {
+        let mut changed = false;
+        for row in &mut self.list {
+            let until = deadline(row.kind);
+            changed |= row.scope_muted_until != until && row.muted_until.is_none();
+            row.scope_muted_until = until;
+        }
+        changed
     }
 
     pub fn get(&self, id: ChatId) -> Option<&ChatSummary> {
@@ -288,6 +353,7 @@ impl Dialogs {
                 kind: c.kind,
                 folder: c.folder,
                 read: c.read,
+                mute: c.muted_until,
             })
         };
         self.fields.guard(page, seq, held, current)
@@ -339,6 +405,7 @@ impl Dialogs {
         summary.unread_mentions = fresh.unread_mentions;
         summary.can_send = fresh.can_send;
         summary.muted_until = fresh.muted_until;
+        summary.scope_muted_until = fresh.scope_muted_until;
         summary.folder = fresh.folder;
         (*summary != before || summary.last_id != known).then_some(&*summary)
     }
@@ -465,7 +532,8 @@ mod tests {
             last_date: 0,
             last_id: None,
             can_send: true,
-            muted_until: 0,
+            muted_until: None,
+            scope_muted_until: 0,
             folder: PeerFolder::Main,
             reading: None,
             topic_unread: None,

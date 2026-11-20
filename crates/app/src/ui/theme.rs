@@ -35,7 +35,7 @@ pub(crate) const MONO_FONT: &str = "Menlo";
 /// The one corner radius, for messages, fields and buttons.
 pub(crate) const RADIUS: f32 = 12.;
 /// Opacity of quiet text (times, previews, hints) over its surface.
-pub(crate) const QUIET: f32 = 0.74;
+const QUIET: f32 = 0.74;
 /// Opacity of a hairline drawn in the text color.
 const LINE: f32 = 0.24;
 /// Opacity of the wash behind inline code, in the text's own color.
@@ -221,6 +221,7 @@ pub(crate) struct Theme {
     /// One surface at every depth, and marks in the accent (every colourway
     /// but abyss); otherwise the strata, and marks in each row's own ink (abyss).
     flat: bool,
+    increased_contrast: bool,
     /// Text on the surface. In abyss it is also the source of the `own` and
     /// `accent` fills; views paint those through their roles.
     pub(crate) text: Rgba,
@@ -292,6 +293,7 @@ impl Theme {
             surfaces: spec.surfaces.map(color),
             flip: spec.flip,
             flat: false,
+            increased_contrast: false,
             text,
             on_text,
             incoming: Rgba {
@@ -309,6 +311,49 @@ impl Theme {
             spoilers: [color(spec.spoiler), color(HIDDEN)],
             quiet: [QUIET; 2],
         }
+    }
+
+    /// A variant of this colourway with opaque rules and quiet text. It
+    /// keeps the colourway's own inks and fills, including custom hues.
+    pub(crate) fn increased_contrast(mut self) -> Self {
+        self.increased_contrast = true;
+        self.quiet = [1.; 2];
+        self
+    }
+
+    pub(crate) fn has_increased_contrast(&self) -> bool {
+        self.increased_contrast
+    }
+
+    pub(crate) fn quiet_opacity(&self) -> f32 {
+        if self.increased_contrast { 1. } else { QUIET }
+    }
+
+    pub(crate) fn quiet(&self, ink: Rgba) -> Rgba {
+        faded(ink, self.quiet_opacity())
+    }
+
+    pub(crate) fn line(&self, ink: Rgba) -> Rgba {
+        self.rule(ink, LINE)
+    }
+
+    pub(crate) fn rule(&self, ink: Rgba, opacity: f32) -> Rgba {
+        faded(ink, if self.increased_contrast { 1. } else { opacity })
+    }
+
+    /// Focus on a surface uses that depth's contrasting ink.
+    pub(crate) fn focus_on(&self, depth: Depth) -> Rgba {
+        self.text_on(depth)
+    }
+
+    /// Pick the stronger side of the black/white contrast crossover for a
+    /// solid colour sample. The weaker maximum still clears 4.5:1.
+    pub(crate) fn sample_outline(fill: Rgba) -> Rgba {
+        gpui::rgb(if luminance(fill) > 0.179 {
+            0x00_00_00
+        } else {
+            0xFF_FF_FF
+        })
     }
 
     /// The fill of a message bubble on `side`.
@@ -462,10 +507,15 @@ impl Themes {
     /// render before [`Themes::init`] (tests) get the defaults.
     pub(crate) fn of(window: &Window, cx: &App) -> Theme {
         let mode = Mode::of(window);
-        cx.try_global::<Self>().map_or_else(
+        let theme = cx.try_global::<Self>().map_or_else(
             || Theme::new(mode, Colourway::DEFAULT, Settings::default()),
             |t| t.theme(mode),
-        )
+        );
+        if super::display::DisplayPreferences::of(cx).increase_contrast {
+            theme.increased_contrast()
+        } else {
+            theme
+        }
     }
 
     /// abyss's hues, or the defaults before [`Themes::init`].
@@ -568,16 +618,6 @@ impl Themes {
             }
         }));
     }
-}
-
-/// `color` at quiet-text strength.
-pub(crate) fn quiet(color: Rgba) -> Rgba {
-    faded(color, QUIET)
-}
-
-/// A hairline in `color`.
-pub(crate) fn line(color: Rgba) -> Rgba {
-    faded(color, LINE)
 }
 
 /// `color` with its opacity scaled by `factor`.

@@ -17,9 +17,11 @@ use std::ops::Range;
 use abyss_core::rich_text::{LinkTarget, RichText, Style};
 use abyss_core::sanitize::clean;
 use gpui::{
-    App, ElementId, Font, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
-    StrikethroughStyle, StyledText, TextRun, UnderlineStyle, Window, px,
+    AnyElement, App, ElementId, Font, FontStyle, FontWeight, Hsla, Rgba, SharedString,
+    StrikethroughStyle, TextRun, UnderlineStyle, Window, prelude::*, px,
 };
+
+mod accessible;
 
 /// Bytes of a hidden link target shown inline; the click copies all of it.
 const MAX_SHOWN_TARGET: usize = 256;
@@ -249,26 +251,14 @@ pub(crate) enum Click {
 }
 
 impl Body {
-    /// The body as clickable text. Link and reveal ranges never overlap
-    /// (a link under a hidden spoiler is a reveal range only), so one click
-    /// asks for one thing.
+    /// The rendered body shares activation across mouse, keyboard and `AppKit`.
     pub(crate) fn interactive(
         self,
         id: impl Into<ElementId>,
-        on_click: impl Fn(Click, &mut Window, &mut App) + 'static,
-    ) -> InteractiveText {
-        let (mut ranges, targets): (Vec<Range<usize>>, Vec<SharedString>) =
-            self.links.into_iter().unzip();
-        ranges.extend(self.spoilers);
-        InteractiveText::new(id, StyledText::new(self.text).with_runs(self.runs)).on_click(
-            ranges,
-            move |range_ix, window, cx| {
-                let click = targets
-                    .get(range_ix)
-                    .map_or(Click::Reveal, |t| Click::Copy(t.clone()));
-                on_click(click, window, cx);
-            },
-        )
+        ink: Rgba,
+        activate: impl Fn(&Click, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        accessible::AccessibleText::new(id.into(), self, ink, activate).into_any_element()
     }
 }
 

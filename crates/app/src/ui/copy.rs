@@ -53,12 +53,15 @@ pub(crate) const CONNECTING: &str = "Connecting…";
 pub(crate) const CONTINUE: &str = "Continue";
 
 pub(crate) const PHONE_TITLE: &str = "Sign in to Telegram";
+pub(crate) const PHONE_LABEL: &str = "Phone number";
 pub(crate) const PHONE_PLACEHOLDER: &str = "Phone number, e.g. +44 20 7946 0000";
 
 pub(crate) const CODE_TITLE: &str = "Enter the code";
+pub(crate) const CODE_LABEL: &str = "Login code";
 pub(crate) const CODE_PLACEHOLDER: &str = "Code";
 
 pub(crate) const PASSWORD_TITLE: &str = "Two-step verification";
+pub(crate) const PASSWORD_LABEL: &str = "Two-step verification password";
 pub(crate) const PASSWORD_PLACEHOLDER: &str = "Password";
 /// `--fake`: the demo account's login code, shown when the code screen opens.
 #[cfg(feature = "fake")]
@@ -101,11 +104,10 @@ pub(crate) const LOGOUT_NOT_STARTED_SERVER: &str = "Telegram ended this session,
      Check local storage access and retry.";
 pub(crate) const STAY_SIGNED_IN: &str = "Stay signed in";
 
-/// Startup couldn't read the logout-pending marker (review round 19). This
-/// is not a logout: nothing is deleted on it.
-pub(crate) const STARTUP_BLOCKED_TITLE: &str = "Couldn't read local storage";
-pub(crate) const STARTUP_BLOCKED_DETAIL: &str = "abyss couldn't read its saved secrets, so it \
-     can't tell whether a logout is unfinished. Nothing was loaded or deleted. Check local storage access and retry.";
+/// Startup could not resolve an earlier logout before loading the account.
+pub(crate) const STARTUP_BLOCKED_TITLE: &str = "Couldn't open the saved account";
+pub(crate) const STARTUP_BLOCKED_DETAIL: &str = "abyss couldn't check the previous logout. \
+     Retry to check local storage and finish any pending notification removal.";
 
 /// Logout asks first: it deletes local data (plan section 17.3, task 6c).
 pub(crate) const LOGOUT_CONFIRM_TITLE: &str = "Log out?";
@@ -127,6 +129,11 @@ pub(crate) fn flood_detail(seconds_left: u64) -> SharedString {
 }
 
 pub(crate) const COMPOSER_PLACEHOLDER: &str = "Write a message…";
+
+/// What the composer's length counter says aloud.
+pub(crate) fn characters_used(used: usize, max: usize) -> String {
+    format!("{used} of {max} characters")
+}
 pub(crate) const CORE_STOPPED: &str = "abyss's core stopped unexpectedly.";
 pub(crate) const CORE_GONE: &str = "abyss's core has stopped.";
 

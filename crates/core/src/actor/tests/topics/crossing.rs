@@ -106,7 +106,7 @@ async fn a_snapshot_with_101_then_the_live_101() {
     rename(&h, f, t, "renamed").await;
     h.until(|e| matches!(e, Event::TopicsAppended { topics, .. } if topics.iter().any(|x| x.id == t && x.unread == 1)))
         .await;
-    h.fake.push_update(Update::NewMessage(m101)).await;
+    h.fake.push_update(Update::NewMessage(m101.into())).await;
     let (ev, _) = h
         .until(|e| matches!(e, Event::TopicBumped { topic, .. } if topic.id == t))
         .await;

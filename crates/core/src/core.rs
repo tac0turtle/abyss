@@ -50,6 +50,8 @@ pub struct CoreConfig {
     pub secret_storage: Option<crate::secret::SecretStorageConfig>,
     /// `None` runs without a disk cache.
     pub cache: Option<CacheConfig>,
+    /// Require the UI to acknowledge platform notification cleanup on logout.
+    pub notification_cleanup: events::NotificationCleanupPolicy,
     /// Faults for manual testing of the fake (`ABYSS_FAKE_FAULTS`).
     #[cfg(feature = "fake")]
     pub fake_faults: FakeFaults,
@@ -206,6 +208,12 @@ impl CoreSender {
 }
 
 impl CoreEvents {
+    /// The account epoch carried by the last event this receiver returned.
+    /// Read it when taking a notice, before taking another event.
+    pub fn account_epoch(&self) -> u64 {
+        self.events.observer().get()
+    }
+
     /// Next event; `None` once core has stopped.
     pub async fn recv(&mut self) -> Option<Event> {
         self.events.recv().await
@@ -275,11 +283,11 @@ pub fn start(config: CoreConfig, backend: BackendChoice) -> Result<CoreHandle, S
                 .as_ref()
                 .ok_or(StartError::SecretStorage)?;
             let store = crate::secret::SwitchingStore::new(
-                crate::secret::SecretStorageConfig {
-                    dir: storage.dir.clone(),
-                    use_keychain: storage.use_keychain,
-                },
-                crate::secret::KeychainStore::new(),
+                storage.clone(),
+                crate::secret::KeychainStore::with_namespace(
+                    storage.keychain_namespace.as_str(),
+                    crate::secret::KeychainLocation::File,
+                ),
             );
             let slot = crate::credentials::CredentialSlot::new(env);
             let make = move |persist| GrammersBackend::new(slot, persist);
@@ -362,7 +370,7 @@ fn start_with<B: Backend>(
     let backend = make(persist.clone());
     let (cmd_tx, commands) = mpsc::channel(COMMAND_CAPACITY);
     let (internal_tx, internal) = mpsc::channel(INTERNAL_CAPACITY);
-    let (events, events_rx) = events::channel();
+    let (events, events_rx) = events::channel_with_notifications(config.notification_cleanup);
     let (done_tx, done_rx) = oneshot::channel();
     let cancel = CancellationToken::new();
     let (stop, stop_rx) = mpsc::channel(1);
@@ -457,18 +465,17 @@ async fn prepare<B: Backend>(
     } = boot;
     // Before the session: an interrupted logout is finished first, and the
     // old account's session is never loaded (review round 15, A).
-    let pending_logout = read_pending_logout(&persist).await;
-    let (account, identity) = match pending_logout {
-        Some(_) => (persist.fresh_session(), Identity::Unknown),
-        None => load_account(&persist, &events).await,
+    let pending_logout = read_pending_logout(&persist, &events).await;
+    let blocked = pending_logout.is_some_and(PendingLogout::blocks_session);
+    let (account, identity) = if blocked {
+        (persist.fresh_session(), Identity::Unknown)
+    } else {
+        load_account(&persist, &events).await
     };
-    let (handle, cache_parts) = match (cache, pending_logout) {
-        // Unknown whether a logout is pending: the cache is not even opened
-        // (opening may destroy and recreate it), only its directory is kept
-        // until `RetryStartup` reads the marker (review round 25, finding 4).
-        (Some(CacheConfig { dir }), Some(PendingLogout::Unreadable(_))) => {
-            (None, Some(CacheParts::closed(dir)))
-        }
+    let (handle, cache_parts) = match (cache, blocked) {
+        // Opening may destroy or recreate the cache. Leave that to the
+        // logout's ordered local step, or to startup once the marker is resolved.
+        (Some(CacheConfig { dir }), true) => (None, Some(CacheParts::closed(dir))),
         (Some(CacheConfig { dir }), _) => {
             let provisioned = provision_cache(&persist, dir, identity).await;
             (provisioned.served, Some(provisioned.parts))

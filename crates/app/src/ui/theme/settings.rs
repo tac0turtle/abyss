@@ -39,6 +39,26 @@ impl Hue {
         (degrees < 360 && degrees % HUE_STEP == HUE_OFFSET).then_some(Self(degrees))
     }
 
+    pub(crate) fn accessible_name(self) -> String {
+        let name = match self.0 {
+            0..=19 | 350..=u16::MAX => "Rose",
+            20..=34 => "Red",
+            35..=64 => "Orange",
+            65..=94 => "Gold",
+            95..=109 => "Yellow",
+            110..=134 => "Lime",
+            135..=159 => "Green",
+            160..=184 => "Mint",
+            185..=204 => "Teal",
+            205..=234 => "Cyan",
+            235..=259 => "Blue",
+            260..=279 => "Indigo",
+            280..=309 => "Violet",
+            _ => "Magenta",
+        };
+        format!("{name}, {} degrees", self.0)
+    }
+
     pub(crate) fn degrees(self) -> f32 {
         f32::from(self.0)
     }

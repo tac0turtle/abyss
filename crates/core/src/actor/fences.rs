@@ -98,10 +98,10 @@ impl<B: Backend> Actor<B> {
                         self.history_ended(load.thread, dir, None).await;
                     }
                     if snapshot {
-                        // Boxed: finishing the boot replays buffered
-                        // updates, which may fence again (the boot is gone
-                        // by then, so this goes no deeper).
-                        Box::pin(self.snapshot_done(super::boot::Snapshot::Tail(load))).await;
+                        self.snapshot_done(super::boot::Snapshot::Tail {
+                            load,
+                            applied: false,
+                        });
                     }
                 }
                 Job::Send { local_id, .. } => self.sends.unqueue(local_id),

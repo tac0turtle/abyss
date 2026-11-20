@@ -4,6 +4,7 @@
 //! The shell (`shell::chats`) feeds it events and lends it an [`Admit`] to
 //! queue commands with core (`commands.rs`); `shell::chat_view` renders it.
 
+pub(crate) mod announce;
 mod commands;
 pub(crate) mod copy;
 #[cfg(feature = "fake")]
@@ -30,7 +31,7 @@ use abyss_core::model::{
     ChatId, ChatKind, ChatSummary, Message, MsgId, ThreadKey, TopicGone, TopicId,
 };
 use abyss_core::store::{ForumStatus, ViewGen};
-use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, Task, px};
+use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, SharedString, Task, px};
 
 pub(crate) use self::commands::{Admit, Refused};
 use self::discarded::Obsolete;
@@ -74,6 +75,13 @@ pub(crate) enum Pane {
     Thread(ThreadKey),
     /// A forum: its topic list, or one of its topics (`open`).
     Forum { chat: ChatId, open: Option<TopicId> },
+}
+
+/// Whether a modal overlay covers the message pane (`ChatShell::set_covered`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Covered {
+    Yes,
+    No,
 }
 
 /// What the open thread's composer area shows (plan section 8).
@@ -164,6 +172,11 @@ pub(crate) struct ChatShell {
     /// Whether the window is active, as the OS last said. Reads and the
     /// live tail follow this at once, whatever core was told.
     active: WindowState,
+    /// A modal overlay covers the pane (review A64, N57): the session says
+    /// so before each frame check ([`Self::set_covered`]). Nothing under it
+    /// is seen, so no read mark and no live tail, exactly as if the window
+    /// were inactive.
+    covered: Covered,
     /// The window state core last admitted (`Command::Window`).
     focus_sent: WindowState,
     /// Bringing core in line with `active` after a refusal.
@@ -171,6 +184,11 @@ pub(crate) struct ChatShell {
     /// Discarding sends of threads that can no longer be sent to, after a
     /// refusal.
     obsolete_retry: Backoff,
+    /// Withdrawing `ViewingTail` while a modal overlay covers the pane
+    /// (review A76): its own backoff, apart from the frame retry (loads and
+    /// read marks), which may have given up. It never gives up while the
+    /// pane stays covered; a cover or an uncover starts it afresh.
+    withdraw_retry: Backoff,
     /// Frame-driven commands (loads, read marks, the live tail) core
     /// refused: the next frame retries, and a wake-up makes sure one comes.
     frame_retry: Backoff,
@@ -190,6 +208,8 @@ pub(crate) struct ChatShell {
     countdown: Countdown,
     /// Where the message rows were painted this frame.
     painted: viewport::Painted,
+    /// What the live region says of messages arriving in the open thread.
+    announcer: announce::Announcer,
 }
 
 /// The retry wake-up: when it is due, its name, and its task (dropping the
@@ -239,9 +259,11 @@ impl Default for ChatShell {
             core: CoreState::Running,
             next_local: 1,
             active: WindowState::Active,
+            covered: Covered::No,
             focus_sent: WindowState::Active,
             focus_retry: Backoff::default(),
             obsolete_retry: Backoff::default(),
+            withdraw_retry: Backoff::default(),
             frame_retry: Backoff::default(),
             auto_restart: None,
             held_recovery: None,
@@ -250,6 +272,7 @@ impl Default for ChatShell {
             conn: None,
             countdown: Countdown::Idle,
             painted: viewport::Painted::default(),
+            announcer: announce::Announcer::default(),
         }
     }
 }
@@ -290,6 +313,19 @@ impl ChatShell {
     /// paints the chat again reports it.
     pub(crate) fn hidden(&mut self) {
         self.viewing = None;
+    }
+
+    /// Whether a modal overlay covers the pane, as of the frame about to be
+    /// checked (review A64, N57). Covered, [`Self::frame_seen`] marks
+    /// nothing read and tells core no tail is on screen; the first frame
+    /// painted uncovered reports both again.
+    pub(crate) fn set_covered(&mut self, covered: Covered) {
+        if self.covered != covered {
+            // A new cover owes a fresh withdrawal, and an uncover
+            // supersedes the pending one (A76).
+            self.withdraw_retry.reset();
+        }
+        self.covered = covered;
     }
 }
 
@@ -632,6 +668,10 @@ impl ChatShell {
             | Event::CredentialSource(_)
             | Event::CredentialItem(_)
             | Event::Error(_)
+            | Event::Notify(_)
+            | Event::ClearNotifications(_)
+            | Event::NotifyDeleted { .. }
+            | Event::InboxRead { .. }
             | Event::LoadEnded { .. } => {}
         }
     }
@@ -697,6 +737,7 @@ impl ChatShell {
             obsolete,
             self.frame_retry.due(now),
             recovery,
+            self.withdraw_due(now),
         ]
         .into_iter()
         .fold(focus, earliest)
@@ -773,12 +814,16 @@ impl ChatShell {
     fn on_history(&mut self, thread: ThreadKey, batch: Batch) {
         let anchor = self.scroll_anchor();
         let late = self.late_divider(thread, &batch);
+        let news = self.arrival(thread, &batch);
         let (view, dir) = (batch.view, batch.dir);
         let Some(w) = self.open_window(thread) else {
             return;
         };
         let applied = w.apply(batch);
         let reset = applied == Applied::Reset;
+        if let Some(text) = news {
+            self.announcer.offer(thread, text, Instant::now());
+        }
         self.sync_rows(Some(applied));
         if let Some(after) = late {
             self.first_unread.divider = Divider::At(after);
@@ -843,6 +888,33 @@ impl ChatShell {
             .iter()
             .any(|m| !m.outgoing && m.id > newest)
             .then_some(newest)
+    }
+
+    /// What the live region says of `batch`, if it brings an incoming message
+    /// at the open thread's attached tail: who it is from.
+    fn arrival(&self, thread: ThreadKey, batch: &Batch) -> Option<SharedString> {
+        let w = self
+            .window
+            .as_ref()
+            .filter(|w| w.thread() == thread && w.view() == Some(batch.view) && !w.has_newer())?;
+        if batch.dir != HistoryDir::Newer {
+            return None;
+        }
+        // An attached, loaded tail can be empty (a new chat): then nothing
+        // bounds what is new from below (review A42).
+        let newest = w.newest();
+        let message = batch
+            .messages
+            .iter()
+            .rfind(|m| !m.outgoing && newest.is_none_or(|n| m.id > n))?;
+        let title = self.selected_chat().map(|c| c.title.as_str());
+        let sender = message.sender.as_ref().map(|s| s.name.as_str()).or(title);
+        Some(copy::new_message_from(sender))
+    }
+
+    /// The live region's announcement about the open thread.
+    pub(crate) fn announcement(&self) -> Option<&announce::Announcement> {
+        self.announcer.current(self.selected()?)
     }
 
     /// Whether message row `ix` starts with the divider.

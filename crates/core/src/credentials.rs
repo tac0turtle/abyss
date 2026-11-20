@@ -1,8 +1,8 @@
 //! API credential provenance (plan sections 17.1 and 17.2a).
 //!
 //! Resolution order, atomic per source: the env pair (a dev override, never
-//! persisted), then the Keychain item `dev.abyss.apicreds` (owned by the
-//! persistence worker), then a pair embedded at build time, else onboarding.
+//! persisted), then saved credentials (owned by the persistence worker),
+//! then a pair embedded at build time, else onboarding.
 //! A source that is present but unusable stops the resolution with an error;
 //! it never falls through to the next source.
 //!

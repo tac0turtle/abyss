@@ -43,6 +43,17 @@ impl Backoff {
         self.until = now.checked_add(delay);
     }
 
+    /// An attempt failed at `now`, and the intent must never give up (a
+    /// withdrawal that core relies on, review A76): the delay caps at
+    /// [`MAX_DELAY`], which bounds the rate, and the count stays below
+    /// [`MAX_FAILURES`], so it stays ready once the delay passed.
+    pub(crate) fn failed_persistent(&mut self, now: Instant) {
+        self.failed(now);
+        if self.gave_up() {
+            self.failures = MAX_FAILURES - 1;
+        }
+    }
+
     /// An attempt succeeded, or a fresh trigger allows trying again at once.
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
@@ -108,5 +119,26 @@ mod tests {
         assert_eq!(b.due(now), Some(now + FIRST_DELAY));
         assert!(b.ready(now + FIRST_DELAY));
         assert_eq!(b.due(now + FIRST_DELAY), None, "due: nothing waits");
+    }
+
+    /// A withdrawal never gives up, and its rate stays bounded (review A76).
+    #[test]
+    fn persistent_failures_cap_the_delay_and_never_give_up() {
+        let mut now = Instant::now();
+        let mut b = Backoff::default();
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            b.failed_persistent(now);
+            assert!(!b.gave_up());
+            let until = b.until.unwrap();
+            waits.push(until - now);
+            assert!(!b.ready(until.checked_sub(Duration::from_millis(1)).unwrap()));
+            now = until;
+            assert!(b.ready(now), "ready again once the delay passed");
+        }
+        assert_eq!(
+            waits,
+            [500, 1_000, 2_000, 4_000, 8_000, 8_000, 8_000, 8_000].map(Duration::from_millis)
+        );
     }
 }

@@ -94,7 +94,7 @@ impl FakeHandle {
     /// whose topic is its own id) is added and emitted as a new message.
     pub async fn create_topic(&self, chat: ChatId, title: &str) -> Result<TopicId, BackendError> {
         let (topic, message) = self.shared.with(|s| create(s, chat, title))?;
-        self.push_update(Update::NewMessage(message)).await;
+        self.push_update(Update::NewMessage(message.into())).await;
         Ok(topic)
     }
 
@@ -109,7 +109,8 @@ impl FakeHandle {
                 .push(message.clone());
             Ok::<_, BackendError>(message)
         })?;
-        self.push_update(Update::NewMessage(message.clone())).await;
+        self.push_update(Update::NewMessage(message.clone().into()))
+            .await;
         Ok(message)
     }
 

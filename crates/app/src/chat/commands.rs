@@ -17,7 +17,7 @@ use super::retry::AUTO_RESTART_GAP;
 use super::sends::Echo;
 use super::topics::{Intent, TopicList};
 use super::viewport::Seen;
-use super::{ChatShell, Composer, CoreState, Pane, Stale};
+use super::{ChatShell, Composer, CoreState, Covered, Pane, Stale};
 
 /// Core did not take a command: its queue is full, or it is gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +91,36 @@ impl ChatShell {
         self.topics = Some(TopicList::new(chat, opening));
         self.set_pane(Pane::Forum { chat, open: None });
         self.show_window(None);
+        Ok(())
+    }
+
+    /// Opens a notification's forum and topic with one queue slot. Both
+    /// core views and the pane stay as they are if admission is refused.
+    pub(crate) fn show_forum_topic(
+        &mut self,
+        chat: ChatId,
+        topic: TopicId,
+        admit: Admit<'_>,
+    ) -> Result<(), Refused> {
+        if matches!(self.pane, Pane::Forum { chat: c, .. } if c == chat) {
+            return self.open_topic(topic, admit);
+        }
+        let thread = ThreadKey {
+            chat,
+            topic: Some(topic),
+        };
+        let running = self.core == CoreState::Running;
+        if running {
+            admit(Command::OpenForumTopic { chat, topic })?;
+        }
+        self.topics = Some(TopicList::new(chat, running.then_some(Intent::First)));
+        self.set_pane(Pane::Forum {
+            chat,
+            open: Some(topic),
+        });
+        self.set_inline(Inline::Expanded);
+        self.show_window(Some(thread));
+        self.capture(None);
         Ok(())
     }
 
@@ -175,6 +205,9 @@ impl ChatShell {
         if pane.chat() != self.pane.chat() {
             self.shown_kind = None;
             self.inline = Inline::Expanded;
+        }
+        if pane.thread() != self.pane.thread() {
+            self.announcer.clear();
         }
         self.pane = pane;
         self.sync_inline();
@@ -449,8 +482,9 @@ impl ChatShell {
     }
 
     /// After a frame was painted: load more history near either end, mark
-    /// read up to the newest message on screen while the window is active,
-    /// and tell core whether the live tail is on screen. `seen` is `None`
+    /// read up to the newest message on screen while the window is active
+    /// and no overlay covers the pane, and tell core whether the live tail
+    /// is on screen. `seen` is `None`
     /// when no row was laid out. A refusal is retried on a later frame once
     /// its backoff allows ([`Self::retry_due`] makes sure one comes), and not
     /// at all after [`MAX_FAILURES`](super::retry::MAX_FAILURES) in a row
@@ -471,6 +505,9 @@ impl ChatShell {
         } else {
             Ok(())
         };
+        // The withdrawal under a cover has its own backoff: it must not wait
+        // for the frame retry, which may have given up (A76).
+        let focus = focus.and(self.withdraw_tail(now, admit));
         if !self.frame_retry.ready(now) {
             // Skipped, not succeeded: the backoff stands.
             return focus;
@@ -495,9 +532,10 @@ impl ChatShell {
         now: Instant,
         admit: Admit<'_>,
     ) -> Result<(), Refused> {
-        let active = self.active == WindowState::Active;
+        // A covered pane shows nothing: neither read nor watched (A64).
+        let active = self.active == WindowState::Active && self.covered == Covered::No;
         let Some(w) = self.window.as_mut() else {
-            return self.set_viewing(None, admit);
+            return self.frame_viewing(None, admit);
         };
         let thread = w.thread();
         if self.first_unread.opening == Opening::FallbackDue {
@@ -528,7 +566,57 @@ impl ChatShell {
             self.read_sent = Some(max_id);
         }
         let tail = tail_on_screen(w, seen);
-        self.set_viewing((active && tail).then_some(thread), admit)
+        self.frame_viewing((active && tail).then_some(thread), admit)
+    }
+
+    /// The frame path's report of the live tail. Under a cover it says
+    /// nothing: the withdrawal is [`Self::withdraw_tail`]'s, with its own
+    /// backoff, so a refusal never counts against the frame retry (A76).
+    fn frame_viewing(
+        &mut self,
+        thread: Option<ThreadKey>,
+        admit: Admit<'_>,
+    ) -> Result<(), Refused> {
+        if self.covered == Covered::Yes {
+            return Ok(());
+        }
+        self.set_viewing(thread, admit)
+    }
+
+    /// Whether a withdrawal of the watched tail is owed: a modal overlay
+    /// covers the pane while core still has the tail as watched.
+    fn withdraw_owed(&self) -> bool {
+        self.covered == Covered::Yes && self.viewing.is_some() && self.core != CoreState::Stopped
+    }
+
+    /// Tells core the tail is no longer watched once a cover owes it.
+    /// Independent of paging and read-mark backoff: a refusal waits its
+    /// own backoff, which caps at [`MAX_DELAY`](super::retry::MAX_DELAY)
+    /// and never gives up while the cover stays, because core counts
+    /// incoming messages as viewed until it hears (A76). One non-blocking
+    /// attempt per call; the retry wake-up supplies the calls.
+    fn withdraw_tail(&mut self, now: Instant, admit: Admit<'_>) -> Result<(), Refused> {
+        if !self.withdraw_owed() || !self.withdraw_retry.ready(now) {
+            return Ok(());
+        }
+        let res = self.set_viewing(None, admit);
+        match res {
+            Ok(()) => self.withdraw_retry.reset(),
+            Err(_) => self.withdraw_retry.failed_persistent(now),
+        }
+        res
+    }
+
+    /// When the owed withdrawal is next due, for the retry wake-up.
+    pub(super) fn withdraw_due(&self, now: Instant) -> Option<Instant> {
+        if !self.withdraw_owed() {
+            return None;
+        }
+        if self.withdraw_retry.ready(now) {
+            Some(now)
+        } else {
+            self.withdraw_retry.due(now)
+        }
     }
 
     /// Discards the sends core keeps for threads that can no longer be sent
@@ -698,7 +786,8 @@ impl ChatShell {
         let dialogs = self.request_dialogs(now, admit);
         let topics = self.request_topics(now, admit);
         let obsolete = self.discard_obsolete_sends(now, admit);
-        focus.and(dialogs).and(topics).and(obsolete)
+        let withdrawn = self.withdraw_tail(now, admit);
+        focus.and(dialogs).and(topics).and(obsolete).and(withdrawn)
     }
 
     /// Whether core's idea of the window (its state, the live tail) lags

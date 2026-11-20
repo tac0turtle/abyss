@@ -8,7 +8,7 @@ use gpui::{Context, Window};
 
 use super::Root;
 use super::auth::{AuthView, Back, Onboarding, Stored, back};
-use super::session::{LogoutPrompt, Session};
+use super::session::Session;
 use crate::ui::copy::onboarding as copy;
 use crate::ui::password::{PasswordInput, Reveal};
 
@@ -143,28 +143,30 @@ impl Session {
     }
 
     /// Log out deletes local data, so it asks first.
-    pub(super) fn logout(&mut self, _: &mut Window, cx: &mut Context<'_, Root>) {
+    pub(super) fn logout(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         if matches!(self.auth, AuthView::SignedIn | AuthView::Done { .. }) {
-            self.set_logout_prompt(LogoutPrompt::Open);
+            self.close_menu(window, cx);
+            self.logout_focus.open(window, cx);
+            self.open_logout_prompt();
             cx.notify();
         }
     }
 
-    pub(super) fn cancel_logout(&mut self, _: &mut Window, cx: &mut Context<'_, Root>) {
-        self.set_logout_prompt(LogoutPrompt::Closed);
-        cx.notify();
+    pub(super) fn cancel_logout(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        self.close_logout_prompt(window, cx);
     }
 
     /// Confirmed: the prompt closes once core admitted the logout; refused,
     /// it stays up for another try.
     pub(super) fn confirm_logout(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
-        let signed_in = matches!(self.auth, AuthView::SignedIn | AuthView::Done { .. });
-        if !self.confirming_logout() || !signed_in {
-            self.set_logout_prompt(LogoutPrompt::Closed);
+        if !self.confirming_logout() {
+            // A prompt that outlived its screen closes the normal way,
+            // releasing its focus (review N55); none open: nothing to do.
+            self.close_logout_prompt(window, cx);
             return cx.notify();
         }
         if self.admit_auth(Command::Logout, window, cx).is_ok() {
-            self.set_logout_prompt(LogoutPrompt::Closed);
+            self.cancel_logout(window, cx);
         }
         cx.notify();
     }

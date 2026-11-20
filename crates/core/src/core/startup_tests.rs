@@ -93,3 +93,140 @@ async fn cached_history_survives_a_core_restart() {
         Duration::from_secs(10)
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_keeps_the_session_until_platform_notifications_are_cleared() {
+    use crate::api::{AuthState, Event, LocalDeletion};
+    use crate::backend::fake::{FAKE_SELF_HASH, FAKE_SELF_ID};
+    use crate::events::NotificationCleanupPolicy;
+    use crate::secret::{SecretItem, SecretStore};
+
+    let store = MemoryStore::new();
+    let blob = crate::session::signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH);
+    store.set(SecretItem::Session, &blob).unwrap();
+    let (fake, _handle) = FakeBackend::new(FakeScript::demo(1, 0));
+    let config = CoreConfig {
+        notification_cleanup: NotificationCleanupPolicy::Required,
+        ..CoreConfig::default()
+    };
+    let mut core = start_with(config, move |_| fake, store.clone(), || {}).unwrap();
+    next_matching(
+        &mut core,
+        |event| matches!(event, Event::Auth(state) if state.is_signed_in()),
+    )
+    .await;
+    let awaiting = |event: &Event| matches!(event, Event::ClearNotifications(_));
+    core.send(Command::Logout).unwrap();
+    let Event::ClearNotifications(first) = next_matching(&mut core, awaiting).await else {
+        unreachable!();
+    };
+    assert!(store.get(SecretItem::Session).unwrap().is_some());
+    drop(first);
+    next_matching(&mut core, |event| {
+        matches!(
+            event,
+            Event::Auth(AuthState::LoggedOut {
+                local: LocalDeletion::Failed(_),
+                ..
+            })
+        )
+    })
+    .await;
+    assert!(store.get(SecretItem::Session).unwrap().is_some());
+    assert!(store.get(SecretItem::LogoutPending).unwrap().is_some());
+
+    core.send(Command::Logout).unwrap();
+    let Event::ClearNotifications(retry) = next_matching(&mut core, awaiting).await else {
+        unreachable!();
+    };
+    assert!(store.get(SecretItem::Session).unwrap().is_some());
+    retry.complete();
+    next_matching(&mut core, |event| {
+        matches!(
+            event,
+            Event::Auth(AuthState::LoggedOut {
+                local: LocalDeletion::Deleted,
+                ..
+            })
+        )
+    })
+    .await;
+    assert!(store.get(SecretItem::Session).unwrap().is_none());
+    assert!(store.get(SecretItem::LogoutPending).unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_resumed_without_a_center_erases_secrets_but_defers_notification_cleanup() {
+    use crate::api::{AuthState, Event, LocalDeletion};
+    use crate::backend::fake::{FAKE_SELF_HASH, FAKE_SELF_ID};
+    use crate::events::NotificationCleanupPolicy::{Disabled, Required};
+    use crate::secret::{SecretItem, SecretStore};
+
+    let store = MemoryStore::new();
+    let blob = crate::session::signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH);
+    store.set(SecretItem::Session, &blob).unwrap();
+    store.set(SecretItem::CacheKey, &[17; 32]).unwrap();
+    let launch = |notification_cleanup| {
+        let (fake, handle) = FakeBackend::new(FakeScript::demo(1, 0));
+        let config = CoreConfig {
+            notification_cleanup,
+            ..CoreConfig::default()
+        };
+        (
+            start_with(config, move |_| fake, store.clone(), || {}).unwrap(),
+            handle,
+        )
+    };
+    let signed_in = |event: &Event| matches!(event, Event::Auth(state) if state.is_signed_in());
+    let clear = |event: &Event| matches!(event, Event::ClearNotifications(_));
+    let logged_out = |event: &Event| matches!(event, Event::Auth(AuthState::LoggedOut { .. }));
+
+    let (mut bundled, _bundled_handle) = launch(Required);
+    next_matching(&mut bundled, signed_in).await;
+    bundled.send(Command::Logout).unwrap();
+    drop(next_matching(&mut bundled, clear).await);
+    next_matching(&mut bundled, logged_out).await;
+    bundled.begin_shutdown().unwrap().await.unwrap();
+
+    let (mut incapable, _incapable_handle) = launch(Disabled);
+    assert!(matches!(
+        next_matching(&mut incapable, |event| logged_out(event) || clear(event)).await,
+        Event::Auth(AuthState::LoggedOut {
+            local: LocalDeletion::Deleted,
+            ..
+        })
+    ));
+    assert!(store.get(SecretItem::Session).unwrap().is_none());
+    assert!(store.get(SecretItem::CacheKey).unwrap().is_none());
+    assert!(store.get(SecretItem::LogoutPending).unwrap().is_some());
+    incapable.begin_shutdown().unwrap().await.unwrap();
+
+    // A new session may have been saved while cleanup was deferred. The next
+    // capable startup must clear the old banners before serving that session.
+    store.set(SecretItem::Session, &blob).unwrap();
+    let (mut bundled, _bundled_handle) = launch(Required);
+    let clearance_or_session = |event: &Event| signed_in(event) || clear(event);
+    let first = next_matching(&mut bundled, clearance_or_session).await;
+    assert!(clear(&first));
+    drop(first);
+    let blocked = next_matching(&mut bundled, |event| {
+        signed_in(event) || matches!(event, Event::Auth(AuthState::StartupBlocked { .. }))
+    })
+    .await;
+    assert!(matches!(
+        blocked,
+        Event::Auth(AuthState::StartupBlocked { .. })
+    ));
+    assert!(store.get(SecretItem::LogoutPending).unwrap().is_some());
+    bundled.send(Command::RetryStartup).unwrap();
+    let Event::ClearNotifications(completion) =
+        next_matching(&mut bundled, clearance_or_session).await
+    else {
+        unreachable!();
+    };
+    completion.complete();
+    next_matching(&mut bundled, signed_in).await;
+    assert!(store.get(SecretItem::LogoutPending).unwrap().is_none());
+    assert!(store.get(SecretItem::Session).unwrap().is_some());
+    bundled.begin_shutdown().unwrap().await.unwrap();
+}

@@ -29,15 +29,16 @@ mod tests;
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, ScrollEvent, SharedString, UTF16Selection, Window, actions, div, point,
-    prelude::*, px, size,
+    App, Bounds, ClipboardItem, Context, CursorStyle, Div, Entity, EntityInputHandler,
+    EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollEvent, SharedString, Stateful, UTF16Selection, Window,
+    actions, div, point, prelude::*, px, size,
 };
 
 pub(crate) use self::edit::{COMPOSER_MAX_UTF16, Limits};
 use self::edit::{EditBuffer, Fit, Lines};
 use self::element::{TextElement, TextLayout};
+use super::{a11y, theme::Themes};
 
 /// Key context shared by [`TextInput`] and the password field.
 pub(crate) const KEY_CONTEXT: &str = "TextInput";
@@ -113,6 +114,11 @@ pub(crate) struct TextInput {
     focus_handle: FocusHandle,
     buffer: EditBuffer,
     placeholder: SharedString,
+    accessible_label: Option<SharedString>,
+    /// The field holds a credential (the login code): accessibility and the
+    /// platform text services see bullets, never the digits. It is still
+    /// drawn as typed.
+    secret: bool,
     last_layout: Option<TextLayout>,
     last_bounds: Option<Bounds<Pixels>>,
     /// Vertical scroll of the composer, in pixels from the top.
@@ -134,12 +140,67 @@ impl TextInput {
             focus_handle: cx.focus_handle(),
             buffer: EditBuffer::new(limits),
             placeholder: placeholder.into(),
+            accessible_label: None,
+            secret: false,
             last_layout: None,
             last_bounds: None,
             scroll_top: px(0.),
             autoscroll: false,
             is_selecting: false,
         }
+    }
+
+    /// Gives a single-line form field its name, tab stop and focus ring.
+    pub(crate) fn labelled(mut self, label: &'static str) -> Self {
+        self.accessible_label = Some(label.into());
+        self.focus_handle = self.focus_handle.clone().tab_stop(true);
+        self
+    }
+
+    /// Marks the field a credential: only bullets reach accessibility and
+    /// the platform's text services (as in the password field).
+    pub(crate) fn secret(mut self) -> Self {
+        self.secret = true;
+        self
+    }
+
+    /// Names the composer after the open chat, and puts it in the tab order.
+    /// Called for every frame, so it compares before it allocates.
+    pub(crate) fn set_label(&mut self, label: &str) {
+        if self.accessible_label.as_deref() != Some(label) {
+            self.accessible_label = Some(label.to_owned().into());
+            self.focus_handle = self.focus_handle.clone().tab_stop(true);
+        }
+    }
+
+    fn root(&self, window: &Window, cx: &App) -> Stateful<Div> {
+        let Some(label) = self.accessible_label.clone() else {
+            return div().id("editor");
+        };
+        let a11y_active = window.is_a11y_active();
+        let selected = self.buffer.selected();
+        let index = |offset| {
+            self.text()
+                .get(..offset)
+                .map_or(0, |text| text.chars().count())
+        };
+        let selection = a11y::Selection::new(
+            index(selected.start)..index(selected.end),
+            self.buffer.reversed(),
+        );
+        let placeholder = self.placeholder.clone();
+        let field = if self.secret {
+            // Counted in place: a copy of the code would be an unzeroized String.
+            let len = a11y_active.then(|| self.text().chars().count());
+            a11y::secure_field(div(), label, placeholder, len, selection)
+        } else if self.buffer.limits().lines == Lines::Multi {
+            let value = a11y_active.then(|| self.text().to_owned());
+            a11y::text_area(div(), label, placeholder, value, selection)
+        } else {
+            let value = a11y_active.then(|| self.text().to_owned());
+            a11y::text_field(div(), label, placeholder, value, selection)
+        };
+        a11y::field_frame(field, &Themes::of(window, cx))
     }
 
     pub(crate) fn text(&self) -> &str {
@@ -320,9 +381,12 @@ impl TextInput {
         self.after_edit(fit, window, cx);
     }
 
-    #[expect(clippy::unused_self, reason = "GPUI action listeners receive the view")]
+    /// Escape leaves the field to its owner, unless an input method is
+    /// composing: Escape then only ends the composition.
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<'_, Self>) {
-        cx.propagate();
+        if self.buffer.marked().is_none() {
+            cx.propagate();
+        }
     }
 
     #[expect(clippy::unused_self, reason = "GPUI action listeners receive the view")]
@@ -461,6 +525,10 @@ impl EntityInputHandler for TextInput {
     ) -> Option<String> {
         let (text, actual) = self.buffer.text_for_utf16(&range_utf16);
         actual_range.replace(actual);
+        if self.secret {
+            // Secret fields take digits only: one UTF-16 unit per bullet.
+            return Some(super::password::bullets(text.encode_utf16().count()));
+        }
         Some(text)
     }
 
@@ -590,11 +658,12 @@ impl EntityInputHandler for TextInput {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let len = self.buffer.utf16_len();
         let counter = (self.buffer.limits().lines == Lines::Multi && len >= COUNTER_FROM)
             .then(|| format!("{len} / {COMPOSER_MAX_UTF16}"));
-        div()
+        let spoken = super::copy::characters_used(len, COMPOSER_MAX_UTF16);
+        self.root(window, cx)
             .flex()
             .flex_col()
             .w_full()
@@ -616,8 +685,12 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
-            .on_action(cx.listener(Self::cut))
-            .on_action(cx.listener(Self::copy))
+            // A credential never reaches the clipboard (as `PasswordInput`).
+            .when(!self.secret, |field| {
+                field
+                    .on_action(cx.listener(Self::cut))
+                    .on_action(cx.listener(Self::copy))
+            })
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::cancel))
@@ -629,10 +702,13 @@ impl Render for TextInput {
             .child(TextElement { input: cx.entity() })
             .children(counter.map(|c| {
                 div()
+                    .id("counter")
+                    .role(gpui::Role::Label)
+                    .aria_value(spoken)
                     .flex()
                     .justify_end()
                     .text_xs()
-                    .opacity(crate::ui::theme::QUIET)
+                    .opacity(crate::ui::theme::Themes::of(window, cx).quiet_opacity())
                     .child(c)
             }))
     }

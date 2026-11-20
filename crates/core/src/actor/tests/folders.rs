@@ -100,12 +100,18 @@ async fn next_page(h: &mut Harness, target: ChatId) -> Option<PeerFolder> {
 /// (bootstrap snapshots buffer live updates, so they never cross a move).
 /// The directory comes first, so it is dropped last.
 async fn cached_list() -> (CacheDir, Harness, CacheHandle) {
-    cached_list_of(3).await
+    cached_list_of(3, CacheSetup::EitherOrder).await
+}
+
+#[derive(PartialEq, Eq)]
+enum CacheSetup {
+    EitherOrder,
+    CacheFirst,
 }
 
 /// [`cached_list`] with `server` chats on the server (the first three
 /// cached).
-async fn cached_list_of(server: u32) -> (CacheDir, Harness, CacheHandle) {
+async fn cached_list_of(server: u32, setup: CacheSetup) -> (CacheDir, Harness, CacheHandle) {
     let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     let cache = cache_at(dir.path(), &key);
@@ -115,16 +121,23 @@ async fn cached_list_of(server: u32) -> (CacheDir, Harness, CacheHandle) {
     cache.barrier().await.unwrap();
     let (backend, fake) = FakeBackend::new(script);
     fake.inject(Op::Dialogs, Fault::Error(BackendError::Transient));
+    let cache_first = (setup == CacheSetup::CacheFirst).then(|| fake.hold(Op::Dialogs, 1));
     let mut h = harness_with(backend, fake, Some(cache.clone())).await;
     // No periodic light refresh: the cache's worker is an OS thread, so the
     // paused clock can race ahead while the actor waits on it, and a
     // refresh's first page would cross the pages these tests time.
     h.send(Command::Window(WindowState::Inactive)).await;
-    // The bootstrap's dialogs fail; the cached list arrives after.
-    h.until(|e| matches!(e, Event::LoadEnded { error: Some(_), .. }))
-        .await;
-    h.until(|e| matches!(e, Event::DialogsReset(c) if c.len() == 3))
-        .await;
+    let cached = |e: &Event| matches!(e, Event::DialogsReset(c) if c.len() == 3);
+    let failed = |e: &Event| matches!(e, Event::LoadEnded { error: Some(_), .. });
+    let (first, _) = h.until(|e| cached(e) || failed(e)).await;
+    if cached(&first) {
+        if let Some(gate) = cache_first {
+            gate.notify_one();
+        }
+        h.until(failed).await;
+    } else {
+        h.until(cached).await;
+    }
     (dir, h, cache)
 }
 
@@ -144,7 +157,7 @@ async fn cached_folder(cache: &CacheHandle, target: ChatId) -> Option<PeerFolder
 async fn a_first_page_crossing_a_move_keeps_the_move() {
     // Six chats on the server, three cached; chats 3 and 6 are channels
     // (`ChatChanged` makes core ask `peer_dialogs` about them).
-    let (_dir, mut h, cache) = cached_list_of(6).await;
+    let (_dir, mut h, cache) = cached_list_of(6, CacheSetup::CacheFirst).await;
     let channel = |id| ChatId {
         kind: crate::model::PeerKind::Channel,
         id,
@@ -155,37 +168,33 @@ async fn a_first_page_crossing_a_move_keeps_the_move() {
         .await;
     h.until(|e| matches!(e, Event::Reconciled { thread, .. } if thread.chat == unlisted))
         .await;
-    // Long (within the call deadline): the paused clock may jump while the
-    // actor waits on the cache's worker thread, and the page must still
-    // land after the move and the newer sources.
-    h.fake
-        .inject(Op::Dialogs, Fault::Delay(Duration::from_secs(25)));
+    let crossing_reply = h.fake.hold_snapshot(Op::Dialogs);
     let pages = h.fake.calls(Op::Dialogs);
     h.send(Command::LoadDialogs).await;
     dialogs_calls(&h, pages + 1).await;
     archive_across_a_response(&mut h, target).await;
     h.fake.edit_dialogs(|d| {
-        for c in d.iter_mut().filter(|c| c.id == unlisted) {
-            c.folder = PeerFolder::Archive;
+        for c in d {
+            if c.id == unlisted {
+                c.folder = PeerFolder::Archive;
+            } else if c.id == target {
+                c.title = "Updated by peer dialogs".into();
+            }
         }
     });
     h.fake
         .push_update(Update::Folders(vec![(unlisted, PeerFolder::Archive)]))
         .await;
-    for chat in [unlisted, target] {
-        h.fake.push_update(Update::ChatChanged { chat }).await;
-    }
-    for _ in 0..1000 {
-        if h.fake.calls(Op::PeerDialogs) >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        h.fake.calls(Op::PeerDialogs),
-        2,
-        "the newer sources are out"
-    );
+    h.fake
+        .push_update(Update::ChatChanged { chat: unlisted })
+        .await;
+    h.until(|e| matches!(e, Event::KindChanged { chat, .. } if *chat == unlisted))
+        .await;
+    h.fake
+        .push_update(Update::ChatChanged { chat: target })
+        .await;
+    h.until(|e| matches!(e, Event::ChatBumped(s) if s.id == target && s.title == "Updated by peer dialogs")).await;
+    crossing_reply.notify_one();
     let (crossing, _) = h
         .until(|e| matches!(e, Event::DialogsReset(_) | Event::DialogsAppended(_)))
         .await;
@@ -249,7 +258,7 @@ async fn a_later_page_crossing_a_move_keeps_the_move() {
 /// the chat never shows its stale folder, and the cache keeps the move.
 #[tokio::test(start_paused = true)]
 async fn a_page_older_than_an_evicted_move_is_dropped() {
-    let (_dir, mut h, cache) = cached_list_of(4).await;
+    let (_dir, mut h, cache) = cached_list_of(4, CacheSetup::EitherOrder).await;
     let target = chat(4);
     h.fake
         .inject(Op::Dialogs, Fault::Delay(Duration::from_secs(2)));

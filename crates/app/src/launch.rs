@@ -58,16 +58,16 @@ pub(crate) enum LaunchError {
 }
 
 /// Decides what to start from the command line and an environment lookup.
-/// The home directory comes from the user database (`storage::home_dir`),
-/// not `HOME`.
+/// The Application Support directory comes from Foundation
+/// (`storage::support_dir`): the container's when sandboxed, never `HOME`.
 pub(crate) fn resolve(
     args: impl IntoIterator<Item = OsString>,
     var: impl Fn(&str) -> Option<OsString>,
 ) -> Result<Launch, LaunchError> {
-    resolve_in(args, var, storage::home_dir())
+    resolve_in(args, var, storage::support_dir())
 }
 
-/// [`resolve`] with the home directory given.
+/// [`resolve`] with the Application Support directory given.
 #[cfg_attr(
     feature = "fake",
     expect(
@@ -78,7 +78,7 @@ pub(crate) fn resolve(
 pub(crate) fn resolve_in(
     args: impl IntoIterator<Item = OsString>,
     var: impl Fn(&str) -> Option<OsString>,
-    home: Option<std::path::PathBuf>,
+    support: Option<std::path::PathBuf>,
 ) -> Result<Launch, LaunchError> {
     // Skip argv[0]; ignore anything else (macOS may add `-psn_…`).
     let args: Vec<OsString> = args.into_iter().skip(1).collect();
@@ -98,7 +98,7 @@ pub(crate) fn resolve_in(
             cache: CacheLocation::fake(
                 var(storage::FAKE_CACHE_VAR).as_deref(),
                 var(storage::TMPDIR_VAR),
-                home,
+                support,
             ),
         });
         #[cfg(not(feature = "fake"))]
@@ -110,7 +110,7 @@ pub(crate) fn resolve_in(
     });
     Ok(Launch::Telegram {
         env,
-        cache: CacheLocation::real(home),
+        cache: CacheLocation::real(support),
     })
 }
 
@@ -248,9 +248,9 @@ mod tests {
     /// Task 9b: the real backend gets the Application Support cache.
     #[test]
     fn the_real_backend_gets_the_real_cache() {
-        let home = Some("/Users/someone".into());
-        // `HOME` is ignored: the home directory is the user database's.
-        let launch = resolve_in(args(&[]), env(&[("HOME", "/elsewhere")]), home);
+        let support = Some("/Users/someone/Library/Application Support".into());
+        // `HOME` is ignored: the root is Foundation's, handed in here.
+        let launch = resolve_in(args(&[]), env(&[("HOME", "/elsewhere")]), support);
         let Ok(Launch::Telegram { cache, .. }) = launch else {
             panic!("expected the real backend");
         };
@@ -261,7 +261,7 @@ mod tests {
         let Ok(Launch::Telegram { cache, .. }) = resolve_in(args(&[]), env(&[]), None) else {
             panic!("expected the real backend");
         };
-        assert!(cache.is_err(), "no home, no cache");
+        assert!(cache.is_err(), "no root, no cache");
     }
 
     /// Task 9b: `--fake` never gets the real cache, and a cache only when
@@ -269,9 +269,9 @@ mod tests {
     #[cfg(feature = "fake")]
     #[test]
     fn the_fake_gets_a_cache_only_when_asked() {
-        let home = || Some("/Users/someone".into());
+        let support = || Some("/Users/someone/Library/Application Support".into());
         let vars = [("TMPDIR", "/var/folders/t/")];
-        let Ok(Launch::Fake { cache, .. }) = resolve_in(args(&[FAKE_FLAG]), env(&vars), home())
+        let Ok(Launch::Fake { cache, .. }) = resolve_in(args(&[FAKE_FLAG]), env(&vars), support())
         else {
             panic!("expected the fake");
         };
@@ -280,7 +280,7 @@ mod tests {
             ("TMPDIR", "/var/folders/t/"),
             (crate::storage::FAKE_CACHE_VAR, "1"),
         ];
-        let Ok(Launch::Fake { cache, .. }) = resolve_in(args(&[FAKE_FLAG]), env(&asked), home())
+        let Ok(Launch::Fake { cache, .. }) = resolve_in(args(&[FAKE_FLAG]), env(&asked), support())
         else {
             panic!("expected the fake");
         };

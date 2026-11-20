@@ -63,8 +63,10 @@ fn child() {
     let key = CacheKey::generate().unwrap();
     let open = Cache::open(&cache, &key).unwrap();
     crate::storage::start_fake_cleanup(run.clone(), cache);
-    if scenario == "clean" {
-        return clean_child(open, &run);
+    match scenario.to_str().unwrap() {
+        "clean" => return clean_child(open, &run),
+        "ack" => return ack_child(open, &run),
+        _ => {}
     }
     let subscriber = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -76,7 +78,7 @@ fn child() {
         other => panic!("unknown scenario {other}"),
     }
     let start = Instant::now();
-    let cleanup = crate::shell::quit_signals(&|| {});
+    let cleanup = crate::shell::quit_signals(&|| None);
     let took = start.elapsed();
     let status = if took > PROMPT {
         SLOW
@@ -95,8 +97,30 @@ fn child() {
 /// awaiting the returned future sees the run directory removed.
 fn clean_child(open: Cache, run: &std::path::Path) {
     drop(open);
-    futures::executor::block_on(crate::shell::quit_signals(&|| {}));
+    futures::executor::block_on(crate::shell::quit_signals(&|| None));
     assert!(!run.exists(), "the run directory was removed");
+}
+
+/// The cleanup waits for core's ack when this quit is the first request, as an
+/// OS-initiated quit is (N48): core gets GPUI's quit budget to save, not just
+/// a cancel.
+fn ack_child(open: Cache, run: &std::path::Path) {
+    use std::future::Future;
+    use std::task::Context;
+
+    drop(open);
+    let (done, ack) = futures::channel::oneshot::channel();
+    let ack: crate::shell::bridge::ShutdownAck = Box::pin(async move { ack.await.ok() });
+    let ack = std::cell::Cell::new(Some(ack));
+    let mut quit = Box::pin(crate::shell::quit_signals(&|| ack.take()));
+    // Long enough for the cleanup worker to have finished: only core's
+    // ack can still be holding the future.
+    std::thread::sleep(Duration::from_millis(300));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(quit.as_mut().poll(&mut cx).is_pending(), "waits for core");
+    done.send(abyss_core::ShutdownReport::UNCONFIRMED).unwrap();
+    futures::executor::block_on(quit);
+    assert!(!run.exists(), "the run directory was removed after the ack");
 }
 
 /// Runs `child` for `scenario`; its exit status, or `None` if the watchdog
@@ -133,6 +157,11 @@ fn run(scenario: &str) -> Option<i32> {
 #[test]
 fn quit_cleanup_still_removes_the_fake_run() {
     assert_eq!(run("clean"), Some(0));
+}
+
+#[test]
+fn quit_waits_for_cores_ack_before_the_cleanup() {
+    assert_eq!(run("ack"), Some(0));
 }
 
 #[test]

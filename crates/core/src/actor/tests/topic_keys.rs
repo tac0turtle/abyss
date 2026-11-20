@@ -46,7 +46,7 @@ async fn settled() -> (Harness, CacheHandle, CacheDir) {
 /// A live message of chat 1 that reached its window.
 async fn delivered(h: &mut Harness, m: Message) -> Vec<Event> {
     let id = m.id;
-    h.fake.push_update(Update::NewMessage(m)).await;
+    h.fake.push_update(Update::NewMessage(m.into())).await;
     let whole = ThreadKey::whole(chat(1));
     let (ev, skipped) = h
         .until(|e| matches!(e, Event::History { thread, dir: HistoryDir::Newer, .. } if *thread == whole))
@@ -61,7 +61,9 @@ async fn delivered(h: &mut Harness, m: Message) -> Vec<Event> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_topic_tagged_message_of_a_non_forum_chat_bypasses_its_window() {
     let (mut h, cache, _dir) = settled().await;
-    h.fake.push_update(Update::NewMessage(tagged(11))).await;
+    h.fake
+        .push_update(Update::NewMessage(tagged(11).into()))
+        .await;
     h.until(|e| matches!(e, Event::ChatBumped(s) if s.last_id == Some(MsgId(11))))
         .await;
     h.fake.push_update(Update::Edited(tagged(10))).await;
@@ -110,7 +112,9 @@ async fn a_tail_requested_before_a_loss_of_continuity_does_not_restore_it() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     for id in 11..=19 {
-        h.fake.push_update(Update::NewMessage(tagged(id))).await;
+        h.fake
+            .push_update(Update::NewMessage(tagged(id).into()))
+            .await;
     }
     h.until(|e| matches!(e, Event::Reconciled { thread, .. } if *thread == whole))
         .await;

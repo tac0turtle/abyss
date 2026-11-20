@@ -31,6 +31,28 @@ pub struct ChatId {
     pub id: i64,
 }
 
+impl ChatId {
+    /// A Telegram Bot API dialog id encodes both the peer kind and its bare id.
+    pub fn dialog_id(self) -> Option<i64> {
+        crate::backend::grammers::map::peer_id(self)?.bot_api_dialog_id()
+    }
+
+    pub fn from_dialog_id(id: i64) -> Option<Self> {
+        use grammers_session::types::{PeerId, PeerKind as GrammersKind};
+
+        let peer = PeerId::from_bot_api_dialog_id(id)?;
+        let kind = match peer.kind() {
+            GrammersKind::User => PeerKind::User,
+            GrammersKind::Chat => PeerKind::Chat,
+            GrammersKind::Channel => PeerKind::Channel,
+        };
+        Some(Self {
+            kind,
+            id: peer.bare_id()?,
+        })
+    }
+}
+
 /// Server message id, unique per chat (supergroups) or per account (others).
 #[derive(
     serde::Serialize,
@@ -187,11 +209,13 @@ pub struct ChatSummary {
     /// without relying on timestamps, which collide within a second.
     pub last_id: Option<MsgId>,
     pub can_send: bool,
-    /// Notifications are muted until this time (Unix seconds; `0`: not
-    /// muted, `i32::MAX`: for good). Checked against the clock when used
-    /// ([`ChatSummary::muted_at`]), so an expired mute stops counting.
-    /// Chat folders can leave muted chats out.
-    pub muted_until: i64,
+    /// The chat's own mute deadline, in Unix seconds. An explicit zero
+    /// overrides the account default; absence inherits it.
+    pub muted_until: Option<i64>,
+    /// The account default for this chat's kind. Projected by core and
+    /// kept only in memory.
+    #[serde(skip)]
+    pub scope_muted_until: i64,
     /// The main list or the archive. The list holds both; the UI shows one
     /// at a time.
     pub folder: PeerFolder,
@@ -361,9 +385,18 @@ impl ChatSummary {
         self.displayed_unread() > 0 || (!forum && self.unread_mentions > 0)
     }
 
+    /// Whether the server's unread state contributes to the Dock badge.
+    pub fn has_confirmed_unread(&self) -> bool {
+        if matches!(self.kind, ChatKind::Supergroup { forum: true, .. }) {
+            self.topic_unread.unwrap_or(self.read.unread) > 0
+        } else {
+            self.read.unread > 0 || self.unread_mentions > 0
+        }
+    }
+
     /// Whether notifications are muted at `now` (Unix seconds).
     pub fn muted_at(&self, now: i64) -> bool {
-        self.muted_until > now
+        self.muted_until.unwrap_or(self.scope_muted_until) > now
     }
 }
 
@@ -673,7 +706,7 @@ impl Preview {
     /// the media kind.
     pub fn of(m: &Message) -> Self {
         match &m.body {
-            Body::Text(rt) => Preview::Text(clean(rt.text(), MAX_PREVIEW_BYTES)),
+            Body::Text(rt) => Preview::Text(clean(&rt.excerpt(), MAX_PREVIEW_BYTES)),
             Body::Media { kind, .. } => Preview::Media(kind.clone()),
             Body::Service(_) | Body::Unsupported => Preview::Service,
         }
@@ -730,6 +763,24 @@ mod tests {
             reply_to: None,
             body: Body::Unsupported,
         }
+    }
+
+    #[test]
+    fn preview_text_hides_spoilers() {
+        use crate::rich_text::{EntityKind, RawEntity, RichText, SPOILER_EXCERPT};
+
+        let text = "pin 4417 ok";
+        let entity = RawEntity {
+            offset: 4,
+            length: 4,
+            kind: EntityKind::Spoiler,
+        };
+        let mut m = message(None);
+        m.body = Body::Text(RichText::from_entities(text, &[entity]));
+        assert_eq!(
+            Preview::of(&m),
+            Preview::Text(format!("pin {SPOILER_EXCERPT} ok"))
+        );
     }
 
     #[test]

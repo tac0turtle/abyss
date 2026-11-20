@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use abyss_core::api::UserError;
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, FontWeight, SharedString, Stateful, Window, div,
-    prelude::*, px,
+    AnyElement, App, ClickEvent, Context, Div, FontWeight, IntoElement, Role, ScrollHandle,
+    SharedString, Stateful, Window, div, prelude::*, px, text,
 };
 
 use super::appearance;
@@ -18,9 +18,9 @@ use super::{Failure, Root, State};
 use crate::chat::copy as chat_copy;
 use crate::chat::inline::Inline;
 use crate::chat::list::Step;
-use crate::ui::copy;
 use crate::ui::mark::mark;
 use crate::ui::theme::{self, Depth, Mode, Side, Theme, Themes};
+use crate::ui::{a11y, a11y::FocusDirection, copy};
 
 mod onboarding;
 
@@ -32,81 +32,134 @@ impl Render for Root {
             // The sidebar's rows are cached: a folder's expired mutes are
             // rechecked here, at most once a minute (plan section 17.7).
             session.shell.list.recheck(crate::chat::format::now());
+            session.sync_composer_label(cx);
         }
         let theme = &Themes::of(window, cx);
         let (body, overlay) = match &self.state {
-            State::Failed(failure) => (failure_screen(failure).into_any_element(), None),
+            State::Failed(failure) => (failure_screen(failure, theme).into_any_element(), None),
             State::Running(session) => (
-                session_body(session, theme, cx),
-                closing_overlay(session.closing, theme),
+                session_body(session, theme, window, cx),
+                closing_overlay(session.closing, &self.closing_focus, theme, window, cx),
             ),
         };
-        let panel = self
-            .appearance_open
-            .then(|| appearance::panel(theme, Mode::of(window), Themes::settings(cx), cx));
-        div()
-            .size_full()
-            .relative()
-            .flex()
-            .flex_col()
-            .bg(theme.surface(Depth::NOW))
-            .text_color(theme.text)
-            .font_family(theme::BODY_FONT)
-            .text_size(px(14.))
-            // The content view extends under the transparent macOS title
-            // bar. Paint it in the theme, but keep content below the native
-            // controls. Fullscreen needs no permanent title-bar space.
-            .pt(super::titlebar_inset(window))
-            .on_action(cx.listener(|root, _: &super::ForumBack, window, cx| {
-                root.with_session(|s, cx| s.back_from_forum(window, cx), cx);
-            }))
-            .on_action(cx.listener(|root, _: &super::NextTab, window, cx| {
-                root.with_session(|s, cx| s.step_tab(Step::Next, window, cx), cx);
-            }))
-            .on_action(cx.listener(|root, _: &super::PreviousTab, window, cx| {
-                root.with_session(|s, cx| s.step_tab(Step::Previous, window, cx), cx);
-            }))
-            .on_action(cx.listener(|root, _: &super::ToggleUnread, window, cx| {
-                root.with_session(|s, cx| s.toggle_unread(window, cx), cx);
-            }))
-            .on_action(cx.listener(|root, _: &super::NextRow, window, cx| {
-                root.with_session(|s, cx| s.step_row(Step::Next, window, cx), cx);
-            }))
-            .on_action(cx.listener(|root, _: &super::PreviousRow, window, cx| {
-                root.with_session(|s, cx| s.step_row(Step::Previous, window, cx), cx);
-            }))
-            .on_action(cx.listener(|root, _: &super::ExpandForum, _, cx| {
-                root.with_session(|s, cx| s.set_inline(Inline::Expanded, cx), cx);
-            }))
-            .on_action(cx.listener(|root, _: &super::CollapseForum, _, cx| {
-                root.with_session(|s, cx| s.set_inline(Inline::Collapsed, cx), cx);
-            }))
-            .child(body)
+        // Settings closes when shutdown starts (`request_quit`); it is never
+        // drawn beside the closing overlay either (N43).
+        let panel = (self.appearance_open && overlay.is_none()).then(|| {
+            appearance::panel(
+                theme,
+                Mode::of(window),
+                Themes::settings(cx),
+                self,
+                window,
+                cx,
+            )
+        });
+        let occluded = panel.is_some() || overlay.is_some();
+        shell_frame(theme, window, cx)
+            .child(behind_overlay("main-body", body, occluded))
             .children(panel)
             .children(overlay)
     }
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "overlay presence controls native tree visibility"
+)]
+fn behind_overlay(id: &'static str, body: AnyElement, hidden: bool) -> AnyElement {
+    div()
+        .id(id)
+        .relative()
+        .size_full()
+        .when(hidden, |element| {
+            element
+                .role(Role::Group)
+                .a11y_synthetic_children(|builder| builder.parent_node().set_hidden())
+        })
+        .child(body)
+        .into_any_element()
+}
+
+fn shell_frame(theme: &Theme, window: &Window, cx: &mut Context<'_, Root>) -> Div {
+    div()
+        .size_full()
+        .relative()
+        .flex()
+        .flex_col()
+        .bg(theme.surface(Depth::NOW))
+        .text_color(theme.text)
+        .font_family(theme::BODY_FONT)
+        .text_size(px(14.))
+        // The content view extends under the transparent macOS title
+        // bar. Paint it in the theme, but keep content below the native
+        // controls. Fullscreen needs no permanent title-bar space.
+        .pt(super::titlebar_inset(window))
+        .on_action(cx.listener(|root, _: &super::FocusNext, window, cx| {
+            root.step_focus(FocusDirection::Next, window, cx);
+        }))
+        .on_action(cx.listener(|root, _: &super::FocusPrevious, window, cx| {
+            root.step_focus(FocusDirection::Previous, window, cx);
+        }))
+        .on_action(cx.listener(|root, _: &super::ForumBack, window, cx| {
+            root.with_chat_shortcut(|s, cx| s.back_from_forum(window, cx), cx);
+        }))
+        .on_action(cx.listener(|root, _: &super::NextTab, window, cx| {
+            root.with_chat_shortcut(|s, cx| s.step_tab(Step::Next, window, cx), cx);
+        }))
+        .on_action(cx.listener(|root, _: &super::PreviousTab, window, cx| {
+            root.with_chat_shortcut(|s, cx| s.step_tab(Step::Previous, window, cx), cx);
+        }))
+        .on_action(cx.listener(|root, _: &super::ToggleUnread, window, cx| {
+            root.with_chat_shortcut(|s, cx| s.toggle_unread(window, cx), cx);
+        }))
+        .on_action(cx.listener(|root, _: &super::NextRow, window, cx| {
+            root.with_chat_shortcut(|s, cx| s.step_row(Step::Next, window, cx), cx);
+        }))
+        .on_action(cx.listener(|root, _: &super::PreviousRow, window, cx| {
+            root.with_chat_shortcut(|s, cx| s.step_row(Step::Previous, window, cx), cx);
+        }))
+        .on_action(cx.listener(|root, _: &super::ExpandForum, _, cx| {
+            root.with_chat_shortcut(|s, cx| s.set_inline(Inline::Expanded, cx), cx);
+        }))
+        .on_action(cx.listener(|root, _: &super::CollapseForum, _, cx| {
+            root.with_chat_shortcut(|s, cx| s.set_inline(Inline::Collapsed, cx), cx);
+        }))
+}
+
 /// A card screen: scrolls when its content is taller than the window, and
 /// is centered when it fits (task 12: the guide was cut off, buttons
 /// unreachable, on a short window).
-pub(super) fn page(content: impl IntoElement) -> AnyElement {
-    div()
-        .id("page")
-        .size_full()
-        .overflow_y_scroll()
-        .child(
-            div()
-                .w_full()
-                .min_h_full()
-                .flex()
-                .flex_col()
-                .justify_center()
-                .items_center()
-                .py_4()
-                .child(content),
-        )
-        .into_any_element()
+fn page(content: impl IntoElement) -> AnyElement {
+    Page(content.into_any_element()).into_any_element()
+}
+
+#[derive(IntoElement)]
+struct Page(AnyElement);
+
+impl RenderOnce for Page {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let state = window.use_state(cx, |_, _| ScrollHandle::new());
+        let scroll = state.read(cx).clone();
+        div()
+            .id("page")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .on_action(move |action: &a11y::RevealFocus, window, _| {
+                action.scroll_page(&scroll, window);
+            })
+            .child(
+                div()
+                    .w_full()
+                    .min_h_full()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .items_center()
+                    .py_4()
+                    .child(self.0),
+            )
+    }
 }
 
 pub(super) fn centered() -> Div {
@@ -122,16 +175,40 @@ pub(super) fn card() -> Div {
     div().w(px(420.)).flex().flex_col().gap_3().p_6()
 }
 
-pub(super) fn title(text: impl Into<SharedString>) -> Div {
-    div()
-        .text_xl()
-        .font_weight(FontWeight::SEMIBOLD)
-        .child(text.into())
+fn title(text: impl Into<SharedString>) -> Stateful<Div> {
+    heading_style(a11y::heading("heading", text, 1))
+}
+
+fn heading_style<E: Styled>(heading: E) -> E {
+    heading.text_xl().font_weight(FontWeight::SEMIBOLD)
+}
+
+/// Quiet text with a stable identity for each accessible paragraph.
+fn quiet_lines<'a>(
+    id: &'static str,
+    lines: impl IntoIterator<Item = &'a str>,
+    theme: &Theme,
+) -> impl Iterator<Item = Div> {
+    let opacity = theme.quiet_opacity();
+    lines
+        .into_iter()
+        .enumerate()
+        .map(move |(i, line)| div().opacity(opacity).child(text!(id = (id, i), line)))
 }
 
 /// Quiet text: whatever color it inherits, at reduced strength.
-pub(super) fn muted(text: impl Into<SharedString>) -> Div {
-    div().opacity(theme::QUIET).child(text.into())
+pub(super) fn muted(text: impl Into<SharedString>, theme: &Theme) -> Div {
+    div().opacity(theme.quiet_opacity()).child(text.into())
+}
+
+/// Quiet text a screen reader announces when it arrives or changes: a
+/// plain string child has no accessibility node of its own.
+pub(super) fn quiet_status(
+    id: &'static str,
+    text: impl Into<SharedString>,
+    theme: &Theme,
+) -> Stateful<Div> {
+    a11y::status(id, text).opacity(theme.quiet_opacity())
 }
 
 /// Quiet text inside a message bubble on `side`, at that bubble's quiet
@@ -140,7 +217,7 @@ pub(super) fn muted_in(text: impl Into<SharedString>, side: Side, theme: &Theme)
     div().opacity(theme.quiet_in(side)).child(text.into())
 }
 
-fn failure_screen(failure: &Failure) -> impl IntoElement {
+fn failure_screen(failure: &Failure, theme: &Theme) -> impl IntoElement {
     let (heading, lines) = match failure {
         Failure::Launch(error) => copy::launch_error(error),
         Failure::Start(error) => copy::start_error(error),
@@ -149,7 +226,9 @@ fn failure_screen(failure: &Failure) -> impl IntoElement {
         card()
             .w(px(560.))
             .child(title(heading))
-            .children(lines.into_iter().map(muted)),
+            .children(lines.into_iter().enumerate().map(|(i, message)| {
+                a11y::alert(("startup-error", i), message).opacity(theme.quiet_opacity())
+            })),
     )
 }
 
@@ -186,12 +265,17 @@ impl Session {
     }
 }
 
-fn session_body(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
+fn session_body(
+    session: &Session,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut Context<'_, Root>,
+) -> AnyElement {
     let screen = match session.screen() {
         Screen::Auth => auth_screen(session, theme, cx),
         Screen::Recovery => recovery_view(session, theme, cx),
         Screen::Stopped => centered()
-            .child(muted(chat_copy::STOPPED_RESTART))
+            .child(quiet_status("stopped", chat_copy::STOPPED_RESTART, theme))
             .into_any_element(),
     };
     let live = session.screen() == Screen::Auth;
@@ -205,33 +289,41 @@ fn session_body(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) ->
         ))
     });
     let confirm =
-        (live && session.confirming_logout()).then(|| logout_confirm(theme, cx).into_any_element());
+        (live && session.confirming_logout()).then(|| logout_confirm(session, theme, window, cx));
+    let menu = (live && session.auth == AuthView::SignedIn && confirm.is_none())
+        .then(|| super::folder_menu::menu_overlay(session, theme, window, cx))
+        .flatten();
     let credential = live
         .then(|| credential_banner(session, theme, cx))
         .flatten();
-    div()
+    let base = div()
         .size_full()
         .relative()
+        .id("session")
+        .when(live && session.auth != AuthView::SignedIn, |body| {
+            body.role(Role::Group)
+                .aria_label("Telegram sign-in")
+                .track_focus(&session.auth_focus)
+        })
         .child(screen)
         .children(credential)
         .children(logout)
-        .children(confirm)
-        .children(
-            (live && session.auth == AuthView::SignedIn)
-                .then(|| super::folder_menu::menu_overlay(session, theme, cx))
-                .flatten(),
-        )
         .children(
             (live && !session.discarded.is_empty())
                 .then(|| discarded_notice(&session.discarded, theme, cx)),
         )
-        .children(
-            session
-                .writes_cancelled
-                .then(|| copy::user_error(UserError::FolderWritesCancelled))
-                .or_else(|| session.notice.clone())
-                .map(|text| toast(text, theme)),
-        )
+        .into_any_element();
+    div()
+        .size_full()
+        .relative()
+        .child(behind_overlay(
+            "session-body",
+            base,
+            confirm.is_some() || menu.is_some(),
+        ))
+        .children(confirm)
+        .children(menu)
+        .children(session_notice(session, theme))
         .into_any_element()
 }
 
@@ -248,8 +340,12 @@ fn recovery_view(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -
                 .px_4()
                 .py_2()
                 .border_b_1()
-                .border_color(theme::line(theme.text))
-                .child(muted(session.stopped_banner())),
+                .border_color(theme.line(theme.text))
+                .child(quiet_status(
+                    "stopped-banner",
+                    session.stopped_banner(),
+                    theme,
+                )),
         )
         .child(
             div()
@@ -265,7 +361,7 @@ fn raised(el: Div, theme: &Theme) -> Div {
     el.bg(theme.surface(Depth::NOW))
         .text_color(theme.text)
         .border_1()
-        .border_color(theme::line(theme.text))
+        .border_color(theme.line(theme.text))
         .rounded(px(theme::RADIUS))
 }
 
@@ -288,13 +384,18 @@ fn credential_banner(session: &Session, theme: &Theme, cx: &mut Context<'_, Root
         .items_center()
         .px_3()
         .py_2()
-        .child(div().child(text))
+        .child(a11y::alert("credential-item-error", text))
         .children(retry);
     Some(raised(banner, theme))
 }
 
 /// Logout deletes local data, so it asks first.
-fn logout_confirm(theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
+fn logout_confirm(
+    session: &Session,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut Context<'_, Root>,
+) -> Div {
     let cancel = on(
         secondary("logout-cancel", copy::CANCEL, theme),
         Session::cancel_logout,
@@ -305,11 +406,29 @@ fn logout_confirm(theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
         Session::confirm_logout,
         cx,
     );
-    let content = card()
+    let group = &session.logout_focus.group;
+    group.enter_after_draw(window, cx);
+    let content = group
+        .frame(a11y::labelled(
+            raised(card(), theme),
+            "logout-dialog",
+            Role::Dialog,
+            copy::LOGOUT_CONFIRM_TITLE,
+        ))
+        .key_context("Overlay")
+        .a11y_synthetic_children(|builder| builder.parent_node().set_modal())
+        .on_action(cx.listener(|root, _: &super::DismissOverlay, window, cx| {
+            root.with_session(|s, cx| s.cancel_logout(window, cx), cx);
+        }))
         .child(title(copy::LOGOUT_CONFIRM_TITLE))
-        .child(muted(copy::LOGOUT_CONFIRM_DETAIL))
-        .child(footer(None, vec![cancel, confirm]));
-    modal(raised(content, theme), theme)
+        .child(
+            div()
+                .opacity(theme.quiet_opacity())
+                .child(a11y::text("logout-detail", copy::LOGOUT_CONFIRM_DETAIL)),
+        )
+        .child(footer(None, vec![cancel, confirm]))
+        .child(group.end());
+    modal(content, theme)
 }
 
 /// "Logout incomplete": the local deletion failed; Retry runs it again.
@@ -319,10 +438,13 @@ fn logout_incomplete_screen(
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
     use abyss_core::api::RemoteLogout;
-    let remote = matches!(remote, RemoteLogout::Failed(_) | RemoteLogout::TimedOut)
-        .then(|| muted(copy::LOGOUT_REMOTE_UNCONFIRMED));
+    let remote = matches!(remote, RemoteLogout::Failed(_) | RemoteLogout::TimedOut).then(|| {
+        div()
+            .opacity(theme.quiet_opacity())
+            .child(text!(copy::LOGOUT_REMOTE_UNCONFIRMED))
+    });
     let retry = on(
-        button("retry-logout", copy::onboarding::RETRY, theme),
+        auth_button("retry-logout", copy::onboarding::RETRY, theme),
         Session::retry_logout,
         cx,
     );
@@ -357,7 +479,7 @@ fn logout_not_started_screen(
         )
     });
     let retry = on(
-        button("retry-logout", copy::onboarding::RETRY, theme),
+        auth_button("retry-logout", copy::onboarding::RETRY, theme),
         Session::retry_logout,
         cx,
     );
@@ -373,7 +495,7 @@ fn logout_not_started_screen(
 /// "Couldn't read Keychain" at startup: Retry reads the marker again.
 fn startup_blocked_screen(theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     let retry = on(
-        button("retry-startup", copy::onboarding::RETRY, theme),
+        auth_button("retry-startup", copy::onboarding::RETRY, theme),
         Session::retry_startup,
         cx,
     );
@@ -391,7 +513,7 @@ fn startup_blocked_screen(theme: &Theme, cx: &mut Context<'_, Root>) -> AnyEleme
 fn auth_screen(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     use copy::onboarding as text;
     match &session.auth {
-        AuthView::Connecting => connecting_screen(),
+        AuthView::Connecting => connecting_screen(theme),
         AuthView::Onboarding(step) => onboarding::screen(session, step, theme, cx),
         AuthView::Phone { error } => phone_screen(session, *error, theme, cx),
         AuthView::Code {
@@ -421,7 +543,7 @@ fn auth_screen(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> 
             cx,
         ),
 
-        AuthView::LoggingOut | AuthView::LogoutStarting => onboarding::logging_out_screen(),
+        AuthView::LoggingOut | AuthView::LogoutStarting => onboarding::logging_out_screen(theme),
         AuthView::LogoutIncomplete { remote } => logout_incomplete_screen(*remote, theme, cx),
         AuthView::LogoutNotStarted { trigger } => {
             logout_not_started_screen(session, *trigger, theme, cx)
@@ -435,8 +557,10 @@ fn auth_screen(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> 
     }
 }
 
-fn connecting_screen() -> AnyElement {
-    centered().child(muted(copy::CONNECTING)).into_any_element()
+fn connecting_screen(theme: &Theme) -> AnyElement {
+    centered()
+        .child(title(copy::CONNECTING).opacity(theme.quiet_opacity()))
+        .into_any_element()
 }
 
 fn phone_screen(
@@ -477,13 +601,14 @@ fn password_screen(
 }
 
 /// An input's frame: the same wash as an incoming message.
-pub(super) fn field(input: AnyElement, theme: &Theme) -> Div {
+pub(super) fn field(input: AnyElement, border: gpui::Rgba, theme: &Theme) -> Stateful<Div> {
     div()
+        .id("folder-name-frame")
         .w_full()
         .px_3()
         .py_2()
-        .border_1()
-        .border_color(theme::line(theme.text))
+        .border_2()
+        .border_color(border)
         .rounded(px(theme::RADIUS))
         .bg(theme.incoming)
         .text_color(theme.on_incoming)
@@ -492,36 +617,47 @@ pub(super) fn field(input: AnyElement, theme: &Theme) -> Div {
 
 /// A primary action, in the theme's `accent`.
 pub(super) fn button(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_4()
+    auth_button(id, label, theme)
+}
+
+fn auth_button(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div> {
+    let button = a11y::focus_ring(a11y::button(id, label), theme.on_accent);
+    primary_style(button, theme)
+}
+
+pub(super) fn primary_style(el: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
+    el.px_4()
         .py_2()
         .rounded(px(theme::RADIUS))
         .bg(theme.accent)
         .text_color(theme.on_accent)
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
-        .child(label)
 }
 
 /// The lesser action beside a [`button`]: an outline, no fill.
 fn secondary(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_4()
-        .py_2()
-        .rounded(px(theme::RADIUS))
-        .border_1()
-        .border_color(theme::line(theme.text))
-        .cursor_pointer()
-        .child(label)
+    let button = a11y::focus_ring(a11y::button(id, label), theme.text);
+    secondary_style(button, theme)
 }
 
-/// Wires a button to a session action.
+fn secondary_style(el: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
+    el.px_4()
+        .py_2()
+        .rounded(px(theme::RADIUS))
+        .border_color(theme.line(theme.text))
+        .cursor_pointer()
+}
+
+/// Wires an accessible control to a session action.
 fn on(el: Stateful<Div>, action: SubmitFn, cx: &mut Context<'_, Root>) -> Stateful<Div> {
-    el.on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
-        root.with_session(|s, cx| action(s, window, cx), cx);
-    }))
+    let root = cx.weak_entity();
+    a11y::on_activate(el, move |window, cx| {
+        root.update(cx, |root, cx| {
+            root.with_session(|s, cx| action(s, window, cx), cx)
+        })
+        .ok();
+    })
 }
 
 /// Back, where the screen has one (plan section 17.3).
@@ -552,13 +688,12 @@ fn footer(back: Option<Stateful<Div>>, actions: Vec<Stateful<Div>>) -> Div {
 
 /// An inline error. No color marks it (the theme has none to spare): a rule
 /// and a heavier weight do.
-fn error_line(text: impl Into<SharedString>, theme: &Theme) -> Div {
-    div()
+fn error_line(text: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
+    a11y::alert("inline-error", text)
         .pl_2()
         .border_l_2()
         .border_color(theme.text)
         .font_weight(FontWeight::MEDIUM)
-        .child(text.into())
 }
 
 /// The mark, the wordmark and the tagline, above each sign-in step.
@@ -581,7 +716,11 @@ pub(super) fn brand(theme: &Theme) -> Div {
                         .child(chat_copy::WORDMARK),
                 ),
         )
-        .child(muted(copy::TAGLINE))
+        .child(
+            div()
+                .opacity(theme.quiet_opacity())
+                .child(text!(copy::TAGLINE)),
+        )
 }
 
 /// A login step: heading, explanation, one input, extra lines, inline
@@ -599,17 +738,31 @@ struct LoginForm {
 impl LoginForm {
     fn render(self, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
         let error = self.error.map(|e| error_line(copy::user_error(e), theme));
-        let submit = on(button("continue", copy::CONTINUE, theme), self.submit, cx);
+        let submit = on(
+            auth_button("continue", copy::CONTINUE, theme),
+            self.submit,
+            cx,
+        );
         page(
             card()
                 .child(brand(theme))
                 .child(title(self.heading))
-                .child(muted(self.detail))
-                .child(field(self.input, theme))
+                .child(
+                    div()
+                        .opacity(theme.quiet_opacity())
+                        .child(text!(self.detail)),
+                )
+                .child(self.input)
                 .children(self.extra)
                 .children(error)
                 .child(footer(self.back, vec![submit]))
-                .child(muted(copy::DESCRIPTOR).text_xs().pt_4()),
+                .child(
+                    div()
+                        .opacity(theme.quiet_opacity())
+                        .text_xs()
+                        .pt_4()
+                        .child(text!(copy::DESCRIPTOR)),
+                ),
         )
         .into_any_element()
     }
@@ -625,14 +778,32 @@ fn flood_wait_screen(
     page(
         card()
             .child(title(copy::FLOOD_TITLE))
-            .child(muted(copy::flood_detail(left)))
+            .child(
+                div()
+                    .opacity(theme.quiet_opacity())
+                    .child(text!(copy::flood_detail(left))),
+            )
             .child(footer(back_button(session, theme, cx), Vec::new())),
     )
     .into_any_element()
 }
 
+fn session_notice(session: &Session, theme: &Theme) -> Option<Div> {
+    let text = session
+        .writes_cancelled
+        .then(|| copy::user_error(UserError::FolderWritesCancelled))
+        .or_else(|| session.notice.clone())?;
+    let content = if session.screen() == Screen::Auth && session.auth != AuthView::SignedIn {
+        a11y::alert("notice", text)
+    } else {
+        a11y::status("notice", text)
+    }
+    .into_any_element();
+    Some(toast(content, theme))
+}
+
 /// A passing notice: outlined, on the base surface, quieter than a message.
-fn toast(text: SharedString, theme: &Theme) -> Div {
+fn toast(content: AnyElement, theme: &Theme) -> Div {
     div()
         .absolute()
         .bottom_4()
@@ -646,10 +817,10 @@ fn toast(text: SharedString, theme: &Theme) -> Div {
                 .py_2()
                 .rounded_full()
                 .border_1()
-                .border_color(theme::line(theme.text))
+                .border_color(theme.line(theme.text))
                 .bg(theme.surface(Depth::NOW))
                 .text_color(theme.text)
-                .child(text),
+                .child(content),
         )
 }
 
@@ -672,7 +843,13 @@ fn discarded_notice(
         .px_4()
         .py_2()
         .occlude()
-        .child(div().flex().flex_col().children(lines))
+        .child(
+            div().flex().flex_col().children(
+                lines
+                    .enumerate()
+                    .map(|(i, line)| a11y::status(("discarded", i), line)),
+            ),
+        )
         .child(on(
             secondary("discarded-copy", chat_copy::COPY_TEXT, theme),
             Session::copy_discarded,
@@ -693,32 +870,81 @@ fn discarded_notice(
         .child(raised(notice, theme))
 }
 
-/// A blocking notice with a Quit button.
-fn quit_card(heading: &'static str, detail: &'static str, theme: &Theme) -> Div {
-    card().child(title(heading)).child(muted(detail)).child(
-        div()
-            .flex()
-            .justify_end()
-            .child(button("quit", copy::QUIT, theme).on_click(|_: &ClickEvent, _, cx| cx.quit())),
-    )
+/// The closing overlay's dialog. It hides the window's body from assistive
+/// technology (`behind_overlay`), so it must be a node of its own, and the
+/// one place focus can be (`Root::overlay_focus`).
+fn closing_dialog(
+    focus: &a11y::OverlayFocus,
+    label: &'static str,
+    content: Div,
+    closing: Closing,
+    window: &Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    // Without a control, focus stays on the dialog; stepping into it would
+    // redraw for ever.
+    if closing != Closing::Waiting {
+        focus.group.enter_after_draw(window, cx);
+    }
+    focus
+        .group
+        .frame(a11y::labelled(
+            content,
+            "closing-dialog",
+            Role::Dialog,
+            label,
+        ))
+        .a11y_synthetic_children(|builder| builder.parent_node().set_modal())
+        .child(focus.group.end())
 }
 
-fn closing_overlay(closing: Closing, theme: &Theme) -> Option<AnyElement> {
-    let content = match closing {
+/// A blocking notice with a Quit button: a dialog named by its heading,
+/// whose detail is an alert read on arrival.
+fn quit_card(heading: &'static str, detail: &'static str, theme: &Theme) -> Div {
+    card()
+        .child(title(heading))
+        .child(a11y::alert("closing-detail", detail).opacity(theme.quiet_opacity()))
+        .child(
+            div().flex().justify_end().child(
+                button("quit", copy::QUIT, theme).on_click(|_: &ClickEvent, _, cx| cx.quit()),
+            ),
+        )
+}
+
+fn closing_overlay(
+    closing: Closing,
+    focus: &a11y::OverlayFocus,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    let (label, content) = match closing {
         Closing::Open => return None,
-        Closing::Waiting => card().items_center().child(title(copy::CLOSING)),
-        Closing::Unconfirmed => quit_card(copy::UNCONFIRMED_TITLE, copy::UNCONFIRMED_DETAIL, theme),
-        Closing::LogoutUnfinished => quit_card(
+        Closing::Waiting => (
+            copy::CLOSING,
+            card()
+                .items_center()
+                .child(heading_style(a11y::status("closing-status", copy::CLOSING))),
+        ),
+        Closing::Unconfirmed => (
+            copy::UNCONFIRMED_TITLE,
+            quit_card(copy::UNCONFIRMED_TITLE, copy::UNCONFIRMED_DETAIL, theme),
+        ),
+        Closing::LogoutUnfinished => (
             copy::LOGOUT_UNFINISHED_TITLE,
-            copy::LOGOUT_UNFINISHED_DETAIL,
-            theme,
+            quit_card(
+                copy::LOGOUT_UNFINISHED_TITLE,
+                copy::LOGOUT_UNFINISHED_DETAIL,
+                theme,
+            ),
         ),
     };
-    Some(modal(content, theme).into_any_element())
+    let dialog = closing_dialog(focus, label, content, closing, window, cx);
+    Some(modal(dialog, theme).into_any_element())
 }
 
 /// A layer over the window that blocks the content under it.
-fn modal(content: Div, theme: &Theme) -> Div {
+fn modal(content: impl IntoElement, theme: &Theme) -> Div {
     div()
         .absolute()
         .top_0()

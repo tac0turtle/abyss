@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
-use crate::api::Event;
+use crate::api::{Event, NotificationCleanup};
 
 /// Maximum queued events.
 pub const EVENT_CAPACITY: usize = 1024;
@@ -45,6 +45,7 @@ pub struct EventSender {
     budget: Arc<Semaphore>,
     /// The epoch stamped on events sent from now on.
     epoch: Arc<AtomicU64>,
+    notification_cleanup: NotificationCleanupPolicy,
 }
 
 #[derive(Debug)]
@@ -70,13 +71,31 @@ impl EpochObserver {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Closed;
 
+/// Whether the installation needs notification cleanup and can perform it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotificationCleanupPolicy {
+    #[default]
+    Disabled,
+    /// This installation may have old notifications, but cannot reach the center.
+    Unavailable,
+    /// The event consumer can confirm removal from the center.
+    Required,
+}
+
 pub fn channel() -> (EventSender, EventReceiver) {
+    channel_with_notifications(NotificationCleanupPolicy::Disabled)
+}
+
+pub(crate) fn channel_with_notifications(
+    notification_cleanup: NotificationCleanupPolicy,
+) -> (EventSender, EventReceiver) {
     let (tx, rx) = mpsc::channel(EVENT_CAPACITY);
     let budget = Arc::new(Semaphore::new(TOTAL_PERMITS));
     let sender = EventSender {
         tx,
         budget,
         epoch: Arc::new(AtomicU64::new(0)),
+        notification_cleanup,
     };
     let receiver = EventReceiver {
         rx,
@@ -86,6 +105,32 @@ pub fn channel() -> (EventSender, EventReceiver) {
 }
 
 impl EventSender {
+    pub(crate) fn has_notifications(&self) -> bool {
+        self.notification_cleanup == NotificationCleanupPolicy::Required
+    }
+
+    pub(crate) fn requires_notification_cleanup(&self) -> bool {
+        self.notification_cleanup != NotificationCleanupPolicy::Disabled
+    }
+
+    /// Returns true only when the consumer confirms the center is empty.
+    pub(crate) async fn clear_notifications(&self) -> bool {
+        if !self.has_notifications() {
+            return false;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let clearance = async {
+            self.send(Event::ClearNotifications(NotificationCleanup(tx)))
+                .await
+                .ok()?;
+            rx.await.ok()
+        };
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), clearance).await,
+            Ok(Some(()))
+        )
+    }
+
     /// Queues `event`, waiting for both a slot and byte budget. If the receiver
     /// is gone, the permit is dropped with the rejected event, returning its budget.
     pub async fn send(&self, event: Event) -> Result<(), Closed> {

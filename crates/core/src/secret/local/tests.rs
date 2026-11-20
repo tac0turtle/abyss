@@ -12,22 +12,75 @@ fn store<S: SecretStore>(dir: &Path, keychain: S, protection: Protection) -> Swi
         SecretStorageConfig {
             dir: dir.to_owned(),
             use_keychain: protection == Protection::Keychain,
+            keychain_namespace: crate::secret::KeychainNamespace::Bare,
         },
         keychain,
     )
 }
 
-fn seed(keychain: &MemoryStore) {
+fn seed(keychain: &impl SecretStore) {
     for item in ITEMS {
         keychain.set(item, item.suffix().as_bytes()).unwrap();
     }
 }
 
 #[test]
-fn legacy_import_preserves_every_item_and_local_restarts_never_access_keychain() {
+fn fresh_local_store_cannot_import_another_roots_keychain_items() {
+    let bare_dir = tempfile::tempdir().unwrap();
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let keychain = MemoryStore::new();
+    let bare = store(bare_dir.path(), keychain.clone(), Protection::Keychain);
+    let bundled = store(bundle_dir.path(), keychain, Protection::Local);
+    for item in ITEMS {
+        bare.set(item, item.suffix().as_bytes()).unwrap();
+    }
+    for item in ITEMS {
+        assert_eq!(bundled.get(item).unwrap(), None);
+        assert_eq!(
+            bare.get(item).unwrap().unwrap().as_slice(),
+            item.suffix().as_bytes()
+        );
+    }
+}
+
+/// Review A29: the Keychain namespace belongs to one installation regime and
+/// user, so a manifest lost while the preference still says Keychain is
+/// recovered from that namespace; it is a recovery, and it never reaches the
+/// local default or another namespace's items.
+#[test]
+fn a_lost_manifest_in_keychain_mode_recovers_its_own_namespace_only() {
     let dir = tempfile::tempdir().unwrap();
     let keychain = MemoryStore::new();
     seed(&keychain);
+    let recovered = store(dir.path(), keychain.clone(), Protection::Keychain);
+    for item in ITEMS {
+        assert_eq!(
+            recovered.get(item).unwrap().unwrap().as_slice(),
+            item.suffix().as_bytes(),
+            "the same namespace's items are the store of record"
+        );
+    }
+    drop(recovered);
+
+    // The local default, with the same items present, starts empty and never
+    // touches the Keychain: not even to look.
+    let local_dir = tempfile::tempdir().unwrap();
+    let (guarded, control) = FaultyStore::new(keychain);
+    control.fail(StoreOp::Get);
+    control.fail(StoreOp::Set);
+    control.fail(StoreOp::Delete);
+    let local = store(local_dir.path(), guarded, Protection::Local);
+    for item in ITEMS {
+        assert_eq!(local.get(item).unwrap(), None);
+    }
+    assert_eq!(control.calls(), 0);
+}
+
+#[test]
+fn explicit_switch_preserves_every_item_and_local_restarts_never_access_keychain() {
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = MemoryStore::new();
+    seed(&store(dir.path(), keychain.clone(), Protection::Keychain));
     let local = store(dir.path(), keychain.clone(), Protection::Local);
     for item in ITEMS {
         assert_eq!(
@@ -69,9 +122,6 @@ fn a_completed_local_migration_never_probes_even_a_locked_keychain() {
         }
     }
     impl SecretStore for InaccessibleKeychain {
-        fn has_items(&self) -> Result<bool, StoreError> {
-            self.refuse()
-        }
         fn get(&self, _: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
             self.refuse()
         }
@@ -84,7 +134,7 @@ fn a_completed_local_migration_never_probes_even_a_locked_keychain() {
     }
     let dir = tempfile::tempdir().unwrap();
     let keychain = MemoryStore::new();
-    seed(&keychain);
+    seed(&store(dir.path(), keychain.clone(), Protection::Keychain));
     let local = store(dir.path(), keychain, Protection::Local);
     assert!(local.get(SecretItem::Session).unwrap().is_some());
     drop(local);
@@ -189,7 +239,7 @@ fn failed_destination_write_keeps_the_local_source_authoritative() {
 fn failed_cleanup_blocks_then_resumes_from_the_committed_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let original = MemoryStore::new();
-    seed(&original);
+    seed(&store(dir.path(), original.clone(), Protection::Keychain));
     let (keychain, control) = FaultyStore::new(original.clone());
     control.fail_delete_of(SecretItem::CacheKey);
     let local = store(dir.path(), keychain, Protection::Local);
@@ -210,15 +260,16 @@ fn failed_cleanup_blocks_then_resumes_from_the_committed_snapshot() {
 }
 
 #[test]
-fn unreadable_legacy_item_does_not_commit_a_partial_import() {
+fn unreadable_keychain_item_does_not_commit_a_partial_switch() {
     let dir = tempfile::tempdir().unwrap();
     let original = MemoryStore::new();
-    seed(&original);
+    seed(&store(dir.path(), original.clone(), Protection::Keychain));
     let (keychain, control) = FaultyStore::new(original.clone());
     control.fail_get_of(SecretItem::LogoutPending);
     let local = store(dir.path(), keychain, Protection::Local);
     assert_eq!(local.get(SecretItem::Session), Err(StoreError::Injected));
-    assert!(!dir.path().join(FILE).exists());
+    let state = decode(&fs::read(dir.path().join(FILE)).unwrap()).unwrap();
+    assert!(state.keychain);
     for item in ITEMS {
         assert!(original.contains(item));
     }
@@ -345,9 +396,6 @@ fn failed_local_write_preserves_the_previous_value_on_disk_and_in_memory() {
 fn a_fresh_local_install_never_requests_keychain_secret_access() {
     struct EmptyKeychain;
     impl SecretStore for EmptyKeychain {
-        fn has_items(&self) -> Result<bool, StoreError> {
-            Ok(false)
-        }
         fn get(&self, _: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
             Err(StoreError::Injected)
         }

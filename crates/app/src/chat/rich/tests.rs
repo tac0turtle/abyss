@@ -360,7 +360,9 @@ impl Render for Clickable {
         let body = style(&self.text, &fonts(), &palette(), self.spoilers);
         div()
             .size_full()
-            .child(body.interactive("body", move |click, _, _| clicks.borrow_mut().push(click)))
+            .child(body.interactive("body", gpui::rgb(0), move |click, _, _| {
+                clicks.borrow_mut().push(click.clone());
+            }))
     }
 }
 
@@ -372,8 +374,11 @@ fn spoiler_link() -> [RawEntity; 2] {
     ]
 }
 
-/// Clicks the start of "secret" laid out at the window's top left.
-fn click_on(cx: &mut TestAppContext, spoilers: Spoilers) -> Vec<Click> {
+fn interact(
+    cx: &mut TestAppContext,
+    spoilers: Spoilers,
+    activate: impl FnOnce(&mut gpui::VisualTestContext),
+) -> Vec<Click> {
     let clicks: Rc<RefCell<Vec<Click>>> = Rc::default();
     let shared = Rc::clone(&clicks);
     let text = RichText::from_entities("secret", &spoiler_link());
@@ -383,10 +388,17 @@ fn click_on(cx: &mut TestAppContext, spoilers: Spoilers) -> Vec<Click> {
         clicks: shared,
     });
     cx.run_until_parked();
-    let at = point(px(2.), px(4.));
-    cx.simulate_mouse_move(at, None, Modifiers::none());
-    cx.simulate_click(at, Modifiers::none());
+    activate(cx);
     clicks.take()
+}
+
+/// Clicks the start of "secret" laid out at the window's top left.
+fn click_on(cx: &mut TestAppContext, spoilers: Spoilers) -> Vec<Click> {
+    interact(cx, spoilers, |cx| {
+        let at = point(px(2.), px(4.));
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_click(at, Modifiers::none());
+    })
 }
 
 /// While hidden, a real click on the laid-out text only reveals.
@@ -401,4 +413,14 @@ fn clicking_a_revealed_spoiler_link_copies(cx: &mut TestAppContext) {
         click_on(cx, Spoilers::Revealed),
         [Click::Copy("https://secret.example".into())]
     );
+}
+
+#[gpui::test]
+fn a_focused_link_copies_its_exact_target(cx: &mut TestAppContext) {
+    let clicks = interact(cx, Spoilers::Revealed, |cx| {
+        cx.update(Window::focus_next);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+    });
+    assert_eq!(clicks, [Click::Copy("https://secret.example".into())]);
 }

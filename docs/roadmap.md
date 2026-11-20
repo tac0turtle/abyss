@@ -13,7 +13,7 @@ It leaves out:
 
 Other media appears as an inert placeholder. Nothing outside this scope is added without an explicit decision.
 
-Message links are copy-only. The only URL abyss ever opens is the hardcoded `https://my.telegram.org/apps` in onboarding.
+Message links are copy-only. abyss opens `https://my.telegram.org/apps` from onboarding and `x-apple.systempreferences:com.apple.Notifications-Settings.extension` from Settings. Both URLs are hardcoded.
 
 ## Stages
 
@@ -21,7 +21,7 @@ Message links are copy-only. The only URL abyss ever opens is the hardcoded `htt
 |---|---|---|
 | 1 | Sign-in and onboarding, chat list, text history with formatting, sending, live updates, logout, encrypted message cache | Code done and reviewed against the fake backend; live verification (task 12) open |
 | 2 | Forum topics; chat-list tabs, inline topics and unread views; chat folders and the archive | Code done and reviewed against the fake backend (tasks 1–11, 13–18); macOS close-out done; live verification (task 12) open |
-| 3 | Notifications, Developer ID signing and notarization, App Sandbox, accessibility | Not started; the bundle (`scripts/bundle.sh`) is signed ad hoc |
+| 3 | Notifications, Developer ID signing and notarization, App Sandbox, accessibility | Tasks 0–6 are on `main` (2026-11-20), against the fake backend, after seven review rounds (GPT-6.2 Astra and Gemini 4 Neon). Round 7's findings are fixed, but no clean round 8 ran before the merge: the owner chose to land it. See [plans/stage-3.md](plans/stage-3.md) section 10. Owner checks are open: notification banners, Dock reopen, Cmd+Q and Cmd+W on first launch, and a VoiceOver listening pass. Signing (tasks 7–8) is blocked on Apple Developer enrollment. The bundle (`scripts/bundle.sh`) is signed ad hoc |
 | 4 | Media download and decode: chat images, then avatars (letter avatars and stripped thumbnails included) | Not started; images come last in v1 |
 
 Notes:
@@ -29,6 +29,7 @@ Notes:
 - **Stage 2** is specified in [plans/stage-2.md](plans/stage-2.md) (sections 0–16 forum topics, section 17 tabs/inline topics/unread views) and [plans/folders.md](plans/folders.md) (archive, folder tabs, folder editing). Each task's review is in its log. Task 12 adds live checks U1–U5 and L1–L8. The macOS close-out is done (2026-11-19): strict clippy passes with and without `--features fake` and with `--features snapshots`; the snapshots (tabs, inline topics, unread divider, folder menu) are regenerated against the vertical sidebar rail; and the new UI passed a visual check.
 - **Colourways** (Signal- and Telegram-like themes, Signal-like as the new default; amends the brand's colour rules) are planned in [plans/colourways.md](plans/colourways.md), reviewed clean after five rounds (GPT-6 Astra and Gemini 4 Neon). Tasks 0 to 3 are implemented (2026-11-19): deterministic snapshots, theme roles, Ultramarine and Sky beside abyss with the picker and hardened small files, and Ultramarine as the default, with brand.md amended. The plan's first-launch decision (existing installs keep abyss) was built and then removed: abyss is prerelease, so there are no existing users to keep. Each task was reviewed clean of P0–P2 by GPT-6 Astra and Gemini 4 Neon.
 - **Stage 3:** until signing lands, every rebuild of the ad-hoc-signed dev binary triggers Keychain ACL prompts (stage-1.md section 14, risk 3).
+- **Stage 3 update feed.** abyss uses the pinned grammers message box unmodified. Its channel hint, final channel reply, Secondary-only account recovery and account reset limitations are recorded in [Stage 3 risks](plans/stage-3.md#8-risks).
 - **Archive and chat folders:** proposed in [plans/folders.md](plans/folders.md) as three PRs: the archive as its own view (A), chat folders read-only (B), then archiving and folder editing (C).
 - **Risk (folders, part C):** folder edits are recovered best-effort after an unknown outcome. An uncertain write that the server applies after the next edit's fetch can lose one of the two changes, because `messages.updateDialogFilter` replaces the whole folder with no version check (folders.md, part C, "Risks"). After an uncertain write, the next folder edit waits for the instance's retirement to complete, like every other client operation under the single rebuild mechanism; a retirement that hangs holds it too.
 - **Stage 4:** images decode through one hardened path: a pure-Rust decoder (not ImageIO), strict size and pixel caps, downscaling and the encrypted cache, optionally in a sandboxed process. See stage-1.md section 0.
@@ -43,7 +44,7 @@ This is blocked on a real `api_id`/`api_hash`. Everything else in Stage 1 has ru
 
 **Login and Keychain** (section 13, task 6b):
 - [ ] Code delivered by the app and by SMS, the resend countdown, 2FA, `API_ID_INVALID`, and a flood wait.
-- [ ] Keychain prompts for `dev.abyss.apicreds`, and the retry when the Keychain is locked.
+- [ ] Keychain prompts for the installation's `.apicreds` item, and the retry when the Keychain is locked.
 - [ ] Logout against the real Keychain.
 
 **Backend** (section 13, task 11):
@@ -90,11 +91,13 @@ Open question: should it show active sessions? If so:
 
 ## Non-blocking follow-ups
 
+- Report the message-box ordering bugs upstream to grammers. See the [draft reproductions](plans/grammers-upstream-issues.md).
+
 - **Stage 2:**
   - Option+Cmd row stepping doesn't scroll the selected sidebar row into view (task 14).
   - A v4+ cache whose `messages_thread` index was dropped externally isn't repaired; topic reads degrade to cache misses (task 5).
   - Two anchored-history tests wait 16 s of real time; a directly driven fixture could backdate the refresh instead (task 17).
-  - Live `updateNotifySettings` isn't applied to folder mute rules (folders part B).
+  - Live `updateNotifySettings` isn't applied to folder mute rules (folders part B). Stage 3 task 2 fixes this, because notifications depend on it (stage-3.md section 3.2).
 
 These came out of review and are tracked here so they aren't lost. None blocks Stage 1.
 

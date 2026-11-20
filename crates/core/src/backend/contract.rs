@@ -81,11 +81,10 @@ async fn consume(mut updates: impl UpdateStream) {
     let mut errors = 0;
     loop {
         match updates.next().await {
-            Ok(StreamItem::Baseline) => panic!("a second baseline on the same stream"),
-            Ok(StreamItem::Update(Update::NewMessage(m) | Update::Edited(m))) => {
-                assert!(m.is_valid());
-            }
-            Ok(StreamItem::Update(_)) => {}
+            Ok(StreamItem::Baseline(_)) => panic!("a second baseline on the same stream"),
+            Ok(StreamItem::Update(Update::NewMessage(m))) => assert!(m.message.is_valid()),
+            Ok(StreamItem::Update(Update::Edited(m))) => assert!(m.is_valid()),
+            Ok(_) => {}
             Err(StreamError::Fatal | StreamError::Unauthorized | StreamError::Migrated) => return,
             Err(StreamError::Transient) => {
                 errors += 1;
@@ -425,7 +424,7 @@ async fn check_rebuild<B: Backend>(
         .await
         .expect("baseline after a rebuild")
         .expect("stream");
-    assert!(matches!(first, StreamItem::Baseline));
+    assert!(matches!(first, StreamItem::Baseline(_)));
     let tail = client
         .history(ThreadKey::whole(chat), HistoryQuery::Tail, HISTORY)
         .await
@@ -505,7 +504,7 @@ pub(crate) async fn run<B: Backend>(
         .expect("baseline within the bootstrap wait")
         .expect("stream");
     assert!(
-        matches!(first, StreamItem::Baseline),
+        matches!(first, StreamItem::Baseline(_)),
         "baseline comes first"
     );
     let consumer = tokio::spawn(consume(updates));

@@ -124,7 +124,7 @@ async fn a_late_covering_read_leaves_newer_evidence_in_place() {
     history.push(text_message(chat(1), 11, "new"));
     h.fake.set_history(chat(1), history);
     h.fake
-        .push_update(Update::NewMessage(text_message(chat(1), 11, "new")))
+        .push_update(Update::NewMessage(text_message(chat(1), 11, "new").into()))
         .await;
     h.fake
         .push_update(Update::ReadInbox {

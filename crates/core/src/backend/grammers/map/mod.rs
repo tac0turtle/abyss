@@ -15,4 +15,4 @@ pub(crate) mod topics;
 pub(crate) use lists::{
     Oversized, dialogs, dialogs_parts, history, messages_parts, sent_id, update,
 };
-pub(crate) use peers::{Directory, MAX_DIRECTORY, input_channel, input_peer, peer_id};
+pub(crate) use peers::{Directory, input_channel, input_peer, peer_id};

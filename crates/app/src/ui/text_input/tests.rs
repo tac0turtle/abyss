@@ -94,3 +94,86 @@ fn composer_grows_then_caps_its_height(cx: &mut TestAppContext) {
     // The caret (at the end) is scrolled into view.
     assert!(input.read_with(cx, |i, _| i.scroll_top) > gpui::px(0.));
 }
+
+/// Review A3: a secret field keeps its digit filter, length cap and submit,
+/// and the platform's text services read bullets, never the digits.
+#[gpui::test]
+fn secret_code_field_filters_caps_submits_and_masks_platform_text(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+
+    cx.update(|cx| cx.bind_keys(key_bindings()));
+    let (input, cx) = cx.add_window_view(|_, cx| {
+        TextInput::new(Limits::CODE, "", cx)
+            .labelled("Login code")
+            .secret()
+    });
+    let submits = Rc::new(Cell::new(0));
+    let seen = Rc::clone(&submits);
+    cx.update(|window, cx| {
+        window.focus(&input.focus_handle(cx), cx);
+        cx.subscribe(&input, move |_, _: &TextInputEvent, _| {
+            seen.set(seen.get() + 1);
+        })
+        .detach();
+    });
+    cx.run_until_parked();
+    cx.simulate_input("9a0-8 1x7");
+    assert_eq!(text(&input, cx), "90817", "digits only");
+    cx.simulate_input(&"1".repeat(40));
+    assert_eq!(
+        text(&input, cx).len(),
+        abyss_core::api::MAX_CODE_DIGITS,
+        "length cap"
+    );
+    cx.simulate_keystrokes("enter");
+    assert_eq!(submits.get(), 1);
+    let read = input.update_in(cx, |input, window, cx| {
+        let mut actual = None;
+        let text = input.text_for_range(0..99, &mut actual, window, cx);
+        (text, actual)
+    });
+    let (Some(masked), Some(actual)) = read else {
+        panic!("the field answers text queries");
+    };
+    assert_eq!(masked, "•".repeat(abyss_core::api::MAX_CODE_DIGITS));
+    assert_eq!(actual, 0..abyss_core::api::MAX_CODE_DIGITS);
+}
+
+/// Review N49: a secret field never puts its text on the clipboard, and
+/// Cut leaves it alone, as in `PasswordInput`. An ordinary field still copies.
+#[gpui::test]
+fn secret_field_binds_neither_copy_nor_cut(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.bind_keys(key_bindings()));
+    let (secret, cx) = cx.add_window_view(|_, cx| {
+        TextInput::new(Limits::CODE, "", cx)
+            .labelled("Login code")
+            .secret()
+    });
+    cx.update(|window, cx| window.focus(&secret.focus_handle(cx), cx));
+    cx.run_until_parked();
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+    cx.simulate_input("12345");
+    cx.simulate_keystrokes("cmd-a cmd-c");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("before".into()),
+        "copy must not reach the clipboard"
+    );
+    cx.simulate_keystrokes("cmd-x");
+    assert_eq!(text(&secret, cx), "12345", "cut must not remove the code");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("before".into()),
+        "cut must not reach the clipboard"
+    );
+
+    let (plain, cx) = cx.add_window_view(|_, cx| TextInput::new(Limits::COMPOSER, "", cx));
+    cx.update(|window, cx| window.focus(&plain.focus_handle(cx), cx));
+    cx.run_until_parked();
+    cx.simulate_input("hello");
+    cx.simulate_keystrokes("cmd-a cmd-c");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("hello".into())
+    );
+}

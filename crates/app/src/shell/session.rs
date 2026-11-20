@@ -16,7 +16,7 @@ use gpui::{
 use super::Root;
 use super::auth::{AuthView, project};
 use super::bridge::{CoreLink, EventSource, SharedCore, spawn_pump};
-use super::shutdown::{self, Closing, Next};
+use super::shutdown::{self, Closing};
 use crate::chat::discarded::Discarded;
 use crate::chat::sidebar_file::SidebarFile;
 use crate::chat::{ChatShell, Refused};
@@ -53,6 +53,7 @@ impl Started {
 pub(crate) fn start(
     launch: Launch,
     secret_storage: Result<abyss_core::secret::SecretStorageConfig, StartError>,
+    notification_cleanup: abyss_core::events::NotificationCleanupPolicy,
 ) -> Result<Started, StartError> {
     match launch {
         #[cfg(feature = "fake")]
@@ -74,6 +75,7 @@ pub(crate) fn start(
             let config = CoreConfig {
                 fake_faults: faults,
                 secret_storage: None,
+                notification_cleanup,
                 cache: cache.and_then(|location| crate::storage::config(Ok(location))),
             };
             let core = abyss_core::start(config, BackendChoice::Fake(backend))?;
@@ -83,16 +85,22 @@ pub(crate) fn start(
             })
         }
         Launch::Telegram { env, cache } => {
+            use abyss_core::events::NotificationCleanupPolicy::{Disabled, Unavailable};
+            use abyss_core::secret::KeychainNamespace;
+
+            let storage = secret_storage?;
+            let notification_cleanup = match (notification_cleanup, storage.keychain_namespace) {
+                (Disabled, KeychainNamespace::Bundle) => Unavailable,
+                (policy, _) => policy,
+            };
             // `core::start` initializes SQLCipher and the exit hook before
             // anything opens; a failed directory runs without a cache.
-            #[cfg_attr(
-                not(feature = "fake"),
-                expect(clippy::needless_update, reason = "fake builds add `fake_faults`")
-            )]
             let config = CoreConfig {
                 cache: crate::storage::config(cache),
-                secret_storage: Some(secret_storage?),
-                ..CoreConfig::default()
+                secret_storage: Some(storage),
+                notification_cleanup,
+                #[cfg(feature = "fake")]
+                fake_faults: abyss_core::FakeFaults::default(),
             };
             let core = abyss_core::start(config, BackendChoice::Grammers(env))?;
             Ok(Started::new(core))
@@ -115,6 +123,16 @@ pub(crate) struct Session {
     pub(super) api_hash: Entity<PasswordInput>,
     /// Log out was pressed and waits for confirmation.
     logout_prompt: bool,
+    /// The appearance panel is showing. `Root` owns the panel, which also
+    /// opens on screens with no session; it mirrors the flag here
+    /// (`Root::set_appearance`) so focus moves made by the session
+    /// know the panel covers it.
+    settings: SettingsPanel,
+    /// An event or timer moved the screen on while an overlay covered it,
+    /// and left focus where it was. The last overlay's close completes the
+    /// move ([`Session::overlay_closed`]).
+    focus: FocusDebt,
+    pub(super) logout_focus: crate::ui::a11y::OverlayFocus,
     /// Inline validation of the credential entry.
     pub(super) entry_error: Option<SharedString>,
     /// Which credential source is in control (core's `CredentialSource`).
@@ -129,11 +147,16 @@ pub(crate) struct Session {
     /// The chat shell's own focus, for a pane without a composer (a topic
     /// list): key bindings such as Cmd+[ need a focused element on screen.
     pub(super) pane_focus: FocusHandle,
+    /// The start of the tab order on auth screens without an editor.
+    pub(super) auth_focus: FocusHandle,
     /// A new chat folder's title (`folder_menu`).
     pub(super) folder_name: Entity<TextInput>,
     /// The open archive/folder menu, if any (`folder_menu`).
     pub(super) menu: Option<super::folder_menu::Menu>,
+    pub(super) menu_focus: crate::ui::a11y::OverlayFocus,
     pub(super) tabs: super::tabs::Tabs,
+    /// Focus and scrolling of the sidebar's rows (`shell::nav`).
+    pub(super) nav: super::nav::Nav,
     /// Chat list, open chat and pending sends (`crate::chat`, `shell::chats`).
     pub(super) shell: ChatShell,
     pub(super) conn: Option<ConnState>,
@@ -153,45 +176,45 @@ pub(crate) struct Session {
 }
 
 impl Session {
+    pub(super) fn can_hide(&self) -> bool {
+        self.closing == Closing::Open
+            && !self.shell.is_stopped()
+            && matches!(self.auth, AuthView::SignedIn | AuthView::Done { .. })
+    }
+
     pub(crate) fn new(started: Started, window: &mut Window, cx: &mut Context<'_, Root>) -> Self {
         let shared: SharedCore = Rc::new(RefCell::new(started.commands));
-        let phone = text_input(Limits::PHONE, copy::PHONE_PLACEHOLDER, cx);
-        let code = text_input(Limits::CODE, copy::CODE_PLACEHOLDER, cx);
+        let phone = login_field(
+            Limits::PHONE,
+            copy::PHONE_LABEL,
+            copy::PHONE_PLACEHOLDER,
+            cx,
+        );
+        let code = code_field(cx);
         let composer = text_input(Limits::COMPOSER, copy::COMPOSER_PLACEHOLDER, cx);
         let (folder_name, folder_sub) = super::folder_menu::title_field(window, cx);
         let password = cx.new(|cx| PasswordInput::new(window, cx));
-        let api_id = text_input(Limits::API_ID, copy::onboarding::API_ID_PLACEHOLDER, cx);
+        let api_id = login_field(
+            Limits::API_ID,
+            copy::onboarding::API_ID_LABEL,
+            copy::onboarding::API_ID_PLACEHOLDER,
+            cx,
+        );
         let api_hash = cx.new(|cx| PasswordInput::api_hash(window, cx));
         let [id_sub, hash_sub] = credential_subscriptions(&api_id, &api_hash, window, cx);
-        let subscriptions = [
-            id_sub,
-            hash_sub,
-            cx.subscribe_in(&phone, window, |root, _, _: &TextInputEvent, window, cx| {
-                root.with_session(|s, cx| s.submit_phone(window, cx), cx);
-            }),
-            cx.subscribe_in(&code, window, |root, _, _: &TextInputEvent, window, cx| {
-                root.with_session(|s, cx| s.submit_code(window, cx), cx);
-            }),
-            cx.subscribe_in(
-                &password,
-                window,
-                |root, _, _: &PasswordEvent, window, cx| {
-                    root.with_session(|s, cx| s.submit_password(window, cx), cx);
-                },
-            ),
-            cx.subscribe_in(
-                &composer,
-                window,
-                |root, _, _: &TextInputEvent, window, cx| {
-                    root.with_session(|s, cx| s.submit_message(window, cx), cx);
-                },
-            ),
-            folder_sub,
-        ];
+        let subscriptions = subscriptions(
+            [id_sub, hash_sub, folder_sub],
+            &phone,
+            &code,
+            &password,
+            &composer,
+            window,
+            cx,
+        );
         let mut shell = ChatShell::default();
         shell.list.restore(SidebarFile::load(cx));
         let chat_wiring = super::chats::wire(window, cx);
-        let session = Self {
+        let mut session = Self {
             core: shared,
             auth: AuthView::Connecting,
             needs_params: false,
@@ -201,15 +224,21 @@ impl Session {
             api_id,
             api_hash,
             logout_prompt: false,
+            settings: SettingsPanel::Closed,
+            focus: FocusDebt::None,
+            logout_focus: crate::ui::a11y::OverlayFocus::new(cx),
             entry_error: None,
             source: None,
             cred_item: CredentialItem::Settled,
             composer,
             discarded: Discarded::default(),
             pane_focus: cx.focus_handle(),
+            auth_focus: cx.focus_handle().tab_index(-1),
             folder_name,
             menu: None,
+            menu_focus: crate::ui::a11y::OverlayFocus::new(cx),
             tabs: super::tabs::Tabs::default(),
+            nav: super::nav::Nav::default(),
             shell,
             conn: None,
             notice: None,
@@ -251,12 +280,27 @@ impl Session {
         admitted
     }
 
+    /// Whether the logout confirmation is up. It belongs to the signed-in
+    /// screens: on any other it is not shown, owns no focus and covers
+    /// nothing, whatever the flag says (review N55).
     pub(super) fn confirming_logout(&self) -> bool {
-        self.logout_prompt
+        self.logout_prompt && matches!(self.auth, AuthView::SignedIn | AuthView::Done { .. })
     }
 
-    pub(super) fn set_logout_prompt(&mut self, open: LogoutPrompt) {
-        self.logout_prompt = open == LogoutPrompt::Open;
+    /// Closes the logout confirmation through the one close path: its focus
+    /// is released and focus owed after it is paid. A no-op when none is open.
+    pub(super) fn close_logout_prompt(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if !self.logout_prompt {
+            return;
+        }
+        self.logout_prompt = false;
+        self.logout_focus.close(window, cx);
+        self.overlay_closed(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn open_logout_prompt(&mut self) {
+        self.logout_prompt = true;
     }
 
     pub(super) fn show_notice(
@@ -292,11 +336,7 @@ impl Session {
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        let leaving_password = matches!(self.auth, AuthView::Password { .. })
-            && !matches!(next, AuthView::Password { .. });
-        if leaving_password {
-            self.password.update(cx, PasswordInput::clear);
-        }
+        self.wipe_left_secrets(&next, window, cx);
         let ticking = next.ticking_until().is_some() && self.auth.ticking_until().is_none();
         if next.tears_down() {
             let kept = self.shell.list.kept_view();
@@ -317,11 +357,52 @@ impl Session {
             self.code.update(cx, |input, cx| input.set_max_len(max, cx));
         }
         self.auth = next;
+        self.close_overlays_of_left_screens(window, cx);
         if ticking {
             spawn_ticker(window, cx);
         }
         self.focus_for_auth(window, cx);
         cx.notify();
+    }
+
+    /// A secret never outlives its screen (review N59): the password when
+    /// leaving the password screen, the `api_hash` (and its reveal) when
+    /// leaving the credential entry, the login code when leaving the code
+    /// screen.
+    fn wipe_left_secrets(
+        &mut self,
+        next: &AuthView,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        use super::auth::Onboarding;
+        if matches!(self.auth, AuthView::Password { .. })
+            && !matches!(next, AuthView::Password { .. })
+        {
+            self.password.update(cx, PasswordInput::clear);
+        }
+        if matches!(self.auth, AuthView::Onboarding(Onboarding::Entry { .. }))
+            && !matches!(next, AuthView::Onboarding(Onboarding::Entry { .. }))
+        {
+            self.api_hash.update(cx, PasswordInput::clear);
+        }
+        if matches!(self.auth, AuthView::Code { .. }) && !matches!(next, AuthView::Code { .. }) {
+            self.code.update(cx, |input, cx| input.clear(window, cx));
+        }
+    }
+
+    /// The context menu and the logout confirmation belong to the signed-in
+    /// screens (the menu is drawn on `SignedIn` only, the confirmation on it
+    /// and `Done`). When the screen moves on, as on a revoked session, they
+    /// close through the normal paths: focus released, owed focus paid, and
+    /// nothing left that owns Tab without being on screen (review N55).
+    fn close_overlays_of_left_screens(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if self.auth != AuthView::SignedIn {
+            self.close_menu(window, cx);
+        }
+        if !matches!(self.auth, AuthView::SignedIn | AuthView::Done { .. }) {
+            self.close_logout_prompt(window, cx);
+        }
     }
 
     /// The account's teardown began (review round 15, B): nothing of it
@@ -331,11 +412,12 @@ impl Session {
         self.shell.reset();
         self.composer
             .update(cx, |input, cx| input.clear(window, cx));
-        self.folder_name
-            .update(cx, |input, cx| input.clear(window, cx));
-        self.menu = None;
+        // The next account starts with no credential or code typed for this
+        // one (N59). The menu and the confirmation close with the screen
+        // (`close_overlays_of_left_screens`).
+        self.api_hash.update(cx, PasswordInput::clear);
+        self.code.update(cx, |input, cx| input.clear(window, cx));
         self.discarded.clear();
-        self.logout_prompt = false;
     }
 
     /// Called every second while a countdown runs (a flood wait, a code
@@ -356,20 +438,69 @@ impl Session {
         false
     }
 
-    fn focus_for_auth(&self, window: &mut Window, cx: &mut Context<'_, Root>) {
+    /// Whether an overlay owns keyboard focus. The same order as
+    /// `Root::overlay_focus`, which cannot be asked from inside the session.
+    pub(super) fn overlay_open(&self) -> bool {
+        self.pane_covered() || self.menu.is_some()
+    }
+
+    /// Whether a modal overlay covers the chat pane: the closing overlay,
+    /// Settings, the logout confirmation. Each is a near-opaque veil over
+    /// the whole window, so what the pane paints behind it is not seen: the
+    /// frame observer marks nothing read and reports no live tail, and a
+    /// banner for the open chat is not suppressed (review A64, N57). A
+    /// context menu covers a few rows and leaves the transcript readable, so
+    /// it is not one.
+    pub(super) fn pane_covered(&self) -> bool {
+        self.closing != Closing::Open
+            || self.settings == SettingsPanel::Open
+            || self.confirming_logout()
+    }
+
+    pub(super) fn set_settings(&mut self, panel: SettingsPanel) {
+        self.settings = panel;
+    }
+
+    /// Moves focus to `handle` for something an event or a timer did, not
+    /// the user. An open overlay owns focus until it closes, and typing must
+    /// not reach a field behind it (review A56): the move waits for
+    /// [`Self::overlay_closed`].
+    pub(super) fn move_focus(
+        &mut self,
+        handle: &FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        if self.overlay_open() {
+            self.focus = FocusDebt::Owed;
+        } else {
+            window.focus(handle, cx);
+        }
+    }
+
+    /// An overlay closed. Once none is left, a screen change it covered
+    /// takes focus now: the control that had focus before the overlay opened
+    /// may no longer be on screen.
+    pub(super) fn overlay_closed(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if self.focus == FocusDebt::Owed && !self.overlay_open() {
+            self.focus = FocusDebt::None;
+            self.focus_for_auth(window, cx);
+        }
+    }
+
+    fn focus_for_auth(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         use super::auth::Onboarding;
         let handle = match self.auth {
             AuthView::Onboarding(Onboarding::Entry { .. }) => self.api_id.focus_handle(cx),
             AuthView::Phone { .. } => self.phone.focus_handle(cx),
             AuthView::Code { .. } => self.code.focus_handle(cx),
             AuthView::Password { .. } => self.password.focus_handle(cx),
-            AuthView::SignedIn if self.shell.selected().is_some() => self.composer.focus_handle(cx),
-            // The shell's own focus, so its chords (Ctrl+Tab) work before
-            // any chat is open.
-            AuthView::SignedIn => self.pane_focus.clone(),
-            _ => return,
+            // The message box if the pane renders one, else the shell's own
+            // focus, so its chords (Ctrl+Tab) work before any chat is open.
+            AuthView::SignedIn => self.pane_focus_target(cx),
+            _ => self.auth_focus.clone(),
         };
-        window.focus(&handle, cx);
+        self.move_focus(&handle, window, cx);
     }
 
     pub(super) fn submit_phone(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
@@ -458,6 +589,10 @@ impl Session {
                 self.apply_chat_event(Event::Connection(state), window, cx);
             }
             Event::Error(error) => self.on_error(error, window, cx),
+            Event::Notify(_)
+            | Event::ClearNotifications(_)
+            | Event::NotifyDeleted { .. }
+            | Event::InboxRead { .. } => {}
             // Chat list, message view and sends: `shell::chats`.
             chat => self.apply_chat_event(chat, window, cx),
         }
@@ -521,6 +656,7 @@ impl Session {
         self.closing = Closing::Waiting;
         self.password.update(cx, PasswordInput::clear);
         self.api_hash.update(cx, PasswordInput::clear);
+        self.code.update(cx, |input, cx| input.clear(window, cx));
         let ack = self
             .core
             .try_borrow_mut()
@@ -531,16 +667,8 @@ impl Session {
         cx.spawn_in(window, async move |this, cx| {
             let outcome = shutdown::await_ack(ack, timer).await;
             tracing::info!(?outcome, "shutdown finished");
-            this.update(cx, |root, cx| match shutdown::next(outcome) {
-                Next::Quit => cx.quit(),
-                Next::ShowUnconfirmed => {
-                    root.with_session(|s, _| s.closing = Closing::Unconfirmed, cx);
-                    cx.notify();
-                }
-                Next::ShowLogoutUnfinished => {
-                    root.with_session(|s, _| s.closing = Closing::LogoutUnfinished, cx);
-                    cx.notify();
-                }
+            this.update(cx, |root, cx| {
+                root.finish_shutdown(shutdown::next(outcome), cx);
             })
             .ok();
         })
@@ -548,11 +676,11 @@ impl Session {
         cx.notify();
     }
 
-    /// Backstop for OS-initiated termination: cancels core without waiting.
-    pub(super) fn cancel_core(&self) {
-        if let Ok(mut core) = self.core.try_borrow_mut() {
-            drop(core.begin_shutdown());
-        }
+    /// Backstop for OS-initiated termination: asks core to stop and returns its
+    /// ack, `None` if shutdown already began (the UI holds that ack). Never
+    /// waits.
+    pub(super) fn cancel_core(&self) -> Option<super::bridge::ShutdownAck> {
+        self.core.try_borrow_mut().ok()?.begin_shutdown()
     }
 }
 
@@ -576,11 +704,72 @@ impl Session {
     }
 }
 
-/// Whether the logout confirmation is up.
+/// Whether the appearance panel is showing, as `Root` tells the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LogoutPrompt {
+pub(crate) enum SettingsPanel {
     Open,
     Closed,
+}
+
+/// Whether a focus move was left undone because an overlay covered it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusDebt {
+    None,
+    Owed,
+}
+
+fn login_field(
+    limits: Limits,
+    label: &'static str,
+    placeholder: &'static str,
+    cx: &mut Context<'_, Root>,
+) -> Entity<TextInput> {
+    cx.new(|cx| TextInput::new(limits, placeholder, cx).labelled(label))
+}
+
+/// The login code is a live credential: accessibility reads bullets (review A3).
+fn code_field(cx: &mut Context<'_, Root>) -> Entity<TextInput> {
+    cx.new(|cx| {
+        TextInput::new(Limits::CODE, copy::CODE_PLACEHOLDER, cx)
+            .labelled(copy::CODE_LABEL)
+            .secret()
+    })
+}
+
+fn subscriptions(
+    [id_sub, hash_sub, folder_sub]: [Subscription; 3],
+    phone: &Entity<TextInput>,
+    code: &Entity<TextInput>,
+    password: &Entity<PasswordInput>,
+    composer: &Entity<TextInput>,
+    window: &mut Window,
+    cx: &mut Context<'_, Root>,
+) -> [Subscription; 7] {
+    [
+        id_sub,
+        hash_sub,
+        cx.subscribe_in(phone, window, |root, _, _: &TextInputEvent, window, cx| {
+            root.with_session(|s, cx| s.submit_phone(window, cx), cx);
+        }),
+        cx.subscribe_in(code, window, |root, _, _: &TextInputEvent, window, cx| {
+            root.with_session(|s, cx| s.submit_code(window, cx), cx);
+        }),
+        cx.subscribe_in(
+            password,
+            window,
+            |root, _, _: &PasswordEvent, window, cx| {
+                root.with_session(|s, cx| s.submit_password(window, cx), cx);
+            },
+        ),
+        cx.subscribe_in(
+            composer,
+            window,
+            |root, _, _: &TextInputEvent, window, cx| {
+                root.with_session(|s, cx| s.submit_message(window, cx), cx);
+            },
+        ),
+        folder_sub,
+    ]
 }
 
 /// Enter in either credential field submits both.

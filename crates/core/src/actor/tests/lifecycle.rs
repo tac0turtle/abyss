@@ -119,7 +119,7 @@ async fn recoverable_stream_errors_retry_on_the_same_stream() {
         h.fake.stream_error(StreamError::Transient).await;
     }
     h.fake
-        .push_update(Update::NewMessage(text_message(chat(2), 11, "x")))
+        .push_update(Update::NewMessage(text_message(chat(2), 11, "x").into()))
         .await;
     h.until(|e| matches!(e, Event::ChatBumped(s) if s.id == chat(2)))
         .await;
@@ -355,6 +355,7 @@ async fn stale_generation_completions_are_dropped() {
             cgen: stale,
             parked: None,
             outcome: Outcome::Dialogs {
+                req: super::super::jobs::ReqId(1),
                 step: DialogsStep::First,
                 stamps: super::super::jobs::Stamps::default(),
                 res: Ok(page),
@@ -383,10 +384,7 @@ async fn stale_generation_completions_are_dropped() {
             },
         })
         .await;
-    assert!(
-        events.try_recv().is_none(),
-        "stale completions emit nothing"
-    );
+    assert!(events.try_recv().is_none());
     assert!(actor.dialogs.is_empty());
     assert!(
         actor
@@ -510,7 +508,7 @@ async fn bootstrap_merges_updates_around_the_snapshots() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     // Before the snapshots: queued for the new stream.
     let new = text_message(chat(1), 12, "new");
-    h.fake.push_update(Update::NewMessage(new)).await;
+    h.fake.push_update(Update::NewMessage(new.into())).await;
     h.fake.push_update(deleted(7)).await;
     let (invalidated, _) = h
         .until(|e| matches!(e, Event::ThreadInvalidated(c) if *c == ThreadKey::whole(chat(1))))
@@ -523,7 +521,7 @@ async fn bootstrap_merges_updates_around_the_snapshots() {
     // After the tail snapshot, before the dialogs snapshot.
     tokio::time::sleep_until(baseline + Duration::from_secs(3)).await;
     let dup = text_message(chat(1), 11, "m");
-    h.fake.push_update(Update::NewMessage(dup)).await;
+    h.fake.push_update(Update::NewMessage(dup.into())).await;
     h.fake.push_update(deleted(8)).await;
     h.fake.push_update(Update::Edited(edited(4, 300))).await;
     let mut events = vec![invalidated];
@@ -561,12 +559,6 @@ async fn refresh_on_activation_and_every_five_minutes() {
     h.history(chat(1), HistoryDir::Tail).await;
     h.send(Command::Window(WindowState::Inactive)).await;
     let (dialogs, history) = (h.fake.calls(Op::Dialogs), h.fake.calls(Op::History));
-    tokio::time::sleep(Duration::from_mins(6)).await;
-    assert_eq!(
-        h.fake.calls(Op::Dialogs),
-        dialogs,
-        "no refresh while inactive"
-    );
     // The server changed meanwhile: 4 deleted, 2 edited, 11 new.
     let mut server: Vec<Message> = (1..=11)
         .filter(|i| *i != 4)
@@ -574,8 +566,10 @@ async fn refresh_on_activation_and_every_five_minutes() {
         .collect();
     server[1] = edited(2, 50);
     h.fake.set_history(chat(1), server);
-    h.drain();
-    h.send(Command::Window(WindowState::Active)).await;
+    tokio::time::sleep(Duration::from_secs(299)).await;
+    assert_eq!(h.fake.calls(Op::Dialogs), dialogs);
+    assert_eq!(h.fake.calls(Op::History), history);
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let (_, skipped) = h
         .until(|e| {
             matches!(
@@ -610,8 +604,17 @@ async fn refresh_on_activation_and_every_five_minutes() {
         )),
         "a refresh merges; it does not reset the window"
     );
-    tokio::time::sleep(Duration::from_secs(5 * 60 + 1)).await;
-    assert_eq!(h.fake.calls(Op::Dialogs), dialogs + 2, "periodic refresh");
+    h.until(|e| matches!(e, Event::Reconciled { .. })).await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    h.send(Command::Window(WindowState::Active)).await;
+    h.until(|e| matches!(e, Event::Reconciled { .. })).await;
+    assert_eq!(h.fake.calls(Op::Dialogs), dialogs + 2, "activation refresh");
+    tokio::time::sleep(Duration::from_secs(301)).await;
+    assert_eq!(
+        h.fake.calls(Op::Dialogs),
+        dialogs + 3,
+        "active periodic refresh"
+    );
     assert_eq!(h.fake.builds(), 1, "refresh never rebuilds");
     h.stop().await;
 }

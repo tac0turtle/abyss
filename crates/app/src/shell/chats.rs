@@ -9,18 +9,19 @@ use std::time::Duration;
 use abyss_core::SendError;
 use abyss_core::api::{Command, ConnState, Event, LoadTarget, SendState, UserError, WindowState};
 use abyss_core::model::{ChatId, LocalId, ThreadKey, TopicId};
-use gpui::{App, Context, Focusable, Subscription, WeakEntity, Window};
+use gpui::{App, Context, FocusHandle, Focusable, Subscription, WeakEntity, Window};
 
 use super::Root;
 use super::auth::AuthView;
 use super::bridge::SharedCore;
+use super::nav::RowKey;
 use super::session::Session;
 use crate::chat::copy as chat_copy;
 use crate::chat::discarded::{Lost, Obsolete};
 use crate::chat::inline::Inline;
 use crate::chat::list::{Shown, SidebarRow, Step, View};
 use crate::chat::sidebar_file::SidebarFile;
-use crate::chat::{Admit, ChatShell, Composer, Pane, Refused, Stale, format};
+use crate::chat::{Admit, ChatShell, Composer, Covered, Pane, Refused, Stale, format, topics};
 use crate::ui::copy;
 
 /// How often a flood-wait countdown redraws.
@@ -52,6 +53,10 @@ pub(super) fn admit(core: &SharedCore, cmd: Command) -> Result<(), Refused> {
 pub(super) fn wire(window: &mut Window, cx: &mut Context<'_, Root>) -> [Subscription; 2] {
     let activation = cx.observe_window_activation(window, |root, window, cx| {
         root.with_session(|s, cx| s.on_activation(window, cx), cx);
+        if window.is_window_active() {
+            root.refresh_notification_settings();
+            root.refresh_dock_badge(cx);
+        }
     });
     let this = cx.weak_entity();
     let wake = cx.on_system_wake(move |cx| {
@@ -156,6 +161,9 @@ impl Session {
     /// The user pressed Retry after automatic retries gave up (history or
     /// dialogs): everything waiting may ask again now.
     pub(super) fn retry_loads(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        // The Retry button that has focus goes with the retry: focus stays in
+        // the shell, where Escape and Tab still work.
+        window.focus(&self.pane_focus, cx);
         self.shell.retry_loads();
         let now = cx.background_executor().now();
         self.drive(OnRefusal::Notice, window, cx, |s, admit| {
@@ -196,7 +204,7 @@ impl Session {
             }
         );
         let online = matches!(event, Event::Connection(ConnState::Online));
-        let folders = matches!(event, Event::ChatFolders(_));
+        let menu_changed = matches!(event, Event::ChatFolders(_) | Event::DialogsReset(_));
         let paged = online
             || matches!(
                 event,
@@ -231,8 +239,8 @@ impl Session {
             s.discard_obsolete_sends(now, admit)
         });
         self.composer_changed(composer, window, cx);
-        if folders {
-            self.recheck_folder_menu(window, cx);
+        if menu_changed {
+            self.recheck_menu(window, cx);
         }
         if flood {
             self.start_countdown(window, cx);
@@ -263,6 +271,14 @@ impl Session {
 
     /// After a painted frame: load more, mark read, report the live tail.
     pub(super) fn check_frame(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        // The pane keeps painting behind a modal overlay: what it shows is
+        // not seen (review A64, N57).
+        let covered = if self.pane_covered() {
+            Covered::Yes
+        } else {
+            Covered::No
+        };
+        self.shell.set_covered(covered);
         let seen = self.shell.seen();
         let now = cx.background_executor().now();
         self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
@@ -323,6 +339,24 @@ impl Session {
         self.navigate(to, window, cx, |s, admit| s.open_topic(topic, admit));
     }
 
+    /// A notification click for a forum's topic: the forum and the topic
+    /// open together, or neither does (review A52).
+    pub(super) fn select_forum_topic(
+        &mut self,
+        chat: ChatId,
+        topic: TopicId,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        let to = Some(ThreadKey {
+            chat,
+            topic: Some(topic),
+        });
+        self.navigate(to, window, cx, |s, admit| {
+            s.show_forum_topic(chat, topic, admit)
+        });
+    }
+
     /// Option+Cmd+Down/Up: the next or previous chat or topic row of the
     /// sidebar, selected as a click would select it.
     pub(super) fn step_row(&mut self, step: Step, window: &mut Window, cx: &mut Context<'_, Root>) {
@@ -334,6 +368,51 @@ impl Session {
             Some(SidebarRow::Topic { topic, .. }) => self.select_topic(topic, window, cx),
             _ => {}
         }
+        // The selection moved; a keyboard user can't see it off screen.
+        if let Some(ix) = self.marked_ix() {
+            self.nav.reveal(self.shell.list.view(), ix);
+        }
+    }
+
+    /// Where the marked row (the open chat's or topic's) is in the shown
+    /// view's rows, if the view shows it.
+    fn marked_ix(&self) -> Option<usize> {
+        let marked = self.shell.marked()?;
+        self.shell.list.rows().iter().position(|r| *r == marked)
+    }
+
+    /// Escape: focus goes back to the sidebar row that opened the pane,
+    /// scrolled into view first when the list moved away from it.
+    pub(super) fn focus_opened_row(&mut self, cx: &mut Context<'_, Root>) {
+        if self.auth != AuthView::SignedIn {
+            return;
+        }
+        let (Some(ix), Some(key)) = (self.marked_ix(), self.shell.marked().and_then(RowKey::of))
+        else {
+            return;
+        };
+        self.nav.focus_when_rendered(key);
+        self.nav.reveal(self.shell.list.view(), ix);
+        cx.notify();
+    }
+
+    /// Names the message box after the open thread for a screen reader. It is
+    /// the box's own state, and renders after the shell, so this runs first.
+    pub(super) fn sync_composer_label(&self, cx: &mut App) {
+        let Some(chat) = self.shell.selected_chat() else {
+            return;
+        };
+        let topic = match self.shell.pane() {
+            Pane::Forum {
+                open: Some(topic), ..
+            } => {
+                let shown = self.shell.shown_topic();
+                Some(shown.map_or_else(|| topics::fallback_title(topic), topics::title))
+            }
+            Pane::Empty | Pane::Thread(_) | Pane::Forum { open: None, .. } => None,
+        };
+        let label = chat_copy::composer_label(&chat.title, topic.as_deref());
+        self.composer.update(cx, |input, _| input.set_label(&label));
     }
 
     /// The disclosure glyph and Option+Cmd+Right/Left: expands or
@@ -389,6 +468,18 @@ impl Session {
         }
     }
 
+    /// Where focus belongs in the signed-in pane: the message box while the
+    /// pane renders one, else the pane itself, so Cmd+[ and Escape still
+    /// work. The one answer for a pane change (`switch_pane`) and for focus
+    /// owed after an overlay (`focus_for_auth`), so neither can aim at a box
+    /// the pane does not render (review A68, N56).
+    pub(super) fn pane_focus_target(&self, cx: &App) -> FocusHandle {
+        match (self.shell.selected(), self.shell.composer()) {
+            (Some(_), Composer::Open) => self.composer.focus_handle(cx),
+            _ => self.pane_focus.clone(),
+        }
+    }
+
     /// Changes the pane with `f` and focuses the new pane (the caller
     /// moves the composer's text). Returns whether core admitted the
     /// change; a refusal redraws only what it changed (`drive`, a notice).
@@ -403,12 +494,9 @@ impl Session {
             return false;
         }
         if self.auth == AuthView::SignedIn {
-            // A pane without a box keeps focus, so Cmd+[ still works.
-            let focus = match (self.shell.selected(), self.shell.composer()) {
-                (Some(_), Composer::Open) => self.composer.focus_handle(cx),
-                _ => self.pane_focus.clone(),
-            };
-            window.focus(&focus, cx);
+            // `fix_pane` runs on events: an overlay keeps focus (review A56).
+            let focus = self.pane_focus_target(cx);
+            self.move_focus(&focus, window, cx);
         }
         cx.notify();
         true
@@ -689,6 +777,9 @@ impl Session {
     }
 
     pub(super) fn jump_to_latest(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        // The button that has focus goes once the tail shows: focus stays in
+        // the messages, where the keyboard keeps scrolling.
+        window.focus(&self.nav.history(cx), cx);
         self.drive(OnRefusal::Notice, window, cx, |s, admit| {
             s.jump_to_latest(admit)
         });
@@ -731,6 +822,9 @@ impl Session {
         }
         let kept = self.shell.list.kept_view();
         if self.shell.step_tab(step) {
+            if let (Shown::Tab(from), Shown::Tab(to)) = (kept.shown, self.shell.list.shown()) {
+                self.tabs.move_focus(from, to, window, cx);
+            }
             self.view_changed(kept, window, cx);
         }
     }

@@ -24,8 +24,8 @@ use super::invoke::{Invoke, RetryClass, call};
 use super::map::{self, Directory, input_channel};
 use super::pins::Pins;
 use crate::backend::{
-    BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, RejectReason, TopicsById,
-    TopicsCursor, TopicsPage,
+    BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, NotifyScope, NotifyTarget,
+    RejectReason, TopicsById, TopicsCursor, TopicsPage,
 };
 use crate::model::{
     ChatFolder, ChatId, ChatSummary, FolderEdit, MsgId, PeerFolder, PeerKind, ThreadKey, TopicId,
@@ -774,6 +774,31 @@ impl<I: Invoke> Calls<I> {
         let (result, skipped) = map::topics::by_id(&parts, &dir, chat);
         note_skipped("topics_by_id", skipped);
         Ok(result)
+    }
+
+    /// The peer's own mute setting or the account-wide default for a scope.
+    pub(crate) async fn notify_settings(
+        &self,
+        target: NotifyTarget,
+    ) -> Result<Option<i64>, BackendError> {
+        use tl::enums::InputNotifyPeer;
+
+        let (peer, _in_flight) = match target {
+            NotifyTarget::Scope(NotifyScope::Users) => (InputNotifyPeer::InputNotifyUsers, None),
+            NotifyTarget::Scope(NotifyScope::Groups) => (InputNotifyPeer::InputNotifyChats, None),
+            NotifyTarget::Peer(chat) => {
+                let (peer, in_flight) = self.resolve_used(chat).await?;
+                (
+                    InputNotifyPeer::Peer(tl::types::InputNotifyPeer { peer }),
+                    Some(in_flight),
+                )
+            }
+        };
+        let request = tl::functions::account::GetNotifySettings { peer };
+        call(&self.invoker, RetryClass::Read, &request)
+            .await
+            .map(|settings| map::lists::muted_until(&settings))
+            .map_err(|e| fail(&e))
     }
 
     /// The current summaries of `chats`, at most [`MAX_PEER_DIALOGS`].

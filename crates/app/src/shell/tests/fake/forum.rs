@@ -590,6 +590,89 @@ fn sends_reads_and_the_tail_stay_in_their_topic(cx: &mut TestAppContext) {
     assert!(read(&root, cx, |s| s.shell.echoes().get(failed).is_none()));
 }
 
+/// Review A56: the open topic is deleted while Settings is open. The pane
+/// goes back to the topic list, but focus stays in Settings; it follows the
+/// pane once Settings closes.
+#[gpui::test]
+fn a_removed_topic_behind_settings_leaves_focus_in_settings(cx: &mut TestAppContext) {
+    use gpui::Focusable;
+
+    let (root, cx, harness) = forum_listed(cx);
+    select_forum(&root, cx);
+    topics_listed(&harness, cx, vec![topic(5)], Pages::Done);
+    select_topic(&root, cx, 5);
+    let focused = |root: &Entity<Root>, cx: &mut VisualTestContext| {
+        let (composer, pane) = root.read_with(cx, |root, cx| match &root.state {
+            State::Running(s) => (s.composer.focus_handle(cx), s.pane_focus.clone()),
+            State::Failed(failure) => panic!("failed: {failure:?}"),
+        });
+        cx.update(|window, _| (composer.is_focused(window), pane.is_focused(window)))
+    };
+    assert_eq!(focused(&root, cx), (true, false));
+
+    root.update_in(cx, Root::toggle_appearance);
+    cx.run_until_parked();
+    let removed = Event::TopicRemoved {
+        chat: FORUM,
+        topic: tid(5),
+        reason: TopicGone::Deleted,
+    };
+    core_sends(&harness, cx, removed);
+    assert_eq!(pane(&root, cx), LIST);
+    assert_eq!(focused(&root, cx), (false, false), "Settings keeps focus");
+    root.read_with(cx, |root, _| assert!(root.appearance_open));
+
+    root.update_in(cx, Root::toggle_appearance);
+    cx.run_until_parked();
+    assert_eq!(focused(&root, cx), (false, true), "the pane takes it back");
+}
+
+/// Review A68, N56: a forum that becomes a read-only whole chat behind
+/// Settings. The pane renders no message box then, so closing Settings
+/// focuses the pane, never the unrendered box.
+#[gpui::test]
+fn a_forum_that_became_read_only_behind_settings_focuses_the_pane(cx: &mut TestAppContext) {
+    use gpui::Focusable;
+
+    let (root, cx, harness) = forum_listed(cx);
+    select_forum(&root, cx);
+    let focused = |root: &Entity<Root>, cx: &mut VisualTestContext| {
+        let (composer, pane) = root.read_with(cx, |root, cx| match &root.state {
+            State::Running(s) => (s.composer.focus_handle(cx), s.pane_focus.clone()),
+            State::Failed(failure) => panic!("failed: {failure:?}"),
+        });
+        cx.update(|window, _| (composer.is_focused(window), pane.is_focused(window)))
+    };
+    root.update_in(cx, Root::toggle_appearance);
+    cx.run_until_parked();
+
+    // The forum leaves the list (so nothing says it can be written to) and
+    // stops being a forum.
+    core_sends(
+        &harness,
+        cx,
+        Event::DialogsReset(FakeScript::demo(2, 0).dialogs),
+    );
+    let forum = abyss_core::store::ForumStatus::NotForum;
+    core_sends(&harness, cx, Event::KindChanged { chat: FORUM, forum });
+    core_sends(&harness, cx, Event::ForumInvalidated(FORUM));
+    let whole = ThreadKey::whole(FORUM);
+    assert_eq!(pane(&root, cx), Pane::Thread(whole));
+    assert_eq!(
+        read(&root, cx, |s| s.shell.composer()),
+        crate::chat::Composer::ReadOnly
+    );
+    assert_eq!(focused(&root, cx), (false, false), "Settings keeps focus");
+
+    root.update_in(cx, Root::toggle_appearance);
+    cx.run_until_parked();
+    assert_eq!(
+        focused(&root, cx),
+        (false, true),
+        "the pane, not the box it does not render"
+    );
+}
+
 fn flood(seconds: u32) -> Event {
     Event::LoadEnded {
         target: LoadTarget::Topics(FORUM),

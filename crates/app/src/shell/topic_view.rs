@@ -7,17 +7,19 @@ use std::ops::Range;
 
 use abyss_core::model::{ChatSummary, Topic, TopicId};
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, ElementId, Rgba, SharedString, Stateful, Window, div,
-    prelude::*, px, uniform_list,
+    AnyElement, Context, Div, ElementId, FocusHandle, Rgba, Role, SharedString, Stateful, Window,
+    div, prelude::*, px, uniform_list,
 };
 use jiff::tz::TimeZone;
 
-use super::chat_view::{after_paint, count_badge, depth_of, pane_header, retry_button};
+use super::chat_view::{after_paint, count_badge, depth_of, pane_header, quiet, retry_button};
+use super::nav::RowKey;
 use super::session::Session;
 use super::view::{centered, muted};
 use super::{Root, State};
 use crate::chat::topics::{self, UnreadMark};
 use crate::chat::{ChatShell, copy, format, list as chat_list};
+use crate::ui::a11y;
 use crate::ui::theme::{self, Depth, Theme, Themes};
 
 const TOPIC_ROW_HEIGHT: f32 = 56.;
@@ -49,19 +51,29 @@ pub(super) fn topic_pane(
     let rows = list.map_or(0, |l| l.topics().len());
     let body = if rows == 0 {
         let text = placeholder(shell, countdown);
-        centered().child(muted(text)).into_any_element()
+        centered()
+            .child(quiet("topics-status", text, theme))
+            .into_any_element()
     } else {
         // Each forum keeps its own scroll position.
         let id = ElementId::NamedInteger("topics".into(), chat.id.id.cast_unsigned());
-        uniform_list(id, rows, cx.processor(topic_rows))
+        let fallback = session.nav.forum_list.get_or_init(|| cx.focus_handle());
+        a11y::list("topic-list", copy::topic_list_label(&chat.title))
+            .track_focus(fallback)
+            .tab_index(0)
+            .tab_stop(false)
             .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(uniform_list(id, rows, cx.processor(topic_rows)).flex_1())
             .into_any_element()
     };
     let footer = countdown.filter(|_| rows > 0).map(|left| {
         div()
             .px_3()
             .py_2()
-            .child(muted(copy::topics_flood(left)).text_xs())
+            .child(quiet("topics-countdown", copy::topics_flood(left), theme).text_xs())
     });
     // Below the last topic the column keeps that topic's tone.
     let floor = list
@@ -78,7 +90,7 @@ pub(super) fn topic_pane(
         .min_w_0()
         .flex()
         .flex_col()
-        .child(pane_header(chat))
+        .child(pane_header(chat, theme))
         .child(
             div()
                 .flex_1()
@@ -97,32 +109,36 @@ pub(super) fn topic_pane(
 }
 
 /// An open topic's header: the way back to the list, then the chat's and
-/// the topic's titles, and a mark while the topic is closed. The title
-/// falls back on "General" or "Topic" while the retained list lacks it.
+/// the topic's titles as the heading, and a mark while the topic is closed.
+/// The title falls back on "General" or "Topic" while the retained list
+/// lacks it.
 pub(super) fn topic_header(
     session: &Session,
     chat: &ChatSummary,
     topic: TopicId,
+    theme: &Theme,
     cx: &mut Context<'_, Root>,
 ) -> Div {
     let shown = session.shell.shown_topic();
     let title = shown.map_or_else(|| topics::fallback_title(topic), topics::title);
     let closed = shown.is_some_and(|t| t.closed);
-    div()
-        .p_3()
+    let spoken = a11y::compose([
+        chat.title.as_str(),
+        &title,
+        if closed { copy::CLOSED_TOPIC } else { "" },
+    ]);
+    let back = a11y::control("topics-back", Role::Button, copy::TOPICS_BACK_LABEL)
+        .flex_none()
+        .cursor_pointer()
+        .child(copy::TOPICS_BACK);
+    let back = a11y::on_activate_in(back, cx, |root, window, cx| {
+        root.with_session(|s, cx| s.back_from_forum(window, cx), cx);
+    });
+    let heading = a11y::heading_for("topic-heading", spoken, 1)
+        .min_w_0()
         .flex()
         .gap_3()
         .items_baseline()
-        .child(
-            div()
-                .id("topics-back")
-                .flex_none()
-                .cursor_pointer()
-                .child(copy::TOPICS_BACK)
-                .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
-                    root.with_session(|s, cx| s.back_from_forum(window, cx), cx);
-                })),
-        )
         .child(
             div()
                 .flex_none()
@@ -139,7 +155,14 @@ pub(super) fn topic_header(
                 .font_family(theme::NAME_FONT)
                 .child(title),
         )
-        .children(closed.then(|| muted(copy::CLOSED_TOPIC).text_xs().flex_none()))
+        .children(closed.then(|| muted(copy::CLOSED_TOPIC, theme).text_xs().flex_none()));
+    div()
+        .p_3()
+        .flex()
+        .gap_3()
+        .items_baseline()
+        .child(a11y::focus_ring(back, theme.text))
+        .child(heading)
 }
 
 fn topic_rows(
@@ -154,16 +177,32 @@ fn topic_rows(
     session.topics_seen(range.end.saturating_sub(1), window, cx);
     let theme = &Themes::of(window, cx);
     let (tz, now) = (format::local_tz(), format::now());
-    let Some(list) = session.shell.topics() else {
+    let (nav, Some(list)) = (&session.nav, session.shell.topics()) else {
         return Vec::new();
     };
-    list.topics()
-        .get(range.clone())
-        .unwrap_or_default()
+    let visible = list.topics().get(range).unwrap_or_default();
+    let keys: Vec<_> = visible.iter().map(|t| RowKey::Pane(t.id)).collect();
+    nav.forum.keep(&keys);
+    visible
         .iter()
-        .zip(range)
-        .map(|(topic, ix)| topic_row(topic, ix.into(), (&tz, now), theme, cx))
+        .map(|topic| {
+            let handle = nav.forum.get(RowKey::Pane(topic.id), cx);
+            let id = ("topic", u64::from(topic.id.get().cast_unsigned()));
+            let focus = RowFocus {
+                handle: &handle,
+                window,
+                selected: false,
+            };
+            topic_row(topic, id.into(), (&tz, now), &focus, theme, cx)
+        })
         .collect()
+}
+
+/// What a row needs to take keyboard focus and show it.
+pub(super) struct RowFocus<'a> {
+    pub(super) handle: &'a FocusHandle,
+    pub(super) window: &'a Window,
+    pub(super) selected: bool,
 }
 
 /// A topic: the neutral glyph (owner decision D3), its title with closed
@@ -174,13 +213,25 @@ pub(super) fn topic_row(
     topic: &Topic,
     id: ElementId,
     (tz, now): (&TimeZone, i64),
+    focus: &RowFocus<'_>,
     theme: &Theme,
     cx: &mut Context<'_, Root>,
 ) -> Stateful<Div> {
     let topic_id = topic.id;
     let depth = depth_of(topics::activity(topic), now, tz);
     let (surface, ink) = (theme.surface(depth), theme.text_on(depth));
-    let tag = |text: &'static str| muted(text).text_xs().flex_none();
+    let tag = |text: &'static str| muted(text, theme).text_xs().flex_none();
+    let time = format::list_time(topic.last_date, now, tz);
+    let preview_text = chat_list::preview_text(topic.last.as_ref());
+    let mark = UnreadMark::of(topic);
+    let name = topics::title(topic);
+    let label = copy::topic_row_label(
+        &name,
+        mark,
+        (topic.closed, topic.pinned),
+        &preview_text,
+        &time,
+    );
     let title = div()
         .flex()
         .gap_2()
@@ -190,29 +241,25 @@ pub(super) fn topic_row(
                 .min_w_0()
                 .truncate()
                 .font_family(theme::NAME_FONT)
-                .child(topics::title(topic)),
+                .child(name),
         )
         .children(topic.closed.then(|| tag(copy::CLOSED_TOPIC)))
         .children(topic.pinned.then(|| tag(copy::PINNED_TOPIC)))
-        .child(
-            muted(format::list_time(topic.last_date, now, tz))
-                .text_xs()
-                .flex_none(),
-        );
+        .child(muted(time, theme).text_xs().flex_none());
     let preview = div()
         .flex()
         .gap_2()
         .items_center()
         .child(
-            muted(chat_list::preview_text(topic.last.as_ref()))
+            muted(preview_text, theme)
                 .text_xs()
                 .flex_1()
                 .min_w_0()
                 .truncate(),
         )
-        .children(unread_mark(UnreadMark::of(topic), theme.badge(depth)));
-    div()
-        .id(id)
+        .children(unread_mark(mark, theme.badge(depth)));
+    let row = a11y::row(id, label, focus.handle)
+        .aria_selected(focus.selected)
         .w_full()
         .h(px(TOPIC_ROW_HEIGHT))
         .px_3()
@@ -221,20 +268,25 @@ pub(super) fn topic_row(
         .gap_3()
         .bg(surface)
         .text_color(ink)
-        .cursor_pointer()
-        .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
-            root.with_session(|s, cx| s.select_topic(topic_id, window, cx), cx);
-        }))
-        .child(glyph(ink))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .child(title)
-                .child(preview),
-        )
+        .cursor_pointer();
+    a11y::on_activate_in(row, cx, move |root, window, cx| {
+        root.with_session(|s, cx| s.select_topic(topic_id, window, cx), cx);
+    })
+    .child(glyph(ink))
+    .child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(title)
+            .child(preview),
+    )
+    .children(a11y::ring(
+        focus.handle,
+        focus.window,
+        theme.focus_on(depth),
+    ))
 }
 
 /// The topic glyph on a faint disc of the row's text color, like a chat

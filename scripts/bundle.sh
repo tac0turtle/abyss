@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds an app bundle: binary, icon, Info.plist, ad-hoc signature.
+# Builds an app bundle: binary, icon, Info.plist, signature with the App
+# Sandbox entitlements (assets/macos/abyss.entitlements).
 #
 #   scripts/bundle.sh
 #   scripts/bundle.sh --debug    # target/bundle/debug/abyss.app
@@ -13,7 +14,11 @@
 # ABYSS_SIGNING_IDENTITY can select an installed code-signing certificate.
 # A stable certificate and bundle identifier let Keychain trust survive rebuilds.
 # Without it, ad-hoc signing only seals resources; its identity changes on rebuild.
-# Notarization and the App Sandbox are a later stage.
+# Ad-hoc signing carries the entitlements too, so the bundle is sandboxed either
+# way: its files live in ~/Library/Containers/dev.abyss, apart from the bare
+# binary's (`cargo dev`). The two also keep separate Keychain items: the bundle
+# uses the services under dev.abyss.bundle, the bare binary dev.abyss.bare.
+# Notarization is a later stage.
 set -euo pipefail
 
 # Oldest macOS the bundle declares (LSMinimumSystemVersion). The Rust
@@ -88,7 +93,27 @@ sed -e "s/@VERSION@/$version/g" -e "s/@MIN_MACOS@/$min_macos/g" \
 plutil -lint "$bundle/Contents/Info.plist"
 
 signing_identity="${ABYSS_SIGNING_IDENTITY:--}"
-codesign --force --identifier dev.abyss --sign "$signing_identity" "$bundle"
+entitlements="assets/macos/abyss.entitlements"
+plutil -lint "$entitlements"
+codesign --force --identifier dev.abyss --entitlements "$entitlements" \
+    --sign "$signing_identity" "$bundle"
 codesign --verify --deep --strict "$bundle"
+
+# Exactly the sandbox and outgoing-network entitlements, nothing more.
+embedded="$(codesign -d --entitlements :- "$bundle" 2>/dev/null | plutil -convert xml1 -o - -)"
+entitlement_keys="$(grep -o '<key>[^<]*</key>' <<<"$embedded" | sort | tr '\n' ' ')"
+expected_keys="<key>com.apple.security.app-sandbox</key> <key>com.apple.security.network.client</key> "
+if [[ "$entitlement_keys" != "$expected_keys" ]]; then
+    echo "bundle.sh: unexpected entitlements in the signed bundle: $entitlement_keys" >&2
+    exit 1
+fi
+# plutil's key paths split on dots, so compare the flattened XML instead.
+flat="$(tr -d ' \t\n' <<<"$embedded")"
+for key in com.apple.security.app-sandbox com.apple.security.network.client; do
+    if ! grep -qF "<key>$key</key><true/>" <<<"$flat"; then
+        echo "bundle.sh: entitlement $key is not true" >&2
+        exit 1
+    fi
+done
 
 echo "bundled $bundle (version $version, binary minos ${binary_min:-unknown})"

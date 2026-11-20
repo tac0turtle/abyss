@@ -305,6 +305,7 @@ impl<B: Backend> Actor<B> {
         let chat = thread.chat;
         let mut raised = false;
         if outcome == Outcome::Landed && cgen == self.cgen {
+            self.notify_inbox_read(thread, max_id).await;
             if thread.topic.is_some() {
                 self.topic_read(thread, max_id).await;
                 self.badge_trigger(chat).await;

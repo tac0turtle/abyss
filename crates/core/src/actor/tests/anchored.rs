@@ -323,7 +323,9 @@ async fn a_spoiled_restore_is_recovered_by_a_light_refresh(spoiled: Spoiled) {
     let view = anchored_to_tail(&mut h).await;
     calls_reached(&h, 5).await;
     if spoiled == Spoiled::Bypassed {
-        h.fake.push_update(Update::NewMessage(tagged(300))).await;
+        h.fake
+            .push_update(Update::NewMessage(tagged(300).into()))
+            .await;
         h.until(|e| matches!(e, Event::ChatBumped(s) if s.last_id == Some(MsgId(300))))
             .await;
     }

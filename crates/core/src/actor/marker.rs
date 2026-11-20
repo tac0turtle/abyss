@@ -1,8 +1,7 @@
 //! The durable logout-pending marker (review rounds 15, A, and 19).
 //!
 //! A logout records the marker (`SecretItem::LogoutPending`) before any of
-//! its side effects and clears it only after both the session item and the
-//! cache are gone. A marker that cannot be written stops the logout before
+//! its side effects. A marker that cannot be written stops the logout before
 //! it starts: nothing is terminated, ended or deleted, and the account stays
 //! as it was ("Couldn't start logout", Retry). Startup reads it before the
 //! session or the cache:
@@ -13,11 +12,14 @@
 //! - **Unreadable:** unknown, which is not pending. Startup is blocked
 //!   (nothing loaded, served, built or deleted); Retry reads the marker
 //!   again and goes on as if it had been read at startup.
+//! - **Notifications only:** the session and cache are erased. A process
+//!   without a center can sign in again. A process with a center clears the
+//!   old banners before loading any session or opening the cache.
 //! - **Absent:** a normal startup.
 //!
-//! The marker's one byte is the remote result so far, so a resumed logout
+//! The marker holds the cleanup state and the remote result, so a resumed logout
 //! reports what the first attempt saw. An unknown result is reported as a
-//! failure, so the UI points at Active Sessions. Rewrites of that byte are
+//! failure, so the UI points at Active Sessions. Rewrites of the remote result are
 //! best effort and never stop a logout: the Keychain updates an item in
 //! place (`secret::keychain`), so a failed rewrite leaves the earlier
 //! marker, and every path into the local deletion starts from a marker that
@@ -30,37 +32,68 @@ use zeroize::Zeroizing;
 
 use super::Actor;
 use super::auth::AuthMsg;
-use super::lifecycle::{LogoutStage, Phase, Step};
+use super::lifecycle::{LogoutStage, Phase};
 use super::logout::RemotePlan;
 use crate::api::{AuthState, Command, LogoutTrigger, RemoteLogout, StorageError, UserError};
 use crate::backend::Backend;
+use crate::events::EventSender;
 use crate::secret::StoreError;
 use crate::session::PersistHandle;
 
 /// What startup found in the marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PendingLogout {
-    /// A logout to finish; the remote result it reached.
-    Resume(RemoteLogout),
-    /// The marker could not be read: whether a logout is pending is
-    /// unknown.
+    /// A logout to finish, including any required notification cleanup.
+    Resume {
+        remote: RemoteLogout,
+        cleanup: NotificationObligation,
+    },
+    /// The notification center was unavailable when local erasure finished.
+    NotificationsOnly,
+    /// The marker could not be read, or deferred removal could not be confirmed.
     Unreadable(StorageError),
 }
 
+impl PendingLogout {
+    pub(crate) fn blocks_session(self) -> bool {
+        self != Self::NotificationsOnly
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotificationObligation {
+    None,
+    Required,
+    Deferred,
+}
+
 /// Reads the marker at startup, before the session item.
-pub(crate) async fn read_pending_logout(persist: &PersistHandle) -> Option<PendingLogout> {
-    match persist.load_logout_marker().await {
+pub(crate) async fn read_pending_logout(
+    persist: &PersistHandle,
+    events: &EventSender,
+) -> Option<PendingLogout> {
+    let pending = match persist.load_logout_marker().await {
         Ok(None) => None,
-        Ok(Some(blob)) => Some(PendingLogout::Resume(decode(&blob))),
+        Ok(Some(blob)) => Some(decode(&blob)),
         Err(e) => {
             tracing::warn!("logout marker unreadable; startup blocked");
             Some(PendingLogout::Unreadable(StorageError::from(&e)))
         }
+    };
+    if pending != Some(PendingLogout::NotificationsOnly) || !events.has_notifications() {
+        return pending;
     }
+    if !events.clear_notifications().await {
+        return Some(PendingLogout::Unreadable(StorageError::Local));
+    }
+    persist
+        .delete_logout_marker()
+        .await
+        .err()
+        .map(|error| PendingLogout::Unreadable(StorageError::from(&error)))
 }
 
-/// The marker's byte for a remote result (`None`: not known yet).
-fn encode(remote: Option<RemoteLogout>) -> Zeroizing<Vec<u8>> {
+fn encode(remote: Option<RemoteLogout>, cleanup: NotificationObligation) -> Zeroizing<Vec<u8>> {
     let byte = match remote {
         None => 0,
         Some(RemoteLogout::Revoked) => 1,
@@ -68,16 +101,36 @@ fn encode(remote: Option<RemoteLogout>) -> Zeroizing<Vec<u8>> {
         Some(RemoteLogout::TimedOut) => 3,
         Some(RemoteLogout::NotAttempted) => 4,
     };
-    Zeroizing::new(vec![byte])
+    let cleanup = match cleanup {
+        NotificationObligation::None => 0,
+        NotificationObligation::Required => 1,
+        NotificationObligation::Deferred => 2,
+    };
+    Zeroizing::new(vec![byte, cleanup])
 }
 
-fn decode(blob: &[u8]) -> RemoteLogout {
-    match blob.first() {
-        Some(1) => RemoteLogout::Revoked,
-        Some(3) => RemoteLogout::TimedOut,
-        Some(4) => RemoteLogout::NotAttempted,
+fn decode(blob: &[u8]) -> PendingLogout {
+    let [remote, cleanup] = blob else {
+        return PendingLogout::Unreadable(StorageError::Local);
+    };
+    let remote = match remote {
+        1 => RemoteLogout::Revoked,
+        3 => RemoteLogout::TimedOut,
+        4 => RemoteLogout::NotAttempted,
         // Failed, or not known: the session may still be live on the server.
         _ => RemoteLogout::Failed(UserError::Network),
+    };
+    match cleanup {
+        0 => PendingLogout::Resume {
+            remote,
+            cleanup: NotificationObligation::None,
+        },
+        1 => PendingLogout::Resume {
+            remote,
+            cleanup: NotificationObligation::Required,
+        },
+        2 => PendingLogout::NotificationsOnly,
+        _ => PendingLogout::Unreadable(StorageError::Local),
     }
 }
 
@@ -86,8 +139,9 @@ fn decode(blob: &[u8]) -> RemoteLogout {
 pub(super) async fn mark_logout_pending(
     persist: &PersistHandle,
     remote: Option<RemoteLogout>,
+    cleanup: NotificationObligation,
 ) -> Result<(), StoreError> {
-    let res = persist.store_logout_marker(encode(remote)).await;
+    let res = persist.store_logout_marker(encode(remote, cleanup)).await;
     if res.is_err() {
         tracing::warn!("logout marker not written");
     }
@@ -98,12 +152,13 @@ pub(super) async fn mark_logout_pending(
 pub(super) async fn mark_until(
     persist: &PersistHandle,
     remote: Option<RemoteLogout>,
+    cleanup: NotificationObligation,
     shutdown: &CancellationToken,
 ) -> Option<Result<(), StoreError>> {
     tokio::select! {
         biased;
         () = shutdown.cancelled() => None,
-        res = mark_logout_pending(persist, remote) => Some(res),
+        res = mark_logout_pending(persist, remote, cleanup) => Some(res),
     }
 }
 
@@ -227,6 +282,10 @@ impl<B: Backend> Actor<B> {
     /// logout starts only when the write succeeded (`on_logout_marked`).
     pub(super) async fn begin_marking(&mut self, marking: Marking) {
         self.logout_gate.marking = Some(marking);
+        if self.events.requires_notification_cleanup() {
+            self.logout_notification_obligation = NotificationObligation::Required;
+        }
+        let cleanup = self.logout_notification_obligation;
         let dropped = self.hide_account();
         self.emit_auth().await;
         if dropped {
@@ -238,7 +297,7 @@ impl<B: Backend> Actor<B> {
         tokio::spawn(async move {
             // Shutdown first: nothing was started, and a marker that did
             // land resumes the logout at the next startup.
-            if let Some(res) = mark_until(&persist, None, &shutdown).await {
+            if let Some(res) = mark_until(&persist, None, cleanup, &shutdown).await {
                 let res = res.map_err(|e| StorageError::from(&e));
                 // A closed channel means the actor is gone.
                 let _ = tx.send(AuthMsg::LogoutMarked(res)).await;
@@ -267,15 +326,14 @@ impl<B: Backend> Actor<B> {
     /// loaded and no client is built.
     pub(super) async fn resume_logout(&mut self, pending: PendingLogout) {
         match pending {
-            PendingLogout::Resume(remote) => {
+            PendingLogout::Resume { remote, cleanup } => {
                 tracing::info!("resuming an interrupted logout");
+                self.logout_notification_obligation = cleanup;
                 self.set_auth(AuthState::LoggingOut).await;
                 self.note_remote_logout(remote);
-                self.life.phase = Phase::LoggingOut(LogoutStage::Local);
-                let local = self.local_step();
-                *self.life.step_mut() =
-                    Some(tokio::spawn(async move { Step::Deleted(local.await) }));
+                self.start_local_logout(remote).await;
             }
+            PendingLogout::NotificationsOnly => self.start_build(Duration::ZERO),
             PendingLogout::Unreadable(error) => {
                 // Unknown is not pending: nothing is deleted on it.
                 self.auth.reset_signed_out();
@@ -296,10 +354,14 @@ impl<B: Backend> Actor<B> {
         let read = tokio::select! {
             biased;
             () = self.cancel.cancelled() => return,
-            read = read_pending_logout(&self.persist) => read,
+            read = read_pending_logout(&self.persist, &self.events) => read,
         };
         match read {
             None => self.resume_startup().await,
+            Some(PendingLogout::NotificationsOnly) => {
+                self.logout_notification_obligation = NotificationObligation::Required;
+                self.resume_startup().await;
+            }
             Some(pending) => self.resume_logout(pending).await,
         }
     }
@@ -349,10 +411,26 @@ mod tests {
             RemoteLogout::TimedOut,
             RemoteLogout::NotAttempted,
         ] {
-            assert_eq!(decode(&encode(Some(remote))), remote);
+            assert_eq!(
+                decode(&encode(Some(remote), NotificationObligation::Required)),
+                PendingLogout::Resume {
+                    remote,
+                    cleanup: NotificationObligation::Required,
+                }
+            );
         }
         let unknown = RemoteLogout::Failed(UserError::Network);
-        assert_eq!(decode(&encode(None)), unknown);
-        assert_eq!(decode(&[]), unknown);
+        assert_eq!(
+            decode(&encode(None, NotificationObligation::None)),
+            PendingLogout::Resume {
+                remote: unknown,
+                cleanup: NotificationObligation::None,
+            }
+        );
+        assert_eq!(
+            decode(&encode(None, NotificationObligation::Deferred)),
+            PendingLogout::NotificationsOnly
+        );
+        assert!(matches!(decode(&[]), PendingLogout::Unreadable(_)));
     }
 }

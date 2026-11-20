@@ -135,7 +135,7 @@ impl<B: Backend> Actor<B> {
             load,
             dir,
             query,
-            floor: self.tail_floor(load.thread),
+            floor: self.history_tail_floor(load.thread),
             since: self.windows.continuity_mark(),
         };
         if !self.enqueue(job).await {

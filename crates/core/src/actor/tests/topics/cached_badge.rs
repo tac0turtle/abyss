@@ -167,7 +167,9 @@ async fn a_new_message_discards_a_cached_count_without_a_retained_topic_list() {
     h.online().await;
     h.fake.inject(Op::PeerDialogs, Fault::Hang);
     h.fake
-        .push_update(Update::NewMessage(message_in(topic_key(f, 2), 11, "new")))
+        .push_update(Update::NewMessage(
+            message_in(topic_key(f, 2), 11, "new").into(),
+        ))
         .await;
     let (event, _) = h
         .until(|e| matches!(e, Event::ChatBumped(c) if c.id == f && c.last_id == Some(MsgId(11))))

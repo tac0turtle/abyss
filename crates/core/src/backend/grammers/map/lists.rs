@@ -229,6 +229,7 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
         last_id: (d.top_message > 0).then_some(MsgId(d.top_message)),
         can_send: entry.can_send,
         muted_until: muted_until(&d.notify_settings),
+        scope_muted_until: 0,
         folder: peer_folder(d.folder_id.unwrap_or(0)),
         reading: None,
         topic_unread: None,
@@ -241,9 +242,9 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
 /// Until when notifications are muted (Unix seconds; `0`: not muted).
 /// Telegram mutes until a date (`i32::MAX` for good); the date is kept, so
 /// an expired mute stops counting without a new page.
-fn muted_until(settings: &tl::enums::PeerNotifySettings) -> i64 {
+pub(crate) fn muted_until(settings: &tl::enums::PeerNotifySettings) -> Option<i64> {
     let tl::enums::PeerNotifySettings::Settings(s) = settings;
-    s.mute_until.map_or(0, |until| i64::from(until.max(0)))
+    s.mute_until.map(|until| i64::from(until.max(0)))
 }
 
 pub(super) fn count(n: i32) -> u32 {
@@ -359,6 +360,47 @@ pub(super) fn is_broadcast(chat: ChatId, dir: &Directory) -> bool {
     dir.get(chat).is_some_and(|e| e.broadcast)
 }
 
+fn new_message(raw: &tl::enums::Message, dir: &Directory) -> Option<Update> {
+    let message = message(raw, dir).filter(Message::is_valid)?;
+    let (silent, mentioned) = match raw {
+        tl::enums::Message::Message(m) => (m.silent, m.mentioned),
+        tl::enums::Message::Service(m) => (m.silent, m.mentioned),
+        tl::enums::Message::Empty(_) => return None,
+    };
+    let chat = dir
+        .get(message.thread.chat)
+        .map(|e| (e.kind, e.title.clone()));
+    Some(Update::NewMessage(crate::backend::NewMessage {
+        message,
+        silent,
+        mentioned,
+        chat,
+    }))
+}
+
+fn notify_update(u: &tl::types::UpdateNotifySettings, dir: &Directory) -> Option<Update> {
+    use crate::backend::{NotifyScope, NotifyTarget};
+    use tl::enums::NotifyPeer;
+    let target = match &u.peer {
+        NotifyPeer::Peer(p) => {
+            let chat = chat_id(&p.peer)?;
+            if is_broadcast(chat, dir) {
+                return None;
+            }
+            NotifyTarget::Peer(chat)
+        }
+        NotifyPeer::NotifyUsers => NotifyTarget::Scope(NotifyScope::Users),
+        NotifyPeer::NotifyChats => NotifyTarget::Scope(NotifyScope::Groups),
+        NotifyPeer::NotifyBroadcasts
+        | NotifyPeer::NotifyForumTopic(_)
+        | NotifyPeer::NotifyCommunity(_) => return None,
+    };
+    Some(Update::NotifySettings {
+        target,
+        until: muted_until(&u.notify_settings),
+    })
+}
+
 /// Maps a live update. `None` for everything the client ignores (counted by
 /// the caller at debug level), for broadcast-channel traffic, and for topic
 /// updates naming a non-positive topic.
@@ -366,8 +408,9 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
     use tl::enums::Update as U;
     let live = |m: &tl::enums::Message| message(m, dir).filter(Message::is_valid);
     match raw {
-        U::NewMessage(u) => live(&u.message).map(Update::NewMessage),
-        U::NewChannelMessage(u) => live(&u.message).map(Update::NewMessage),
+        U::NewMessage(u) => new_message(&u.message, dir),
+        U::NewChannelMessage(u) => new_message(&u.message, dir),
+        U::NotifySettings(u) => notify_update(u, dir),
         U::EditMessage(u) => live(&u.message).map(Update::Edited),
         U::EditChannelMessage(u) => live(&u.message).map(Update::Edited),
         U::DeleteMessages(u) => Some(Update::Deleted {

@@ -1,8 +1,8 @@
 //! Shutdown from the UI side (plan section 5).
 //!
 //! GPUI gives `on_app_quit` futures only 200 ms, so closing starts earlier:
-//! the window's should-close hook and our own `Quit` action both ask core to
-//! stop, show "Closing…", and wait for core's ack here, up to a UI timeout.
+//! closing a signed-out window or using `Quit` asks core to stop, shows
+//! "Closing…", and waits for core's ack here, up to a UI timeout.
 
 use std::future::Future;
 use std::pin::pin;

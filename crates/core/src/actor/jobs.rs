@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 use crate::api::{ClientGen, HistoryDir};
 use crate::backend::{
     AROUND_CONTEXT, BackendError, Client, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery,
-    MAX_HISTORY_PAGE, StreamError, StreamItem, TopicsById, TopicsCursor, TopicsPage, UpdateStream,
+    MAX_HISTORY_PAGE, NotifyScope, NotifyTarget, StreamError, StreamItem, TopicsById, TopicsCursor,
+    TopicsPage, UpdateStream,
 };
 use crate::cache::CacheHandle;
 use crate::model::{
@@ -36,9 +37,8 @@ pub(super) const STREAM_RETRY: [Duration; 3] = [
     Duration::from_secs(2),
 ];
 
-/// Identity of one history load, unique per actor. A bootstrap snapshot is
-/// tracked by `(thread, ReqId)`, independent of the view it fills, so it always
-/// completes even when its view went stale.
+/// Actor-assigned identity of a dialogs or history request. History snapshots
+/// also track their thread, independent of the view they fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct ReqId(pub(super) u64);
 
@@ -72,7 +72,13 @@ pub(super) struct Stamps {
 /// A backend call waiting for admission.
 #[derive(Debug)]
 pub(super) enum Job {
+    NotifySettings(NotifyScope),
+    PeerNotifySettings {
+        chat: ChatId,
+        stamps: Stamps,
+    },
     Dialogs {
+        req: ReqId,
         cursor: Option<DialogsCursor>,
         /// Taken at admission (`Badges::dispatch`).
         stamps: Stamps,
@@ -89,9 +95,9 @@ pub(super) enum Job {
         load: Load,
         dir: HistoryDir,
         query: HistoryQuery,
-        /// For tails: the newest id the window held when the request was
-        /// made. The server's answer is authoritative up to it; anything
-        /// newer in the window arrived later (a live update).
+        /// For tails: the newest id in the window or awaiting a notice for
+        /// this thread when the request was made. The server's tail covers
+        /// that id even if it was deleted and the returned top is lower.
         floor: Option<MsgId>,
         /// The continuity clock when the load was requested: a tail may
         /// restore cache continuity only if its window lost none since.
@@ -198,7 +204,13 @@ pub(super) enum StreamEnd {
 /// What a finished task reports back to the actor.
 #[derive(Debug)]
 pub(super) enum Outcome {
+    NotifySettings {
+        target: NotifyTarget,
+        stamps: Stamps,
+        res: CallResult<Option<i64>>,
+    },
     Dialogs {
+        req: ReqId,
         step: DialogsStep,
         stamps: Stamps,
         res: CallResult<DialogsPage>,
@@ -273,7 +285,8 @@ pub(super) struct Done {
 /// What kind of task a `JoinSet` id belongs to, so a panic can clean up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TaskKind {
-    Dialogs,
+    NotifySettings(NotifyTarget),
+    Dialogs(ReqId),
     /// A history load and its direction: a panic ends only that load
     /// (task 10e), never one deferred behind it.
     History(Load, HistoryDir),
@@ -368,7 +381,18 @@ pub(super) fn job_future<C: Client>(
         cancel,
     };
     match job {
-        Job::Dialogs { cursor, stamps } => dialogs(client, admitted, cursor, stamps),
+        Job::NotifySettings(scope) => {
+            let target = NotifyTarget::Scope(scope);
+            notify_settings(client, admitted, target, Stamps::default())
+        }
+        Job::PeerNotifySettings { chat, stamps } => {
+            notify_settings(client, admitted, NotifyTarget::Peer(chat), stamps)
+        }
+        Job::Dialogs {
+            req,
+            cursor,
+            stamps,
+        } => dialogs(client, admitted, req, cursor, stamps),
         Job::PeerDialogs { chats, stamps } => peer_dialogs(client, admitted, chats, stamps),
         Job::History {
             load,
@@ -376,17 +400,7 @@ pub(super) fn job_future<C: Client>(
             query,
             floor,
             since,
-        } => {
-            let outcome = move |res| Outcome::History {
-                load,
-                dir,
-                query,
-                floor,
-                since,
-                res,
-            };
-            history(client, admitted, load, dir, query, outcome)
-        }
+        } => history(client, admitted, load, dir, query, floor, since),
         Job::Send {
             local_id,
             thread,
@@ -459,17 +473,24 @@ fn folder_future<C: Client>(
     }
 }
 
-/// The future of a by-id topics call.
-/// A history call of `load` in `dir`, answered by `outcome`.
 fn history<C: Client>(
     client: Arc<C>,
     admitted: Admitted,
     load: Load,
     dir: HistoryDir,
     query: HistoryQuery,
-    outcome: impl FnOnce(CallResult<HistoryPage>) -> Outcome + Send + 'static,
+    floor: Option<MsgId>,
+    since: ContinuityMark,
 ) -> (TaskKind, DoneFuture) {
     let call = async move { client.history(load.thread, query, PAGE).await };
+    let outcome = move |res| Outcome::History {
+        load,
+        dir,
+        query,
+        floor,
+        since,
+        res,
+    };
     (
         TaskKind::History(load, dir),
         Box::pin(admitted.run(call, outcome)),
@@ -519,9 +540,25 @@ fn peer_dialogs<C: Client>(
     (TaskKind::PeerDialogs(stamps.badge), Box::pin(fut))
 }
 
+fn notify_settings<C: Client>(
+    client: Arc<C>,
+    admitted: Admitted,
+    target: NotifyTarget,
+    stamps: Stamps,
+) -> (TaskKind, DoneFuture) {
+    let call = async move { client.notify_settings(target).await };
+    let fut = admitted.run(call, move |res| Outcome::NotifySettings {
+        target,
+        stamps,
+        res,
+    });
+    (TaskKind::NotifySettings(target), Box::pin(fut))
+}
+
 fn dialogs<C: Client>(
     client: Arc<C>,
     admitted: Admitted,
+    req: ReqId,
     cursor: Option<DialogsCursor>,
     stamps: Stamps,
 ) -> (TaskKind, DoneFuture) {
@@ -531,8 +568,13 @@ fn dialogs<C: Client>(
         DialogsStep::Next
     };
     let call = async move { client.dialogs(cursor, DIALOGS_PAGE).await };
-    let fut = admitted.run(call, move |res| Outcome::Dialogs { step, stamps, res });
-    (TaskKind::Dialogs, Box::pin(fut))
+    let fut = admitted.run(call, move |res| Outcome::Dialogs {
+        req,
+        step,
+        stamps,
+        res,
+    });
+    (TaskKind::Dialogs(req), Box::pin(fut))
 }
 
 /// Reads a page from the cache. `anchor` is the window edge for older/newer reads.

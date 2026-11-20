@@ -7,7 +7,10 @@ name = "abyss"
 version = "0.1.0"
 dependencies = [
  "abyss-core",
+ "async-channel",
+ "block2 0.6.2",
  "futures",
+ "getrandom 0.4.3",
  "gpui",
  "gpui_apple",
  "gpui_platform",
@@ -15,8 +18,12 @@ dependencies = [
  "libc",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
  "objc2-foundation 0.3.2",
+ "objc2-user-notifications",
  "proptest",
+ "raw-window-handle",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",

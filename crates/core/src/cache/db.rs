@@ -69,6 +69,15 @@ CREATE INDEX cached_chats_lru ON cached_chats (last_access);
 INSERT INTO meta (key, value) VALUES ('clock', 0);
 ";
 
+// Additive to every supported cache schema. A scoped marker shares the
+// lifetime of its LRU row, which outlives the chat's last cached message.
+const HISTORY_QUARANTINE: &str = "
+CREATE TABLE IF NOT EXISTS history_quarantine (
+    kind INTEGER NOT NULL, chat INTEGER NOT NULL, PRIMARY KEY (kind, chat),
+    FOREIGN KEY (kind, chat) REFERENCES cached_chats (kind, chat) ON DELETE CASCADE
+) WITHOUT ROWID;
+";
+
 /// The `messages` table and its indexes. Ids are unique per chat, so the key
 /// stays `(kind, chat, id)`; `topic` is the row's thread within its chat (see
 /// [`topic_code`]), and `messages_thread` serves one topic's pages.
@@ -98,6 +107,9 @@ pub struct Cache {
     /// Sum of `messages.size`, as committed.
     bytes: u64,
     budget: u64,
+    /// If the durable marker could not be written, serve no history from
+    /// this connection for the rest of the session.
+    history_disabled: bool,
     /// Census entry (see `census`). Must stay the last field.
     _entry: Open,
 }
@@ -236,7 +248,10 @@ fn page_query(
 ) -> (String, ParamsFromIter<Vec<i64>>) {
     let rows = Rows::of(thread);
     let sql = format!(
-        "SELECT id, topic, {} FROM {} WHERE kind = ?1 AND chat = ?2{} AND {} LIMIT ?4",
+        "SELECT id, topic, {} FROM {} WHERE kind = ?1 AND chat = ?2{}
+         AND NOT EXISTS (SELECT 1 FROM meta WHERE key = 'history_quarantined')
+         AND NOT EXISTS (SELECT 1 FROM history_quarantine WHERE kind = ?1 AND chat = ?2)
+         AND {} LIMIT ?4",
         bounded_body(5),
         rows.table(),
         Rows::topic_clause(6),
@@ -263,8 +278,14 @@ fn chat_id(kind: i64, id: i64) -> Option<ChatId> {
     })
 }
 
+// Chat rows have their own format marker so obsolete positional rows can be
+// discarded without dropping cached history or interpreting the old mute field.
+const CHAT_ROW_FORMAT: &[u8; 7] = b"\xffABYSS\x01";
+
 fn decode_chat(kind: i64, id: i64, body: Option<Vec<u8>>) -> Option<ChatSummary> {
-    let c: ChatSummary = postcard::from_bytes(&body?).ok()?;
+    let body = body?;
+    let c: ChatSummary =
+        postcard::from_bytes(body.strip_prefix(CHAT_ROW_FORMAT.as_slice())?).ok()?;
     (Some(c.id) == chat_id(kind, id) && c.is_valid()).then_some(c)
 }
 
@@ -280,9 +301,13 @@ impl Cache {
         census::init().map_err(CacheError::Init)?;
         let entry = Open::enter(dir).map_err(CacheError::Refused)?;
         super::prepare_dir(dir)?;
-        let conn = Self::connect(dir)?;
+        let mut conn = Self::connect(dir)?;
         Self::unlock(&conn, key)?;
         Self::migrate(&conn)?;
+        conn.execute_batch(HISTORY_QUARANTINE)?;
+        if retry_quarantined_history(&mut conn).is_err() {
+            tracing::warn!("could not purge quarantined cache history on reopen");
+        }
         let bytes: i64 =
             conn.query_row("SELECT COALESCE(SUM(size), 0) FROM messages", [], |r| {
                 r.get(0)
@@ -291,6 +316,7 @@ impl Cache {
             conn,
             bytes: to_u64(bytes),
             budget: MAX_CACHE_BYTES,
+            history_disabled: false,
             _entry: entry,
         })
     }
@@ -344,6 +370,7 @@ impl Cache {
         conn.execute_batch(
             "PRAGMA temp_store = MEMORY;
              PRAGMA secure_delete = ON;
+             PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;",
         )?;
@@ -527,7 +554,9 @@ impl Cache {
         tx.execute("DELETE FROM chats", [])?;
         let mut ord = 0i64;
         for chat in chats.iter().filter(|c| c.is_valid()).take(MAX_DIALOGS) {
-            let Some(body) = encode(chat)? else { continue };
+            let Some(body) = encode(&(CHAT_ROW_FORMAT, chat))? else {
+                continue;
+            };
             tx.execute(
                 "INSERT OR REPLACE INTO chats (kind, id, ord, body) VALUES (?1, ?2, ?3, ?4)",
                 params![kind_code(chat.id.kind), chat.id.id, ord, body],
@@ -656,16 +685,29 @@ impl Cache {
 
     /// Deletes every cached message of `chat`, whatever its thread.
     pub fn delete_chat_messages(&mut self, chat: ChatId) -> Result<(), CacheError> {
-        self.write(|tx, bytes| {
-            let mut stmt = tx.prepare_cached(
-                "DELETE FROM messages WHERE kind = ?1 AND chat = ?2 RETURNING size",
-            )?;
-            let mut rows = stmt.query(params![kind_code(chat.kind), chat.id])?;
-            let mut bytes = bytes;
-            while let Some(row) = rows.next()? {
-                bytes = bytes.saturating_sub(to_u64(row.get(0)?));
-            }
-            Ok(((), bytes))
+        self.write(|tx, bytes| Ok(((), delete_chat_history(tx, chat, bytes)?)))
+    }
+
+    /// Commit the quarantine before attempting deletion. Only the purge
+    /// transaction can clear its marker, so rollback leaves reads blocked.
+    pub(super) fn purge_history(&mut self, chat: Option<ChatId>) -> Result<(), CacheError> {
+        if let Err(err) = quarantine_history(&self.conn, chat) {
+            self.history_disabled = true;
+            return Err(err);
+        }
+        if let Some(chat) = chat {
+            return self.write(|tx, bytes| {
+                let bytes = delete_chat_history(tx, chat, bytes)?;
+                tx.execute(
+                    "DELETE FROM history_quarantine WHERE kind = ?1 AND chat = ?2",
+                    params![kind_code(chat.kind), chat.id],
+                )?;
+                Ok(((), bytes))
+            });
+        }
+        self.write(|tx, _| {
+            purge_account_history(tx)?;
+            Ok(((), 0))
         })
     }
 
@@ -733,6 +775,9 @@ impl Cache {
         bound: i64,
         limit: u32,
     ) -> Result<Vec<Message>, CacheError> {
+        if self.history_disabled {
+            return Ok(Vec::new());
+        }
         let chat = thread.chat;
         let (sql, args) = page_query(thread, page, bound, limit);
         let mut out = Vec::new();
@@ -771,6 +816,70 @@ impl Cache {
             Err(CacheError::OverBudget)
         }
     }
+}
+
+fn quarantine_history(conn: &Connection, chat: Option<ChatId>) -> Result<(), CacheError> {
+    // Sync the marker's WAL commit before purge. The later purge and marker
+    // removal share one transaction and can roll back together.
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    let marked = if let Some(chat) = chat {
+        conn.execute(
+            "INSERT OR IGNORE INTO history_quarantine (kind, chat)
+             SELECT kind, chat FROM cached_chats WHERE kind = ?1 AND chat = ?2",
+            params![kind_code(chat.kind), chat.id],
+        )
+    } else {
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('history_quarantined', 1)",
+            [],
+        )
+    };
+    let restored = conn.pragma_update(None, "synchronous", "NORMAL");
+    marked?;
+    Ok(restored?)
+}
+
+fn retry_quarantined_history(conn: &mut Connection) -> Result<(), CacheError> {
+    let tx = conn.transaction()?;
+    let (account, scoped): (bool, bool) = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM meta WHERE key = 'history_quarantined'),
+                EXISTS (SELECT 1 FROM history_quarantine)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if account {
+        purge_account_history(&tx)?;
+    } else if scoped {
+        tx.execute_batch(
+            "DELETE FROM messages WHERE (kind, chat) IN (SELECT kind, chat FROM history_quarantine);
+             DELETE FROM history_quarantine;",
+        )?;
+    }
+    Ok(tx.commit()?)
+}
+
+fn purge_account_history(tx: &Transaction<'_>) -> Result<(), CacheError> {
+    // Deleting the LRU rows also deletes their scoped quarantine markers.
+    tx.execute_batch(
+        "DELETE FROM messages;
+         DELETE FROM cached_chats;
+         DELETE FROM meta WHERE key = 'history_quarantined';",
+    )?;
+    Ok(())
+}
+
+fn delete_chat_history(
+    tx: &Transaction<'_>,
+    chat: ChatId,
+    mut bytes: u64,
+) -> Result<u64, CacheError> {
+    let mut stmt =
+        tx.prepare_cached("DELETE FROM messages WHERE kind = ?1 AND chat = ?2 RETURNING size")?;
+    let mut rows = stmt.query(params![kind_code(chat.kind), chat.id])?;
+    while let Some(row) = rows.next()? {
+        bytes = bytes.saturating_sub(to_u64(row.get(0)?));
+    }
+    Ok(bytes)
 }
 
 /// Deletes up to `EVICT_BATCH` of the least recently used chat's oldest

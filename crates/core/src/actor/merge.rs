@@ -16,7 +16,7 @@ use super::Actor;
 use super::apply::{HistoryReply, TailMode};
 use crate::api::{Event, HistoryDir};
 use crate::backend::{Backend, HistoryPage};
-use crate::model::{Message, MsgId};
+use crate::model::{ChatId, Message, MsgId};
 use crate::store::{Change, Window};
 
 /// How a server tail differs from the window it refreshes.
@@ -73,14 +73,8 @@ pub(super) fn tail_diff(
             Err(_) => {}
         }
     }
-    let mut ids: Vec<MsgId> = page.messages.iter().map(|m| m.id).collect();
-    ids.sort_unstable();
-    if let Some((lo, top)) = range {
-        diff.deleted = window
-            .iter()
-            .map(|w| w.id)
-            .filter(|id| (lo..=top).contains(id) && ids.binary_search(id).is_err())
-            .collect();
+    diff.deleted = tail_deletions(window, page, range);
+    if let Some((_, top)) = range {
         // Every window message up to the top is gone, yet the server sent
         // history below the window, which a merge ignores: the window would
         // show none of what is left of the tail. Replace it instead.
@@ -92,6 +86,25 @@ pub(super) fn tail_diff(
         }
     }
     diff
+}
+
+/// Messages missing from the server's authoritative range; ids outside it
+/// can be dropped from the local window without being server deletions.
+pub(super) fn tail_deletions(
+    window: &VecDeque<Message>,
+    page: &HistoryPage,
+    range: Option<(MsgId, MsgId)>,
+) -> Vec<MsgId> {
+    let Some((lo, top)) = range else {
+        return Vec::new();
+    };
+    let mut ids: Vec<_> = page.messages.iter().map(|m| m.id).collect();
+    ids.sort_unstable();
+    window
+        .iter()
+        .map(|w| w.id)
+        .filter(|id| (lo..=top).contains(id) && ids.binary_search(id).is_err())
+        .collect()
 }
 
 impl<B: Backend> Actor<B> {
@@ -112,6 +125,7 @@ impl<B: Backend> Actor<B> {
             return self.on_tail(p).await;
         }
         let (thread, view) = (p.thread, p.view);
+        self.reconcile_notice_tail(thread, range, &p.page.messages);
         // A contiguous window's refresh only reconciles its range. Any other
         // tail merged here restores continuity: a restoring tail, or a
         // light refresh of an attached window whose restoring tail failed
@@ -124,11 +138,7 @@ impl<B: Backend> Actor<B> {
         } else {
             self.restore_continuity(&p, range).await;
         }
-        let removed = self.windows.delete(thread.chat, &diff.deleted);
-        if !removed.is_empty() {
-            let chat = thread.chat;
-            self.emit(Event::Deleted { chat, ids: removed }).await;
-        }
+        self.apply_tail_deletions(thread.chat, &diff.deleted).await;
         for m in diff.edited {
             if self.windows.replace(thread, m.clone()) {
                 self.emit(Event::Edited(m)).await;
@@ -147,6 +157,17 @@ impl<B: Backend> Actor<B> {
         self.emit_reconciled(thread, view).await;
         self.tail_covers(thread, view, p.req, range.map(|(lo, _)| lo))
             .await;
+    }
+
+    pub(super) async fn apply_tail_deletions(&mut self, chat: ChatId, ids: &[MsgId]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.notify_deleted(Some(chat), ids).await;
+        let removed = self.windows.delete(chat, ids);
+        if !removed.is_empty() {
+            self.emit(Event::Deleted { chat, ids: removed }).await;
+        }
     }
 
     /// Writes a restoring tail through as `on_tail` does (the page plus the
@@ -177,7 +198,7 @@ mod tests {
     use crate::actor::apply::MIN_ID;
 
     use crate::backend::fake::text_message;
-    use crate::model::{ChatId, PeerKind};
+    use crate::model::PeerKind;
 
     const CHAT: ChatId = ChatId {
         kind: PeerKind::User,

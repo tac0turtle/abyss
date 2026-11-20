@@ -143,6 +143,7 @@ impl<B: Backend> Actor<B> {
         // supplies or clears it (stage 2 plan, section 17.6.1).
         self.reads.project(chats);
         for chat in chats.iter_mut() {
+            chat.scope_muted_until = self.notices.scope_mute(chat.kind);
             // A new dialog read state may expose a missed topic update.
             // A remembered aggregate must not hide that new unread state.
             if self.dialogs.get(chat.id).is_some_and(|old| {
@@ -160,6 +161,7 @@ impl<B: Backend> Actor<B> {
             };
         }
         if guarded != crate::store::Guarded::Discard {
+            self.notices.confirm_snapshot_mutes(chats, stamp);
             for chat in chats.iter() {
                 if kind_status(chat.kind) == ForumStatus::Forum {
                     self.badges.track(chat.id);

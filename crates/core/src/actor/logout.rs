@@ -28,7 +28,7 @@ use super::apply::user_error;
 use super::binding::{Rebinding, finish_rebinding};
 use super::jobs::CallError;
 use super::lifecycle::{Live, LogoutStage, Phase, REBUILD_CAPS, Retired, Step, retire};
-use super::marker::{Marking, mark_logout_pending, mark_until};
+use super::marker::{Marking, NotificationObligation, mark_logout_pending, mark_until};
 
 use crate::api::{
     AuthState, Event, LocalDeletion, LogoutStatus, LogoutTrigger, RemoteLogout, StorageError,
@@ -122,12 +122,17 @@ async fn delete_local(
     open: Option<(CacheHandle, CacheKey)>,
     parts: Option<(PathBuf, Option<Rebinding>)>,
     remote: Option<RemoteLogout>,
+    cleanup: NotificationObligation,
 ) -> LocalDone {
     // Refreshes the remote result only. Every path here starts from a
     // marker that was written (the gate in `marker`) or read (startup), and
     // the Keychain updates in place, so a failed rewrite keeps that marker:
     // the deletion below never runs without one (review round 19).
-    let _ = mark_logout_pending(&persist, remote).await;
+    let marker = match cleanup {
+        NotificationObligation::Deferred => NotificationObligation::Required,
+        other => other,
+    };
+    let _ = mark_logout_pending(&persist, remote, marker).await;
     let session = match account {
         Some(account) => persist
             .delete_session(account)
@@ -152,8 +157,7 @@ async fn delete_local(
         None => (forget_key(&persist).await, None),
     };
     let local = match (session, erased) {
-        // Both gone: only now is the logout-pending marker cleared.
-        (Ok(()), Ok(())) => match persist.delete_logout_marker().await {
+        (Ok(()), Ok(())) => match finish_marker(&persist, remote, cleanup).await {
             Ok(()) => LocalDeletion::Deleted,
             Err(e) => LocalDeletion::Failed(StorageError::from(&e)),
         },
@@ -162,6 +166,18 @@ async fn delete_local(
     LocalDone {
         local,
         cache: reopened,
+    }
+}
+
+/// Only after erasure can the marker record that notifications are all that's left.
+async fn finish_marker(
+    persist: &PersistHandle,
+    remote: Option<RemoteLogout>,
+    cleanup: NotificationObligation,
+) -> Result<(), crate::secret::StoreError> {
+    match cleanup {
+        NotificationObligation::Deferred => mark_logout_pending(persist, remote, cleanup).await,
+        _ => persist.delete_logout_marker().await,
     }
 }
 
@@ -236,6 +252,7 @@ struct RemoteStep<B: Backend> {
     persist: PersistHandle,
     shutdown: CancellationToken,
     plan: RemotePlan,
+    cleanup: NotificationObligation,
     live: Option<Live<B>>,
     /// A retirement that was running when the teardown began.
     retiring: Option<JoinHandle<Step<B>>>,
@@ -250,6 +267,7 @@ impl<B: Backend> RemoteStep<B> {
             persist,
             shutdown,
             plan,
+            cleanup,
             live,
             retiring,
         } = self;
@@ -268,7 +286,7 @@ impl<B: Backend> RemoteStep<B> {
         };
         // Best effort: the marker written before still resumes the logout;
         // this only refines what a resumed one reports.
-        let _ = mark_until(&persist, Some(remote), &shutdown).await;
+        let _ = mark_until(&persist, Some(remote), cleanup, &shutdown).await;
         let retired = match live {
             Some(l) => Some(retire(l, REBUILD_CAPS, &shutdown).await),
             None => None,
@@ -373,6 +391,7 @@ impl<B: Backend> Actor<B> {
             persist: self.persist.clone(),
             shutdown: self.cancel.clone(),
             plan,
+            cleanup: self.logout_notification_obligation,
             live,
             retiring,
         };
@@ -382,13 +401,15 @@ impl<B: Backend> Actor<B> {
 
     /// The remote step finished: the instance is gone. Its send outcomes
     /// belong to the old account and are dropped with it.
-    pub(super) fn after_remote_logout(&mut self, remote: RemoteLogout, retired: Option<Retired>) {
+    pub(super) async fn after_remote_logout(
+        &mut self,
+        remote: RemoteLogout,
+        retired: Option<Retired>,
+    ) {
         self.note_remote_logout(remote);
         drop(retired);
         self.admission.release_parked();
-        self.life.phase = Phase::LoggingOut(LogoutStage::Local);
-        let local = self.local_step();
-        *self.life.step_mut() = Some(tokio::spawn(async move { Step::Deleted(local.await) }));
+        self.start_local_logout(remote).await;
     }
 
     pub(super) fn note_remote_logout(&mut self, remote: RemoteLogout) {
@@ -396,7 +417,10 @@ impl<B: Backend> Actor<B> {
     }
 
     /// The local deletion, detached from the actor's state.
-    pub(super) fn local_step(&mut self) -> impl Future<Output = LocalDone> + Send + 'static {
+    fn local_step(
+        &mut self,
+        cleanup: NotificationObligation,
+    ) -> impl Future<Output = LocalDone> + Send + 'static {
         let persist = self.persist.clone();
         let account = self.account.generation().ok();
         let served = self.cache.take();
@@ -407,16 +431,49 @@ impl<B: Backend> Actor<B> {
             ),
             None => (None, None),
         };
-        delete_local(persist, account, open, parts, self.logout_remote)
+        delete_local(persist, account, open, parts, self.logout_remote, cleanup)
+    }
+
+    async fn notification_cleanup_for_logout(
+        &self,
+    ) -> Result<NotificationObligation, StorageError> {
+        if self.logout_notification_obligation == NotificationObligation::None {
+            return Ok(NotificationObligation::None);
+        }
+        if !self.events.has_notifications() {
+            return Ok(NotificationObligation::Deferred);
+        }
+        if self.events.clear_notifications().await {
+            Ok(NotificationObligation::Required)
+        } else {
+            Err(StorageError::Local)
+        }
+    }
+
+    pub(super) async fn start_local_logout(&mut self, remote: RemoteLogout) {
+        let cleanup = match self.notification_cleanup_for_logout().await {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                return self
+                    .logout_unfinished(remote, LocalDeletion::Failed(error))
+                    .await;
+            }
+        };
+        self.life.phase = Phase::LoggingOut(LogoutStage::Local);
+        let local = self.local_step(cleanup);
+        *self.life.step_mut() = Some(tokio::spawn(async move { Step::Deleted(local.await) }));
     }
 
     /// Shutdown: runs the local step inline, bounded by `deadline`.
     pub(super) async fn delete_local_until(&mut self, deadline: Instant) -> Option<LocalDeletion> {
-        let local = self.local_step();
-        tokio::time::timeout_at(deadline, local)
-            .await
-            .ok()
-            .map(|d| d.local)
+        tokio::time::timeout_at(deadline, async {
+            match self.notification_cleanup_for_logout().await {
+                Ok(cleanup) => self.local_step(cleanup).await.local,
+                Err(error) => LocalDeletion::Failed(error),
+            }
+        })
+        .await
+        .ok()
     }
 
     pub(super) fn logout_status(&self, local: Option<LocalDeletion>) -> LogoutStatus {
@@ -477,9 +534,7 @@ impl<B: Backend> Actor<B> {
         self.set_auth(AuthState::LoggingOut).await;
 
         self.note_remote_logout(remote);
-        self.life.phase = Phase::LoggingOut(LogoutStage::Local);
-        let local = self.local_step();
-        *self.life.step_mut() = Some(tokio::spawn(async move { Step::Deleted(local.await) }));
+        self.start_local_logout(remote).await;
     }
 
     /// An incomplete logout, for the shutdown report.
@@ -513,6 +568,8 @@ impl<B: Backend> Actor<B> {
     /// and read marks. The UI's chat list empties.
     async fn reset_account_data(&mut self) {
         self.dialogs = crate::store::Dialogs::default();
+        self.notices.reset_account();
+        self.gap = super::boot::Gap::Clear;
         self.windows = crate::store::Windows::default();
         self.topics = super::topics::TopicLists::default();
         self.badges = crate::store::Badges::default();

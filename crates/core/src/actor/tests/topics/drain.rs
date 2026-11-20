@@ -49,7 +49,7 @@ async fn draining_due_topics_beyond_page_one() {
             for i in 0..70 {
                 let mut m = message_in(topic_key(f, 5000 + i), 20_000 + i, "unknown");
                 m.date = NOW;
-                h.fake.push_update(Update::NewMessage(m)).await;
+                h.fake.push_update(Update::NewMessage(m.into())).await;
             }
         }
         events_for(&mut h, Duration::from_millis(500)).await;

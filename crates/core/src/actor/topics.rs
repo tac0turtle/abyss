@@ -141,6 +141,17 @@ impl<B: Backend> Actor<B> {
         self.open.filter(|t| t.chat == chat).and_then(|t| t.topic)
     }
 
+    /// Both views change in one actor turn under the same account epoch.
+    pub(super) async fn open_forum_topic(&mut self, chat: ChatId, topic: TopicId) {
+        self.open_forum(chat).await;
+        // A topic key passes open_thread's admission check.
+        self.open_thread(ThreadKey {
+            chat,
+            topic: Some(topic),
+        })
+        .await;
+    }
+
     /// `OpenForum`: the retained list at once (Back is instant), then the
     /// first page, under a new generation. Closes any other forum view.
     pub(super) async fn open_forum(&mut self, chat: ChatId) {
@@ -552,7 +563,8 @@ impl<B: Backend> Actor<B> {
     /// list means core knows the chat is a forum).
     pub(super) async fn topics_on_update(&mut self, update: &Update) {
         let chat = match update {
-            Update::NewMessage(m) | Update::Edited(m) => m.thread.chat,
+            Update::NewMessage(m) => m.message.thread.chat,
+            Update::Edited(m) => m.thread.chat,
             Update::Deleted {
                 chat: Some(chat), ..
             }
@@ -572,7 +584,7 @@ impl<B: Backend> Actor<B> {
         let now = now();
         let routed = |m: &Message| normalize(m.clone(), ForumStatus::Forum).1;
         let tail = match update {
-            Update::NewMessage(m) if self.tail_visible(routed(m).thread) => Tail::Visible,
+            Update::NewMessage(m) if self.tail_visible(routed(&m.message).thread) => Tail::Visible,
             _ => Tail::Hidden,
         };
         let held = match update {
@@ -583,7 +595,7 @@ impl<B: Backend> Actor<B> {
             return;
         };
         let changes = match update {
-            Update::NewMessage(m) => list.on_new_message(&routed(m), tail, now),
+            Update::NewMessage(m) => list.on_new_message(&routed(&m.message), tail, now),
             Update::Edited(m) => list.on_edit(&routed(m), now),
             Update::Deleted { ids, .. } => list.on_deleted(ids, &held, now),
             Update::TopicEdited {

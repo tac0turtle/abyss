@@ -19,6 +19,7 @@ mod loads;
 mod logout;
 mod marker;
 mod merge;
+mod notices;
 mod onboarding;
 mod paused;
 mod peers;
@@ -26,6 +27,8 @@ mod reads;
 mod sends;
 #[cfg(all(test, feature = "fake"))]
 mod tests;
+#[cfg(all(test, feature = "fake"))]
+pub(crate) use tests::assert_difference_purges_history;
 mod threads;
 mod topics;
 
@@ -42,7 +45,7 @@ use admission::Admission;
 pub use admission::MAX_CONCURRENT;
 use auth::AuthMachine;
 pub(crate) use binding::{Identity, provision_cache};
-use boot::Boot;
+use boot::{Boot, Gap};
 use jobs::{CallCtx, Done, FolderJob, Job, Load, ReqId, TaskKind};
 use lifecycle::{Lifecycle, Live, LiveEvent, Phase, Reason};
 use loads::Deferred;
@@ -93,6 +96,7 @@ fn account_scoped(cmd: &Command) -> bool {
             | Command::MarkRead { .. }
             | Command::ViewingTail(_)
             | Command::OpenForum(_)
+            | Command::OpenForumTopic { .. }
             | Command::CloseForum(_)
             | Command::LoadTopics(_)
             | Command::SetPeerFolder { .. }
@@ -132,6 +136,7 @@ pub(crate) struct Actor<B: Backend> {
     cancel: CancellationToken,
     cache: Option<CacheHandle>,
     dialogs: Dialogs,
+    notices: notices::Notices,
     windows: Windows,
     cgen: ClientGen,
     admission: Admission,
@@ -145,6 +150,8 @@ pub(crate) struct Actor<B: Backend> {
     live: Option<Live<B>>,
     life: Lifecycle<B>,
     boot: Option<Boot>,
+    /// A known gap still needs a successful reconcile, even across rebuilds.
+    gap: Gap,
     window: WindowState,
     last_refresh: Instant,
     /// Threads with a history load (cache or server) in flight, and that
@@ -207,6 +214,8 @@ pub(crate) struct Actor<B: Backend> {
     unfinished_logout: Option<(RemoteLogout, crate::api::LocalDeletion)>,
     /// Startup found the logout-pending marker (see `marker`).
     pending_logout: Option<PendingLogout>,
+    /// Required notification cleanup carried by the active or deferred logout.
+    logout_notification_obligation: marker::NotificationObligation,
     /// A logout waiting on its marker, or one that could not start.
     logout_gate: marker::LogoutGate,
 }
@@ -252,6 +261,7 @@ impl<B: Backend> Actor<B> {
             cancel: init.cancel,
             cache: init.cache,
             dialogs: Dialogs::default(),
+            notices: notices::Notices::default(),
             windows: Windows::default(),
             cgen: ClientGen(1),
             admission: Admission::default(),
@@ -262,6 +272,7 @@ impl<B: Backend> Actor<B> {
             live: None,
             life: Lifecycle::default(),
             boot: None,
+            gap: Gap::Clear,
             window: WindowState::Active,
             last_refresh: Instant::now(),
             history_busy: HashMap::new(),
@@ -297,6 +308,10 @@ impl<B: Backend> Actor<B> {
             logout_remote: None,
             unfinished_logout: None,
             pending_logout: init.pending_logout,
+            logout_notification_obligation: match init.pending_logout {
+                Some(PendingLogout::NotificationsOnly) => marker::NotificationObligation::Required,
+                _ => marker::NotificationObligation::None,
+            },
             logout_gate: marker::LogoutGate::default(),
         };
         let channels = ActorChannels {
@@ -320,6 +335,7 @@ impl<B: Backend> Actor<B> {
             let flood_over = self.auth.flood_deadline();
             let topics_at = self.topics_wake();
             let peer_at = self.peer_wake();
+            let notice_at = self.notice_wake();
             // Paused while a logout hides the account (`paused`).
             let send_due = self
                 .sends
@@ -335,6 +351,7 @@ impl<B: Backend> Actor<B> {
                 Some(joined) = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
                     self.on_joined(joined).await;
                 }
+                () = sleep_until(notice_at) => self.flush_notices().await,
                 Some((cgen, item)) = ch.updates.recv() => {
                     if cgen == self.cgen {
                         self.on_feed(item).await;
@@ -354,6 +371,7 @@ impl<B: Backend> Actor<B> {
                 () = sleep_until(peer_at) => {}
                 _ = flush.tick() => self.flush_reads().await,
             }
+            self.advance_boot().await;
             // User loads first; background coverage only when idle.
             self.run_deferred_loads().await;
             self.run_cover_fetch().await;
@@ -368,6 +386,7 @@ impl<B: Backend> Actor<B> {
                 "kind checks outside the required peers"
             );
             self.pump_peer_dialogs();
+            self.pump_notice_lookup();
             self.pump();
             self.sync_peers();
         }
@@ -514,7 +533,9 @@ impl<B: Backend> Actor<B> {
                 return;
             };
             match &mut job {
-                Job::Dialogs { stamps, .. } => stamps.badge = self.badges.dispatch(),
+                Job::Dialogs { stamps, .. } | Job::PeerNotifySettings { stamps, .. } => {
+                    stamps.badge = self.badges.dispatch();
+                }
                 // Its dispatch: the badge stamp and the call interval count
                 // from admission, not from planning.
                 Job::PeerDialogs { chats, stamps } => {
@@ -568,7 +589,10 @@ impl<B: Backend> Actor<B> {
                 }
                 Job::PeerDialogs { .. } => self.peer_job_dropped(),
                 Job::Read { thread, max_id, .. } => self.read_job_dropped(thread, max_id),
-                Job::Send { .. } | Job::Folders(_) => {}
+                Job::Send { .. }
+                | Job::Folders(_)
+                | Job::NotifySettings(_)
+                | Job::PeerNotifySettings { .. } => {}
             }
         }
     }
@@ -616,6 +640,11 @@ impl<B: Backend> Actor<B> {
     /// released by unwinding; clear the state it held and keep running.
     async fn on_panic(&mut self, kind: Option<TaskKind>) {
         match kind {
+            Some(TaskKind::NotifySettings(crate::backend::NotifyTarget::Scope(scope))) => {
+                return self
+                    .on_scope_snapshot(scope, Err(jobs::CallError::Dropped))
+                    .await;
+            }
             Some(TaskKind::ChatFolders) => {
                 // A load wanted after this one still runs.
                 let again = self.folders == FoldersLoad::Again;
@@ -625,11 +654,10 @@ impl<B: Backend> Actor<B> {
                 }
             }
             Some(TaskKind::FolderWrite(write)) => self.folder_write_panicked(write).await,
-            Some(TaskKind::Dialogs) => {
-                self.dialogs_busy = false;
+            Some(TaskKind::Dialogs(req)) => {
                 self.load_ended(LoadTarget::Dialogs, Some(UserError::Internal))
                     .await;
-                self.snapshot_done(boot::Snapshot::Dialogs).await;
+                self.dialogs_finished(req, None).await;
             }
             Some(TaskKind::History(load, dir)) => {
                 self.release_history(load);
@@ -645,7 +673,10 @@ impl<B: Backend> Actor<B> {
                 if let Some(anchored) = self.anchored.take_if(|a| a.load == load) {
                     self.anchored_failed(anchored, UserError::Internal).await;
                 }
-                self.snapshot_done(boot::Snapshot::Tail(load)).await;
+                self.snapshot_done(boot::Snapshot::Tail {
+                    load,
+                    applied: false,
+                });
             }
             Some(TaskKind::Send(local_id)) => {
                 if let Some(state) = self.sends.mark_unknown(local_id) {
@@ -659,6 +690,9 @@ impl<B: Backend> Actor<B> {
                 self.topics_call_panicked(call, topics::Fetch::ById).await;
             }
             Some(TaskKind::PeerDialogs(stamp)) => self.peer_call_panicked(stamp).await,
+            Some(TaskKind::NotifySettings(crate::backend::NotifyTarget::Peer(chat))) => {
+                self.finish_notice_lookup(chat);
+            }
             Some(TaskKind::Updates) => {
                 self.error(UserError::Internal).await;
                 return self.rebuild(Reason::StreamFailed).await;
@@ -702,6 +736,9 @@ impl<B: Backend> Actor<B> {
             Command::OpenThreadAt { thread, after } => self.open_thread_at(thread, after).await,
             Command::CloseThread(thread) => self.close_thread(thread).await,
             Command::OpenForum(chat) => self.open_forum(chat).await,
+            Command::OpenForumTopic { chat, topic } => {
+                self.open_forum_topic(chat, topic).await;
+            }
             Command::CloseForum(chat) => self.close_forum(chat),
             Command::LoadTopics(chat) => self.load_topics(chat).await,
             Command::LoadOlder(thread) => {
@@ -791,7 +828,15 @@ impl<B: Backend> Actor<B> {
             None
         };
         let stamps = jobs::Stamps::default();
-        if self.enqueue(Job::Dialogs { cursor, stamps }).await {
+        let req = self.request_id();
+        if self
+            .enqueue(Job::Dialogs {
+                req,
+                cursor,
+                stamps,
+            })
+            .await
+        {
             self.dialogs_busy = true;
         } else {
             self.load_ended(LoadTarget::Dialogs, Some(UserError::Busy))
@@ -872,14 +917,18 @@ impl<B: Backend> Actor<B> {
     /// Starts a history load for `thread`'s `view`, making it the thread's
     /// single-flight load.
     fn begin_load(&mut self, thread: ThreadKey, view: ViewGen) -> Load {
-        self.next_req = self.next_req.wrapping_add(1);
         let load = Load {
             thread,
             view,
-            req: ReqId(self.next_req),
+            req: self.request_id(),
         };
         self.history_busy.insert(thread, load);
         load
+    }
+
+    fn request_id(&mut self) -> ReqId {
+        self.next_req = self.next_req.wrapping_add(1);
+        ReqId(self.next_req)
     }
 
     /// The newest id `thread`'s window holds now: what a tail requested now
@@ -891,12 +940,17 @@ impl<B: Backend> Actor<B> {
             .map(|m| m.id)
     }
 
+    fn history_tail_floor(&self, thread: ThreadKey) -> Option<MsgId> {
+        self.tail_floor(thread)
+            .max(self.notices.newest_contributor(thread))
+    }
+
     async fn request_tail(&mut self, load: Load) {
         let job = Job::History {
             load,
             dir: HistoryDir::Tail,
             query: HistoryQuery::Tail,
-            floor: self.tail_floor(load.thread),
+            floor: self.history_tail_floor(load.thread),
             since: self.windows.continuity_mark(),
         };
         if !self.enqueue(job).await {

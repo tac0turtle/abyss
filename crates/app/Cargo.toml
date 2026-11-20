@@ -7,13 +7,14 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-channel = "2.5"
 abyss-core = { path = "../core" }
 gpui.workspace = true
 gpui_platform.workspace = true
 futures = { version = "0.3", default-features = false, features = ["std"] }
 # Local times and dates (plan section 8); already in the tree via grammers.
 jiff = "0.2.40"
-# getpwuid_r, getuid (cache location, task 9c); already in the tree via core.
+# getuid (owner checks, task 9c) and the small files' open flags; already in the tree via core.
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
@@ -25,6 +26,19 @@ futures = { version = "0.3", default-features = false, features = ["std", "execu
 gpui = { workspace = true, features = ["test-support"] }
 proptest = "1"
 tempfile = "3"
+
+# AccessKit activates through AppKit. A harnessless target keeps the native
+# window on the process main thread and runs as part of the fake suite.
+[[test]]
+name = "a11y"
+path = "src/native_a11y.rs"
+harness = false
+required-features = ["fake"]
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAccessibilityConstants", "NSAccessibilityElement", "NSAccessibilityProtocols", "NSView", "NSWindow"] }
+raw-window-handle = "0.6"
+serde_json = "1"
 
 [features]
 # Compile Metal shaders at runtime so dev builds don't need Xcode's Metal toolchain
@@ -38,10 +52,19 @@ fake = ["abyss-core/fake"]
 snapshots = ["fake", "gpui/test-support", "gpui_platform/test-support", "dep:gpui_apple"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# AppKit for the Dock icon on direct launches; already pinned through GPUI.
+# Cocoa bindings already pinned through GPUI.
+block2 = "0.6.2"
+getrandom = "0.4.3"
 objc2 = "0.6.5"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSImage", "NSAccessibility", "NSWorkspace"] }
+# NSFileManager and friends: the Application Support root (Stage 3 task 1).
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSFileManager", "NSNotification", "NSOperation", "NSPathUtilities", "NSString", "NSURL", "NSUserDefaults", "block2", "NSValue", "objc2-core-foundation"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFNumber"] }
+objc2-user-notifications = { version = "=0.3.2", default-features = false, features = [
+    "std", "block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest",
+    "UNNotificationResponse", "UNNotificationSettings", "UNNotificationSound", "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+] }
 # The CoreText text system on its own, for the snapshots: `MacPlatform`, the
 # usual way to get it, insists on the main thread, and tests run off it. Same
 # zed revision as `gpui` (already in Cargo.lock through `gpui_platform`).

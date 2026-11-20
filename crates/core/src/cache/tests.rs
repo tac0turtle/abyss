@@ -1,6 +1,7 @@
 use super::*;
 use crate::model::{
-    Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerFolder, PeerKind, ReadState, ThreadKey,
+    Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerFolder, PeerKind, ReadState,
+    ThreadKey, TopicId,
 };
 use crate::rich_text::RichText;
 
@@ -106,7 +107,8 @@ fn summary(c: ChatId, title: &str) -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
-        muted_until: 0,
+        muted_until: None,
+        scope_muted_until: 0,
         folder: PeerFolder::Main,
         reading: None,
         topic_unread: None,
@@ -152,6 +154,113 @@ fn roundtrip_survives_reopen() {
         ids(&db.after(ThreadKey::whole(c), MsgId(1), 1).unwrap()),
         [2]
     );
+}
+
+#[test]
+fn a_failed_scoped_purge_blocks_every_thread_of_that_chat_across_reopen() {
+    let (_t, dir, key) = setup();
+    let mut db = Cache::open(&dir, &key).unwrap();
+    let chat = ChatId {
+        kind: PeerKind::Channel,
+        id: 1,
+    };
+    let thread = ThreadKey::whole(chat);
+    let topic = ThreadKey {
+        chat,
+        topic: Some(TopicId::try_from(2).unwrap()),
+    };
+    let trusted = ThreadKey::whole(user(1));
+    let mut post = msg(chat, 3, "cached topic");
+    post.thread = topic;
+    db.put_messages(thread, &[msg(chat, 2, "cached")]).unwrap();
+    db.put_messages(topic, &[post]).unwrap();
+    db.put_messages(trusted, &[msg(trusted.chat, 2, "unaffected")])
+        .unwrap();
+    let bytes = db.total_bytes();
+    block_history_purges(&db);
+
+    assert!(db.purge_history(Some(chat)).is_err());
+    assert_eq!(db.total_bytes(), bytes, "rollback kept the cached rows");
+    assert!(db.tail(thread, 10).unwrap().is_empty());
+    assert!(db.before(thread, MsgId(3), 10).unwrap().is_empty());
+    assert!(db.after(thread, MsgId(1), 10).unwrap().is_empty());
+    drop(db);
+
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert_eq!(db.total_bytes(), bytes, "the reopen retry still failed");
+    assert!(db.tail(thread, 10).unwrap().is_empty());
+    assert!(db.before(thread, MsgId(3), 10).unwrap().is_empty());
+    assert!(db.after(thread, MsgId(1), 10).unwrap().is_empty());
+    assert!(db.tail(topic, 10).unwrap().is_empty());
+    assert_eq!(ids(&db.tail(trusted, 10).unwrap()), [2]);
+    db.conn().execute_batch("DROP TRIGGER fail_purge").unwrap();
+    drop(db);
+
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert!(db.total_bytes() < bytes, "reopen purged the stale chat");
+    assert!(db.tail(thread, 10).unwrap().is_empty());
+    assert!(db.tail(topic, 10).unwrap().is_empty());
+    db.put_messages(thread, &[msg(chat, 4, "fetched")]).unwrap();
+    assert_eq!(ids(&db.tail(thread, 10).unwrap()), [4]);
+    assert_eq!(ids(&db.tail(trusted, 10).unwrap()), [2]);
+}
+
+#[test]
+fn a_failed_account_purge_blocks_all_history_across_reopen() {
+    let (_t, dir, key) = setup();
+    let mut db = Cache::open(&dir, &key).unwrap();
+    let a = ThreadKey::whole(user(1));
+    let b = ThreadKey::whole(user(2));
+    db.put_chats(&[summary(a.chat, "chat")]).unwrap();
+    db.put_messages(a, &[msg(a.chat, 2, "cached")]).unwrap();
+    db.put_messages(b, &[msg(b.chat, 2, "cached")]).unwrap();
+    let bytes = db.total_bytes();
+    block_history_purges(&db);
+    assert!(db.purge_history(None).is_err());
+    drop(db);
+
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert_eq!(db.total_bytes(), bytes);
+    assert!(db.tail(a, 10).unwrap().is_empty());
+    assert!(db.tail(b, 10).unwrap().is_empty());
+    assert_eq!(db.chats().unwrap().len(), 1);
+    db.conn().execute_batch("DROP TRIGGER fail_purge").unwrap();
+    db.purge_history(Some(a.chat)).unwrap();
+    assert!(db.tail(b, 10).unwrap().is_empty());
+    db.purge_history(None).unwrap();
+    assert_eq!(db.total_bytes(), 0);
+    db.put_messages(b, &[msg(b.chat, 3, "fetched")]).unwrap();
+    assert_eq!(ids(&db.tail(b, 10).unwrap()), [3]);
+}
+
+#[test]
+fn a_failed_quarantine_write_disables_all_history_for_the_session() {
+    let (_t, dir, key) = setup();
+    let mut db = Cache::open(&dir, &key).unwrap();
+    let a = ThreadKey::whole(user(1));
+    let b = ThreadKey::whole(user(2));
+    db.put_messages(a, &[msg(a.chat, 2, "cached")]).unwrap();
+    db.put_messages(b, &[msg(b.chat, 2, "cached")]).unwrap();
+    db.conn().execute_batch("PRAGMA query_only = ON").unwrap();
+
+    assert!(db.purge_history(Some(a.chat)).is_err());
+    assert!(db.total_bytes() > 0);
+    assert!(db.tail(a, 10).unwrap().is_empty());
+    assert!(db.tail(b, 10).unwrap().is_empty());
+
+    db.conn().execute_batch("PRAGMA query_only = OFF").unwrap();
+    db.purge_history(None).unwrap();
+    db.put_messages(b, &[msg(b.chat, 3, "fetched")]).unwrap();
+    assert!(db.tail(b, 10).unwrap().is_empty());
+}
+
+fn block_history_purges(db: &Cache) {
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_purge BEFORE DELETE ON messages
+             BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+        )
+        .unwrap();
 }
 
 #[test]
@@ -411,7 +520,7 @@ fn peer_folder_round_trips() {
     let c = user(1);
     let archived = ChatSummary {
         folder: PeerFolder::Archive,
-        muted_until: i64::from(i32::MAX),
+        muted_until: Some(i64::from(i32::MAX)),
         kind: ChatKind::Private { contact: true },
         ..summary(c, "c")
     };
@@ -690,4 +799,67 @@ fn unowned_rows_are_foreign() {
     assert_eq!(db.bind(None).unwrap(), Binding::Foreign);
 }
 
+/// Stage 3 task 1, the two regimes: a bare `cargo dev` run and the sandboxed
+/// bundle share Keychain items but not files. A run that finds the cache key
+/// in the Keychain with no database (not even its directory) opens a new
+/// cache without an error, and what it writes survives a reopen.
+#[tokio::test]
+async fn a_keychain_key_with_no_database_opens_a_new_cache() {
+    use crate::secret::{MemoryStore, create_cache_key, load_or_create_cache_key};
+
+    // The other regime already stored the key.
+    let store = MemoryStore::new();
+    let stored = create_cache_key(&store).unwrap();
+    let key = load_or_create_cache_key(&store).unwrap();
+    assert_eq!(
+        key.as_bytes(),
+        stored.as_bytes(),
+        "the stored key is reused"
+    );
+
+    // Nothing at all under the (container) root yet, as on a first bundle run.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("Containers/dev.abyss/Data/cache");
+    assert!(!dir.exists());
+
+    // The session's path: `open_blocking` neither fails nor recreates.
+    let (handle, _key) = open_blocking(dir.clone(), key).await.unwrap();
+    assert!(dir.join(DB_FILE).exists(), "a new database was made");
+    assert!(handle.chats().await.unwrap().is_empty());
+    let c = user(1);
+    handle
+        .write(worker::CacheCmd::PutMessages(
+            ThreadKey::whole(c),
+            vec![msg(c, 1, "a")],
+        ))
+        .await;
+    handle.close().await.unwrap();
+
+    // The same stored key opens it again: a clean new cache, not a reset.
+    let key = load_or_create_cache_key(&store).unwrap();
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert_eq!(ids(&db.tail(ThreadKey::whole(c), 10).unwrap()), [1]);
+}
+
 mod threads;
+
+#[test]
+fn cached_chat_keeps_own_mute_and_drops_the_account_default() {
+    let (_t, dir, key) = setup();
+    let peer = ChatSummary {
+        muted_until: Some(0),
+        scope_muted_until: i64::MAX,
+        ..summary(user(1), "Peer")
+    };
+    let group = ChatSummary {
+        muted_until: None,
+        scope_muted_until: i64::MAX,
+        ..summary(user(2), "Group")
+    };
+    let mut db = Cache::open(&dir, &key).unwrap();
+    db.put_chats(&[peer, group]).unwrap();
+    let rows = db.chats().unwrap();
+    assert_eq!(rows[0].muted_until, Some(0));
+    assert_eq!(rows[1].muted_until, None);
+    assert!(rows.iter().all(|row| row.scope_muted_until == 0));
+}

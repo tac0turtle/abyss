@@ -63,7 +63,8 @@ fn summary() -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
-        muted_until: 0,
+        muted_until: None,
+        scope_muted_until: 0,
         folder: PeerFolder::Main,
         reading: None,
         topic_unread: None,
@@ -137,6 +138,70 @@ fn open(core: &mut Core) -> ChatShell {
     assert!(core.take().is_empty(), "already open");
     shell.apply(history(1, HistoryDir::Tail, 51..=100));
     shell
+}
+
+#[test]
+fn a_banner_opens_another_forums_topic_with_one_command_slot() {
+    let a = ChatId {
+        kind: PeerKind::Channel,
+        id: 2,
+    };
+    let b = ChatId {
+        kind: PeerKind::Channel,
+        id: 3,
+    };
+    let topic = TopicId::GENERAL;
+    let mut shell = ChatShell::default();
+    let mut core = Core::default();
+    shell.apply(Event::DialogsReset(
+        [a, b]
+            .into_iter()
+            .map(|id| ChatSummary {
+                id,
+                kind: ChatKind::Supergroup {
+                    forum: true,
+                    gigagroup: false,
+                },
+                ..summary()
+            })
+            .collect(),
+    ));
+    shell.select(a, &mut core.admit()).unwrap();
+    assert!(matches!(core.take().as_slice(), [Command::OpenForum(chat)] if *chat == a));
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let mut admit = |cmd| tx.try_send(cmd).map_err(|_| Refused::Busy);
+    admit(Command::LoadTopics(a)).unwrap();
+    assert_eq!(
+        shell.show_forum_topic(b, topic, &mut admit),
+        Err(Refused::Busy)
+    );
+    assert_eq!(
+        shell.pane(),
+        Pane::Forum {
+            chat: a,
+            open: None
+        }
+    );
+    assert!(matches!(rx.try_recv(), Ok(Command::LoadTopics(chat)) if chat == a));
+    assert!(
+        rx.try_recv().is_err(),
+        "core received no navigation away from A"
+    );
+
+    assert_eq!(shell.show_forum_topic(b, topic, &mut admit), Ok(()));
+    assert_eq!(
+        shell.pane(),
+        Pane::Forum {
+            chat: b,
+            open: Some(topic)
+        }
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Command::OpenForumTopic { chat, topic: t }) if chat == b && t == topic
+    ));
+    assert!(rx.try_recv().is_err());
 }
 
 /// Submits `text`, and core keeps it (`SendAdmitted`).
@@ -467,4 +532,45 @@ fn switching_chats_keeps_echoes_with_their_chat() {
     );
 }
 
+mod covered;
 mod first_unread;
+
+/// A shell with `CHAT` open, loaded and empty (a new chat).
+fn open_empty(core: &mut Core) -> ChatShell {
+    let mut shell = ChatShell::default();
+    shell.apply(Event::DialogsReset(vec![summary()]));
+    shell.select(CHAT, &mut core.admit()).unwrap();
+    shell.apply(history(1, HistoryDir::Tail, 0..0));
+    assert_eq!(shell.row_count(), 0, "loaded and empty");
+    assert!(shell.announcement().is_none());
+    shell
+}
+
+/// Review A42: an attached, loaded window can hold no messages (a new chat),
+/// and then its first incoming message has no lower bound to beat: it is
+/// announced. The user's own message is not.
+#[test]
+fn the_first_incoming_message_in_an_empty_chat_is_announced() {
+    let mut core = Core::default();
+    let mut shell = open_empty(&mut core);
+    shell.apply(live(2));
+    assert_eq!(
+        shell.announcement().map(|a| a.text.as_ref()),
+        Some("New message from c"),
+        "named by the chat when the sender is unknown"
+    );
+
+    let mut shell = open_empty(&mut core);
+    shell.apply(Event::History {
+        thread: THREAD,
+        view: ViewGen(1),
+        dir: HistoryDir::Newer,
+        messages: vec![Message {
+            outgoing: true,
+            ..msg(1)
+        }],
+        removed: Vec::new(),
+        has_more: false,
+    });
+    assert!(shell.announcement().is_none(), "the user's own message");
+}

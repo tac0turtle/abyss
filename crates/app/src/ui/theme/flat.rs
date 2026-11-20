@@ -274,6 +274,7 @@ pub(super) fn theme(flat: Flat, mode: Mode, accent: Option<Hue>) -> Theme {
         // No step flips: one surface takes one text color.
         flip: STEPS,
         flat: true,
+        increased_contrast: false,
         text,
         // Nothing sits on a `text` fill in a flat colourway; the surface is
         // the natural opposite.

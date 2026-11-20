@@ -11,8 +11,10 @@ mod anchored;
 mod auth;
 mod chat_folders;
 mod folders;
+mod gaps;
 mod lifecycle;
 mod logout;
+mod notices;
 mod onboarding;
 mod reads;
 mod topic_keys;
@@ -33,7 +35,7 @@ use crate::api::{AuthState, Command, ConnState, Event, HistoryDir, SendState, Us
 use crate::backend::fake::{
     FAKE_SELF_HASH, FAKE_SELF_ID, FakeBackend, FakeHandle, FakeScript, Fault, Op, text_message,
 };
-use crate::backend::{BackendError, RejectReason, Update};
+use crate::backend::{BackendError, RejectReason, StreamItem, Update};
 use crate::cache::{CacheHandle, CacheKey};
 use crate::events::{self, EventReceiver};
 use crate::model::{ChatId, LocalId, MsgId, PeerKind, ThreadKey};
@@ -72,6 +74,7 @@ fn chat(id: i64) -> ChatId {
 struct Setup {
     /// No stored session: the actor starts signed out.
     signed_out: bool,
+    notifications: events::NotificationCleanupPolicy,
     /// A cache handle opened by the test (no key bookkeeping).
     cache: Option<CacheHandle>,
     /// Open the cache here through the startup path (key from the store).
@@ -158,7 +161,8 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
     let (wrapped, faults) = FaultyStore::new(store.clone());
     startup_faults(&setup, &faults);
     let persist = PersistHandle::spawn(wrapped).unwrap();
-    let pending_logout = super::read_pending_logout(&persist).await;
+    let (events_tx, events) = events::channel_with_notifications(setup.notifications);
+    let pending_logout = super::read_pending_logout(&persist, &events_tx).await;
     let (account, identity) = match pending_logout {
         Some(_) => (persist.fresh_session(), Identity::Unknown),
         None => load(&persist).await,
@@ -175,7 +179,6 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
     }
     let (cmd, cmd_rx) = mpsc::channel(256);
     let (internal, internal_rx) = mpsc::channel(8);
-    let (events_tx, events) = events::channel();
     let cancel = CancellationToken::new();
     let (actor, channels) = Actor::new(ActorInit {
         backend: Arc::new(backend),
@@ -524,12 +527,14 @@ async fn live_messages_extend_open_window_and_bump_others() {
     h.send(Command::OpenThread(ThreadKey::whole(chat(1)))).await;
     h.history(chat(1), HistoryDir::Tail).await;
     h.fake
-        .push_update(Update::NewMessage(text_message(chat(1), 11, "new")))
+        .push_update(Update::NewMessage(text_message(chat(1), 11, "new").into()))
         .await;
     let ev = h.history(chat(1), HistoryDir::Newer).await;
     assert_eq!(history_ids(&ev), vec![11]);
     h.fake
-        .push_update(Update::NewMessage(text_message(chat(2), 11, "other")))
+        .push_update(Update::NewMessage(
+            text_message(chat(2), 11, "other").into(),
+        ))
         .await;
     let (ev, _) = h
         .until(|e| matches!(e, Event::ChatBumped(s) if s.id == chat(2)))
@@ -756,4 +761,53 @@ async fn cached_chat_list_keeps_every_loaded_page() {
     h.stop().await;
     cache.barrier().await.unwrap();
     assert_eq!(cache.chats().await.unwrap().len(), 150);
+}
+
+/// Runs the real feed's over-budget abandonment through the actor and cache.
+pub(crate) async fn assert_difference_purges_history(
+    channel: ChatId,
+    items: impl IntoIterator<Item = StreamItem>,
+) {
+    let dir = CacheDir::new();
+    let key = CacheKey::generate().unwrap();
+    let cache = cache_at(dir.path(), &key);
+    let unopened = [ThreadKey::whole(chat(2)), ThreadKey::whole(channel)];
+    for thread in unopened {
+        cache
+            .write(crate::cache::CacheCmd::PutMessages(
+                thread,
+                vec![text_message(thread.chat, 6, "old history")],
+            ))
+            .await;
+    }
+
+    let mut h = harness(FakeScript::demo(2, 3), Some(cache.clone())).await;
+    open_settled(&mut h, &cache).await;
+    for thread in unopened {
+        assert_eq!(cache.tail(thread, 10).await.unwrap().len(), 1);
+    }
+    h.fake.set_history(
+        chat(1),
+        vec![
+            text_message(chat(1), 1, "kept"),
+            text_message(chat(1), 3, "kept"),
+        ],
+    );
+    let tail = h.fake.hold(Op::History, h.fake.calls(Op::History) + 1);
+    for item in items {
+        h.fake.push_stream_item(item).await;
+    }
+    h.until(|event| matches!(event, Event::ThreadInvalidated(thread) if thread.chat == chat(1)))
+        .await;
+    for thread in unopened {
+        assert!(cache.tail(thread, 10).await.unwrap().is_empty());
+    }
+    assert!(h.fake.recorded_checkpoints().is_empty());
+
+    tail.notify_one();
+    let event = h.history(chat(1), HistoryDir::Tail).await;
+    assert_eq!(history_ids(&event), [1, 3]);
+    h.stop().await;
+    let cached = cache.tail(ThreadKey::whole(chat(1)), 10).await.unwrap();
+    assert_eq!(cached.iter().map(|m| m.id.0).collect::<Vec<_>>(), [1, 3]);
 }

@@ -5,6 +5,7 @@ mod launch;
 mod logging;
 #[cfg(target_os = "macos")]
 mod macos;
+mod notifications;
 mod preferences;
 mod shell;
 mod storage;
@@ -16,7 +17,14 @@ use gpui_platform::application;
 fn main() {
     logging::init();
     let launch = launch::resolve(std::env::args_os(), |name| std::env::var_os(name));
-    application().run(move |cx: &mut App| {
+    let application = application();
+    // Register the notification delegate before AppKit finishes launching.
+    #[cfg(target_os = "macos")]
+    let notifications = notifications::macos::open();
+    #[cfg(not(target_os = "macos"))]
+    let notifications = None;
+    application.on_reopen(shell::reopen);
+    application.run(move |cx: &mut App| {
         #[cfg(target_os = "macos")]
         macos::set_app_icon();
         cx.bind_keys(ui::text_input::key_bindings());
@@ -30,7 +38,7 @@ fn main() {
             }
         })
         .detach();
-        match shell::open(launch, cx) {
+        match shell::open(launch, notifications, cx) {
             Ok(()) => cx.activate(true),
             Err(error) => {
                 tracing::error!(%error, "failed to open the main window");

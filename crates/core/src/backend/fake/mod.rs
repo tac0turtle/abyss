@@ -20,9 +20,10 @@ use tokio::sync::{Notify, mpsc};
 
 use super::{
     AROUND_CONTEXT, Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest,
-    DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl,
-    PasswordChallenge, RejectReason, Seed, SentCode, SessionSeed, SessionSnapshot, SignIn,
-    StreamError, StreamItem, TopicsById, TopicsCursor, TopicsPage, Update, UpdateStream,
+    DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl, NewMessage,
+    NotifyScope, NotifyTarget, PasswordChallenge, RejectReason, Seed, SentCode, SessionSeed,
+    SessionSnapshot, SignIn, StreamError, StreamItem, TopicsById, TopicsCursor, TopicsPage, Update,
+    UpdateStream,
 };
 use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
 use crate::credentials::{CredentialSlot, EnvResolution};
@@ -44,12 +45,16 @@ pub use topics::{DEMO_FORUM_TOPICS, DemoForum, demo_forum};
 const MAX_FAULTS: usize = 1024;
 /// Capacity of the pushed-update channel (shared by every instance's stream).
 const UPDATE_CAPACITY: usize = 256;
+/// A scripted catch-up is bounded like a server difference batch.
+const MAX_CATCH_UP_MESSAGES: usize = 4096;
 /// Recorded sends, seeds and other logs are capped at this many entries.
 const MAX_LOG: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
     Dialogs,
+    NotifySettings(NotifyScope),
+    PeerNotifySettings(ChatId),
     ChatFolders,
     SetPeerFolder,
     EditChatFolder,
@@ -155,6 +160,8 @@ pub struct FakeScript {
     pub dialogs: Vec<ChatSummary>,
     /// Chat folders, in server order.
     pub folders: Vec<ChatFolder>,
+    pub notify_users: Option<i64>,
+    pub notify_groups: Option<i64>,
     /// Per chat, ascending by id. Messages carry the topic the way the
     /// server states it: `None` for General and non-forum chats, `Some(t)`
     /// for every other topic (a topic's creation message included).
@@ -184,6 +191,8 @@ impl Default for FakeScript {
         Self {
             dialogs: Vec::new(),
             folders: Vec::new(),
+            notify_users: None,
+            notify_groups: None,
             history: HashMap::new(),
             topics: HashMap::new(),
             topic_order: HashMap::new(),
@@ -291,6 +300,8 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
                 forum: false,
                 gigagroup: false,
             }
+        } else if id.kind == PeerKind::Chat {
+            ChatKind::Group
         } else {
             ChatKind::Private { contact: false }
         },
@@ -301,7 +312,8 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
-        muted_until: 0,
+        muted_until: None,
+        scope_muted_until: 0,
         folder: PeerFolder::Main,
         reading: None,
         topic_unread: None,
@@ -442,7 +454,7 @@ enum RunnerCmd {
     reason = "test-only channel; updates are the common item"
 )]
 enum StreamCmd {
-    Update(Update),
+    Item(StreamItem),
     Error(StreamError),
     Panic,
 }
@@ -451,6 +463,8 @@ enum StreamCmd {
 struct State {
     dialogs: Vec<ChatSummary>,
     folders: Vec<ChatFolder>,
+    notify_users: Option<i64>,
+    notify_groups: Option<i64>,
     /// Folder writes sent but not landed (`Fault::LandsLate`).
     in_transit: Vec<(i32, Option<ChatFolder>)>,
     history: HashMap<ChatId, Vec<Message>>,
@@ -462,6 +476,8 @@ struct State {
     /// Calls held until the test releases them (`hold`): the op, the
     /// call's number (`calls` once counted) and its release.
     holds: Vec<(Op, usize, Arc<Notify>)>,
+    #[cfg(test)]
+    snapshot_holds: Vec<(Op, Arc<Notify>)>,
     build_faults: VecDeque<BuildFault>,
     calls: HashMap<Op, usize>,
     sent: Vec<(ThreadKey, i64)>,
@@ -486,6 +502,10 @@ struct State {
     repeat_pages: Vec<ChatId>,
     /// Updates still to be dropped instead of delivered (`drop_next_update`).
     drop_updates: usize,
+    #[cfg(test)]
+    checkpoint_pts: i32,
+    /// The `pts` of each position core recorded for catch-up (capped).
+    checkpoints: Vec<i32>,
     /// Per chat, the newest message id and date ever held: new messages are
     /// allocated above it, so deleted ids are never reused.
     high_water: HashMap<ChatId, topics::HighWater>,
@@ -549,6 +569,8 @@ impl FakeBackend {
                 high_water,
                 dialogs: script.dialogs,
                 folders: script.folders,
+                notify_users: script.notify_users,
+                notify_groups: script.notify_groups,
                 history: script.history,
                 topics: script.topics,
                 topic_order: script.topic_order,
@@ -627,6 +649,22 @@ impl Drop for RunnerGuard {
 }
 
 impl FakeHandle {
+    #[cfg(test)]
+    pub(crate) async fn push_stream_item(&self, item: StreamItem) {
+        self.stream.send(StreamCmd::Item(item)).await.unwrap();
+    }
+
+    /// Holds the next successful snapshot of `op`, after taking its answer.
+    #[cfg(test)]
+    pub(crate) fn hold_snapshot(&self, op: Op) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        self.shared.with(|s| {
+            assert!(s.snapshot_holds.len() < MAX_FAULTS);
+            s.snapshot_holds.push((op, Arc::clone(&gate)));
+        });
+        gate
+    }
+
     /// Queues a one-shot fault for the next call of `op`.
     pub fn inject(&self, op: Op, fault: Fault) {
         self.shared.with(|s| {
@@ -712,13 +750,83 @@ impl FakeHandle {
             {
                 topics::move_pointer(s, chat, max_id);
             }
+            if let Update::NotifySettings { target, until } = &update {
+                match target {
+                    NotifyTarget::Peer(chat) => {
+                        if let Some(row) = s.dialogs.iter_mut().find(|row| row.id == *chat) {
+                            row.muted_until = *until;
+                        }
+                    }
+                    NotifyTarget::Scope(NotifyScope::Users) => s.notify_users = *until,
+                    NotifyTarget::Scope(NotifyScope::Groups) => s.notify_groups = *until,
+                }
+            }
             let lost = s.drop_updates > 0;
             s.drop_updates = s.drop_updates.saturating_sub(1);
             lost
         });
         if !lost {
-            let _ = self.stream.send(StreamCmd::Update(update)).await;
+            let _ = self
+                .stream
+                .send(StreamCmd::Item(StreamItem::Update(update)))
+                .await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn push_checkpoint(&self, pts: i32) {
+        let state = super::UpdateCheckpoint(grammers_session::types::UpdatesState {
+            pts,
+            ..Default::default()
+        });
+        let _ = self
+            .stream
+            .send(StreamCmd::Item(StreamItem::Checkpoint(state)))
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_pts(&self) -> i32 {
+        self.shared.with(|s| s.checkpoint_pts)
+    }
+
+    /// A difference replay, with the same end marker as a real stream.
+    pub async fn catch_up(&self, messages: impl IntoIterator<Item = NewMessage>) {
+        for message in messages.into_iter().take(MAX_CATCH_UP_MESSAGES) {
+            let item = StreamItem::CatchUp(Update::NewMessage(message));
+            if self.stream.send(StreamCmd::Item(item)).await.is_err() {
+                return;
+            }
+        }
+        let _ = self
+            .stream
+            .send(StreamCmd::Item(StreamItem::CatchUpEnded))
+            .await;
+    }
+
+    /// A "difference too long", then the end marker.
+    pub async fn catch_up_gap(&self) {
+        for item in [StreamItem::CatchUpGap, StreamItem::CatchUpEnded] {
+            if self.stream.send(StreamCmd::Item(item)).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// The stream's position moves to `pts` (core records it once the updates
+    /// before it are applied and their snapshots are current).
+    pub async fn checkpoint(&self, pts: i32) {
+        let state = grammers_session::types::UpdatesState {
+            pts,
+            ..Default::default()
+        };
+        let item = StreamItem::Checkpoint(crate::backend::UpdateCheckpoint(state));
+        let _ = self.stream.send(StreamCmd::Item(item)).await;
+    }
+
+    /// The `pts` of each position core recorded, oldest first.
+    pub fn recorded_checkpoints(&self) -> Vec<i32> {
+        self.shared.with(|s| s.checkpoints.clone())
     }
 
     /// The next update pushed (by the test or by a server control such as
@@ -871,6 +979,18 @@ impl FakeHandle {
 }
 
 impl Backend for FakeBackend {
+    fn record_update_state(&self, state: crate::backend::UpdateCheckpoint) {
+        self.shared.with(|s| {
+            #[cfg(test)]
+            {
+                s.checkpoint_pts = state.0.pts;
+            }
+            if s.checkpoints.len() < MAX_FAULTS {
+                s.checkpoints.push(state.0.pts);
+            }
+        });
+    }
+
     type Client = FakeClient;
     type Updates = FakeUpdates;
     type Control = FakeControl;
@@ -1023,11 +1143,11 @@ pub struct FakeUpdates {
 impl UpdateStream for FakeUpdates {
     async fn next(&mut self) -> Result<StreamItem, StreamError> {
         if std::mem::take(&mut self.baseline) {
-            return Ok(StreamItem::Baseline);
+            return Ok(StreamItem::Baseline(super::Baseline::Fresh));
         }
         let mut rx = self.stream.lock().await;
         match rx.recv().await {
-            Some(StreamCmd::Update(u)) => Ok(StreamItem::Update(u)),
+            Some(StreamCmd::Item(item)) => Ok(item),
             Some(StreamCmd::Error(e)) => Err(e),
             Some(StreamCmd::Panic) => injected_panic("update stream"),
             None => Err(StreamError::Fatal),
@@ -1155,6 +1275,16 @@ impl FakeClient {
                 Err(BackendError::Unauthorized)
             }
         });
+        #[cfg(test)]
+        if result.is_ok() {
+            let gate = self.shared.with(|s| {
+                let at = s.snapshot_holds.iter().position(|(held, _)| *held == op)?;
+                Some(s.snapshot_holds.remove(at).1)
+            });
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+        }
         let wait = self.shared.latency + delay;
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
@@ -1282,6 +1412,25 @@ impl Client for FakeClient {
                 index: u32::try_from(end).unwrap_or(u32::MAX),
             });
             Ok(DialogsPage { chats, next })
+        })
+        .await
+    }
+
+    async fn notify_settings(&self, target: NotifyTarget) -> Result<Option<i64>, BackendError> {
+        let op = match target {
+            NotifyTarget::Scope(scope) => Op::NotifySettings(scope),
+            NotifyTarget::Peer(chat) => Op::PeerNotifySettings(chat),
+        };
+        self.snapshot(op, |s| {
+            Ok(match target {
+                NotifyTarget::Scope(NotifyScope::Users) => s.notify_users,
+                NotifyTarget::Scope(NotifyScope::Groups) => s.notify_groups,
+                NotifyTarget::Peer(chat) => s
+                    .dialogs
+                    .iter()
+                    .find(|row| row.id == chat)
+                    .and_then(|row| row.muted_until),
+            })
         })
         .await
     }

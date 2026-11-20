@@ -85,6 +85,20 @@ fn api_hash_never_reaches_the_platform(cx: &mut TestAppContext) {
     input.update(cx, |input, _| assert!(input.secret().is_empty()));
 }
 
+/// Review N59: a wiped `api_hash` field is hidden again, so the next visit
+/// never shows the old text, nor an empty field already revealed.
+#[gpui::test]
+fn clearing_the_api_hash_hides_it_again(cx: &mut TestAppContext) {
+    let _serial = SERIAL.lock();
+    cx.update(|cx| cx.bind_keys(key_bindings()));
+    let (input, cx) = cx.add_window_view(PasswordInput::api_hash);
+    input.update(cx, |input, cx| input.set_reveal(super::Reveal::Shown, cx));
+    input.update(cx, PasswordInput::clear);
+    input.update(cx, |input, _| {
+        assert_eq!(input.reveal(), super::Reveal::Hidden);
+    });
+}
+
 #[gpui::test]
 fn dead_key_through_the_input_handler(cx: &mut TestAppContext) {
     let _serial = SERIAL.lock();

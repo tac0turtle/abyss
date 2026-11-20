@@ -4,18 +4,18 @@
 use std::time::Instant;
 
 use abyss_core::api::{CredentialError, UserError};
-use gpui::{AnyElement, Context, Div, SharedString, Stateful, div, prelude::*, px};
+use gpui::{AnyElement, Context, Div, Role, SharedString, Stateful, Toggled, div, prelude::*, px};
 
 use super::{
-    LoginForm, back_button, brand, button, card, error_line, field, footer, muted, on, page,
-    secondary, title,
+    LoginForm, auth_button, back_button, brand, card, error_line, footer, heading_style, on, page,
+    quiet_lines, secondary, secondary_style, title,
 };
 use crate::shell::Root;
 use crate::shell::auth::{Onboarding, Saved, SentView, Stored};
 use crate::shell::session::Session;
-use crate::ui::copy::onboarding as text;
 use crate::ui::password::Reveal;
 use crate::ui::theme::Theme;
+use crate::ui::{a11y, copy::onboarding as text};
 
 /// The credential screens.
 pub(super) fn screen(
@@ -28,14 +28,14 @@ pub(super) fn screen(
         Onboarding::Welcome => welcome(theme, cx),
         Onboarding::Guide => guide(session, theme, cx),
         Onboarding::Entry { error, stored } => entry(session, *error, *stored, theme, cx),
-        Onboarding::Env { error } => env(*error),
+        Onboarding::Env { error } => env(*error, theme),
         Onboarding::Keychain => keychain(theme, cx),
     }
 }
 
 fn welcome(theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     let connect = on(
-        button("connect", text::CONNECT, theme),
+        auth_button("connect", text::CONNECT, theme),
         Session::connect,
         cx,
     );
@@ -43,19 +43,26 @@ fn welcome(theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
         card()
             .child(brand(theme))
             .child(title(text::WELCOME_TITLE))
-            .children(text::WELCOME_LINES.into_iter().map(muted))
+            .children(quiet_lines(
+                "welcome",
+                [crate::ui::copy::DESCRIPTOR]
+                    .into_iter()
+                    .chain(text::WELCOME_LINES),
+                theme,
+            ))
             .child(footer(None, vec![connect])),
     )
 }
 
 fn guide(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
+    let link = a11y::control("open-site", Role::Link, text::OPEN_SITE).child(text::OPEN_SITE);
     let open = on(
-        secondary("open-site", text::OPEN_SITE, theme),
+        secondary_style(a11y::focus_ring(link, theme.text), theme),
         |_, _, cx| Session::open_site(cx),
         cx,
     );
     let next = on(
-        button("have-credentials", text::HAVE_CREDENTIALS, theme),
+        auth_button("have-credentials", text::HAVE_CREDENTIALS, theme),
         Session::have_credentials,
         cx,
     );
@@ -63,13 +70,33 @@ fn guide(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyEle
         card()
             .w(px(560.))
             .child(title(text::GUIDE_TITLE))
-            .child(muted(text::GUIDE_INTRO))
+            .children(quiet_lines("guide-intro", [text::GUIDE_INTRO], theme))
             .child(div().flex().child(open))
-            .children(text::GUIDE_STEPS.into_iter().map(|s| div().child(s)))
-            .child(div().pt_2().child(title(text::TROUBLE_TITLE)))
-            .children(text::TROUBLE.into_iter().map(muted))
+            .child(guide_steps())
+            .child(div().pt_2().child(heading_style(a11y::heading(
+                "troubleshooting",
+                text::TROUBLE_TITLE,
+                2,
+            ))))
+            .children(quiet_lines("troubleshooting-steps", text::TROUBLE, theme))
             .child(footer(back_button(session, theme, cx), vec![next])),
     )
+}
+
+fn guide_steps() -> Stateful<Div> {
+    div()
+        .id("guide-steps")
+        .role(Role::List)
+        .aria_label("Credential setup steps")
+        .flex()
+        .flex_col()
+        .gap_3()
+        .children(
+            text::GUIDE_STEPS
+                .into_iter()
+                .enumerate()
+                .map(|(i, step)| a11y::list_row(i, [step]).child(step)),
+        )
 }
 
 fn entry(
@@ -79,12 +106,14 @@ fn entry(
     theme: &Theme,
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
-    let reveal_label = match session.api_hash.read(cx).reveal() {
-        Reveal::Hidden => text::REVEAL,
-        Reveal::Shown => text::HIDE,
+    let (reveal_label, toggled) = match session.api_hash.read(cx).reveal() {
+        Reveal::Hidden => (text::REVEAL, Toggled::False),
+        Reveal::Shown => (text::HIDE, Toggled::True),
     };
     let reveal = on(
-        secondary("reveal-hash", reveal_label, theme),
+        secondary("reveal-hash", reveal_label, theme)
+            .aria_label("Show API hash on screen")
+            .aria_toggled(toggled),
         |s, _, cx| s.toggle_hash_mask(cx),
         cx,
     );
@@ -92,11 +121,7 @@ fn entry(
         .flex()
         .gap_2()
         .items_center()
-        .child(
-            div()
-                .flex_1()
-                .child(field(session.api_hash.clone().into_any_element(), theme)),
-        )
+        .child(div().flex_1().child(session.api_hash.clone()))
         .child(reveal);
     // A local check failure wins over core's last verdict.
     let problem = session
@@ -104,15 +129,15 @@ fn entry(
         .clone()
         .or_else(|| error.map(|e| text::credential_error(e, session.source)));
     let submit = on(
-        button("continue", crate::ui::copy::CONTINUE, theme),
+        auth_button("continue", crate::ui::copy::CONTINUE, theme),
         Session::submit_credentials,
         cx,
     );
     page(
         card()
             .child(title(text::ENTRY_TITLE))
-            .child(muted(text::ENTRY_DETAIL))
-            .child(field(session.api_id.clone().into_any_element(), theme))
+            .children(quiet_lines("entry-detail", [text::ENTRY_DETAIL], theme))
+            .child(session.api_id.clone())
             .child(hash_row)
             .children(problem.map(|p| error_line(p, theme)))
             .children(stored_pair(stored, theme, cx))
@@ -140,32 +165,42 @@ fn stored_pair(stored: Stored, theme: &Theme, cx: &mut Context<'_, Root>) -> Opt
             .flex()
             .flex_col()
             .gap_2()
-            .child(muted(text::STORED_NOTE))
+            .children(quiet_lines("stored-note", [text::STORED_NOTE], theme))
             .child(div().flex().gap_2().child(use_saved).child(forget)),
     )
 }
 
 /// The env override is unusable: fix it outside abyss. No entry, no Back.
-fn env(error: CredentialError) -> AnyElement {
+fn env(error: CredentialError, theme: &Theme) -> AnyElement {
+    let mut lines = text::env_detail(error).into_iter();
     page(
         card()
             .w(px(560.))
             .child(title(text::ENV_TITLE))
-            .children(text::env_detail(error).into_iter().map(muted)),
+            .children(
+                lines
+                    .next()
+                    .map(|line| a11y::alert("env-error", line).opacity(theme.quiet_opacity())),
+            )
+            .children(lines.enumerate().map(|(i, line)| {
+                div()
+                    .opacity(theme.quiet_opacity())
+                    .child(gpui::text!(id = ("env-recovery", i), line))
+            })),
     )
 }
 
 /// The Keychain could not be read: retry, never re-onboard.
 fn keychain(theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     let retry = on(
-        button("retry-keychain", text::RETRY, theme),
+        auth_button("retry-keychain", text::RETRY, theme),
         Session::use_saved,
         cx,
     );
     page(
         card()
             .child(title(text::KEYCHAIN_TITLE))
-            .child(muted(text::KEYCHAIN_DETAIL))
+            .child(error_line(text::KEYCHAIN_DETAIL, theme))
             .child(footer(None, vec![retry])),
     )
 }
@@ -180,8 +215,13 @@ pub(super) fn code_screen(
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
     let mut extra = vec![
-        div().child(text::CODE_WARNING).into_any_element(),
-        muted(text::NEW_LOGIN_NOTICE).into_any_element(),
+        div()
+            .child(gpui::text!(text::CODE_WARNING))
+            .into_any_element(),
+        div()
+            .opacity(theme.quiet_opacity())
+            .child(gpui::text!(text::NEW_LOGIN_NOTICE))
+            .into_any_element(),
     ];
     if let Some(resend) = resend_row(sent, theme, cx) {
         extra.push(resend.into_any_element());
@@ -211,11 +251,11 @@ fn resend_row(sent: Option<&SentView>, theme: &Theme, cx: &mut Context<'_, Root>
         .map(|at| at.saturating_duration_since(Instant::now()))
         .filter(|d| !d.is_zero())
         .map(|d| d.as_secs() + 1);
-    let mut row = div()
-        .flex()
-        .gap_2()
-        .items_center()
-        .child(muted(text::resend_detail(next, left)));
+    let mut row = div().flex().gap_2().items_center().child(
+        div()
+            .opacity(theme.quiet_opacity())
+            .child(gpui::text!(text::resend_detail(next, left))),
+    );
     if left.is_none() {
         let resend: Stateful<Div> = on(
             secondary("resend", text::RESEND, theme),
@@ -231,7 +271,11 @@ pub(super) fn verifying_screen(error: Option<UserError>, theme: &Theme) -> AnyEl
     page(
         card()
             .child(title(text::VERIFYING_TITLE))
-            .child(muted(text::VERIFYING_DETAIL))
+            .children(quiet_lines(
+                "verifying-detail",
+                [text::VERIFYING_DETAIL],
+                theme,
+            ))
             .children(error.map(|e| error_line(crate::ui::copy::user_error(e), theme))),
     )
 }
@@ -249,17 +293,25 @@ pub(super) fn dead_end_screen(
     page(
         card()
             .child(title(heading))
-            .child(muted(detail))
-            .children(note.map(muted))
+            .children(quiet_lines("dead-end-detail", [detail], theme))
+            .children(note.map(|note| {
+                div()
+                    .opacity(theme.quiet_opacity())
+                    .child(gpui::text!(note))
+            }))
             .child(footer(back_button(session, theme, cx), Vec::new())),
     )
 }
 
-pub(super) fn logging_out_screen() -> AnyElement {
+pub(super) fn logging_out_screen(theme: &Theme) -> AnyElement {
     page(
         card()
             .child(title(text::LOGGING_OUT_TITLE))
-            .child(muted(text::LOGGING_OUT_DETAIL)),
+            .children(quiet_lines(
+                "logout-detail",
+                [text::LOGGING_OUT_DETAIL],
+                theme,
+            )),
     )
 }
 
@@ -277,9 +329,10 @@ pub(super) fn done_screen(
             Some(error_line(crate::ui::copy::SIGNED_IN_UNSAVED, theme)),
         ),
     };
-    let no_2fa = (has_password == Some(false)).then(|| div().child(text::RECOMMEND_2FA));
+    let no_2fa =
+        (has_password == Some(false)).then(|| div().child(gpui::text!(text::RECOMMEND_2FA)));
     let open = on(
-        button("open-chats", text::OPEN_CHATS, theme),
+        auth_button("open-chats", text::OPEN_CHATS, theme),
         Session::open_chats,
         cx,
     );
@@ -287,7 +340,7 @@ pub(super) fn done_screen(
         card()
             .child(title(heading))
             .children(unsaved)
-            .children(text::DONE_TIPS.into_iter().map(muted))
+            .children(quiet_lines("done-tips", text::DONE_TIPS, theme))
             .children(no_2fa)
             .child(footer(None, vec![open])),
     )

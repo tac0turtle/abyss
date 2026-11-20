@@ -176,7 +176,7 @@ impl EnvVar {
 pub enum CredentialSource {
     /// `ABYSS_API_ID` + `ABYSS_API_HASH`: a dev override, never persisted.
     Env,
-    /// The Keychain item `dev.abyss.apicreds`.
+    /// The saved credentials in this installation's secret store.
     Stored,
     /// Compiled in at build time.
     Embedded,

@@ -28,8 +28,8 @@ pub use seed::{MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 use crate::api::{CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
 pub use crate::credentials::CredentialSlot;
 use crate::model::{
-    ChatFolder, ChatId, ChatSummary, FolderEdit, Message, MsgId, PeerFolder, ThreadKey, TopicId,
-    TopicOrder, TopicSnapshot, Visibility,
+    ChatFolder, ChatId, ChatKind, ChatSummary, FolderEdit, Message, MsgId, PeerFolder, ThreadKey,
+    TopicId, TopicOrder, TopicSnapshot, Visibility,
 };
 use crate::store::PostClosed;
 
@@ -145,9 +145,70 @@ pub struct HistoryPage {
     pub has_more: bool,
 }
 
+/// Metadata needed for notices, carried only on new updates.
+#[derive(Clone)]
+pub struct NewMessage {
+    pub message: Message,
+    pub silent: bool,
+    pub mentioned: bool,
+    /// Kind and display title provided by the update's peer directory.
+    pub chat: Option<(ChatKind, String)>,
+}
+
+impl From<Message> for NewMessage {
+    fn from(message: Message) -> Self {
+        Self {
+            message,
+            silent: false,
+            mentioned: false,
+            chat: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for NewMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewMessage").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NotifyScope {
+    Users,
+    Groups,
+}
+
+impl NotifyScope {
+    pub(crate) fn of(kind: ChatKind) -> Self {
+        match kind {
+            ChatKind::Private { .. } | ChatKind::Bot => Self::Users,
+            ChatKind::Group | ChatKind::Supergroup { .. } => Self::Groups,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NotifyTarget {
+    Peer(ChatId),
+    Scope(NotifyScope),
+}
+
+impl std::fmt::Debug for NotifyTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Peer(_) => f.debug_struct("Peer").finish_non_exhaustive(),
+            Self::Scope(scope) => f.debug_tuple("Scope").field(scope).finish(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Update {
-    NewMessage(Message),
+    NewMessage(NewMessage),
+    NotifySettings {
+        target: NotifyTarget,
+        until: Option<i64>,
+    },
     Edited(Message),
     /// `chat` is `None` for private chats and basic groups (account-unique ids).
     Deleted {
@@ -244,18 +305,51 @@ pub enum BackendError {
     SentUnconfirmed,
 }
 
+/// Whether the baseline starts from a carried position with replay pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Baseline {
+    Fresh,
+    Resumed,
+}
+
 /// One item from an instance's update stream.
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "`Baseline` occurs once per stream; boxing would allocate per update"
-)]
 pub enum StreamItem {
     /// The update baseline (`updates.getState`) is recorded. Yielded at most once
     /// per stream. Snapshots taken after it cannot miss an update the stream
     /// will deliver.
-    Baseline,
+    Baseline(Baseline),
     Update(Update),
+    /// Update from a difference, part of a single catch-up.
+    CatchUp(Update),
+    /// All difference slices for this catch-up have been delivered.
+    CatchUpEnded,
+    /// A known gap or position reset. Core reconciles before accepting the checkpoint.
+    CatchUpGap,
+    /// History whose recovery is incomplete. Sent before the following checkpoint.
+    HistoryStale(StaleHistory),
+    /// The receiver's position after the preceding batch, accepted by core
+    /// only after applying those updates.
+    Checkpoint(UpdateCheckpoint),
+}
+
+/// A single affected chat, or all chats when the gap's scope is unknown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct StaleHistory(pub(crate) Option<ChatId>);
+
+impl std::fmt::Debug for StaleHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaleHistory").finish_non_exhaustive()
+    }
+}
+
+/// In-memory stream position. Its channel identities stay out of debug logs.
+pub struct UpdateCheckpoint(pub(crate) grammers_session::types::UpdatesState);
+
+impl std::fmt::Debug for UpdateCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateCheckpoint").finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -422,6 +516,12 @@ pub trait Client: Send + Sync + 'static {
         limit: u32,
     ) -> impl Future<Output = Result<DialogsPage, BackendError>> + Send;
 
+    /// The mute deadline for this target. A successful empty setting inherits its scope.
+    fn notify_settings(
+        &self,
+        target: NotifyTarget,
+    ) -> impl Future<Output = Result<Option<i64>, BackendError>> + Send;
+
     /// The account's chat folders (`messages.getDialogFilters`), in server
     /// order, without the "All chats" position.
     fn chat_folders(&self) -> impl Future<Output = Result<Vec<ChatFolder>, BackendError>> + Send;
@@ -556,6 +656,9 @@ pub trait Backend: Send + Sync + 'static {
     /// `AbyssSession` from the latest one (`AbyssSession::from_snapshot`,
     /// which revokes any earlier instance's write token).
     fn use_account(&self, account: crate::session::SessionSnapshot);
+
+    /// Retains a position for catch-up on the next instance of this account.
+    fn record_update_state(&self, _state: UpdateCheckpoint) {}
 
     /// The API credentials in use (plan section 17.2a). [`Backend::build`]
     /// waits until the slot holds a pair and builds with it, so no client

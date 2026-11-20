@@ -2,7 +2,7 @@
 //!
 //! One build is one client instance: a fresh [`AbyssSession`] over the
 //! account's critical cell, a `SenderPool` with `NoRetries` and a 1,024-update
-//! channel, a `Client`, and an update stream with `catch_up: false`. Nothing is
+//! channel, a `Client`, and an update stream with an in-memory catch-up position. Nothing is
 //! spawned here: core spawns and supervises the runner and the update consumer,
 //! so a panic in grammers (known sites: plan section 1) is contained by core's
 //! `JoinHandle`s and becomes a rebuild or `Error(Internal)`. The mappers in
@@ -25,7 +25,9 @@
 
 mod auth;
 mod calls;
+mod channels;
 mod errors;
+mod feed;
 mod invoke;
 pub(crate) mod map;
 mod pins;
@@ -34,21 +36,20 @@ mod stream;
 mod tests;
 
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use grammers_client::client::ClientConfiguration;
-use grammers_client::sender::{
-    ConnectionParams, NoRetries, SenderPool, SenderPoolHandle, UpdatesConfiguration,
-};
+use grammers_client::sender::{ConnectionParams, NoRetries, SenderPool, SenderPoolHandle};
+use grammers_session::types::UpdatesState;
 
 pub use auth::{GrammersLoginToken, GrammersPasswordToken};
 pub use stream::GrammersUpdates;
 
 use super::{
     Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest, CredentialSlot,
-    DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl,
+    DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl, NotifyTarget,
     PasswordChallenge, Seed, SessionSeed, SessionSnapshot, SignIn, TopicsById, TopicsCursor,
-    TopicsPage,
+    TopicsPage, UpdateCheckpoint,
 };
 use crate::api::{ApiCredentials, PasswordBuf};
 use crate::model::{
@@ -82,7 +83,13 @@ pub struct GrammersBackend {
     /// not provided the account (`use_account`).
     persist: PersistHandle,
     /// The account core loaded at startup or created after a logout.
-    account: std::sync::Mutex<Option<SessionSnapshot>>,
+    account: Mutex<AccountState>,
+}
+
+#[derive(Default)]
+struct AccountState {
+    snapshot: Option<SessionSnapshot>,
+    checkpoint: Option<UpdatesState>,
 }
 
 impl std::fmt::Debug for GrammersBackend {
@@ -96,22 +103,23 @@ impl GrammersBackend {
         Self {
             slot,
             persist,
-            account: std::sync::Mutex::new(None),
+            account: Mutex::default(),
         }
     }
 
-    fn account(&self) -> Option<SessionSnapshot> {
-        self.account
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    fn account(&self) -> MutexGuard<'_, AccountState> {
+        self.account.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    async fn snapshot(&self, seed: SessionSeed) -> SessionSnapshot {
+    async fn snapshot(
+        &self,
+        seed: SessionSeed,
+        stored: Option<SessionSnapshot>,
+    ) -> SessionSnapshot {
         match seed {
             SessionSeed::Live(snapshot) => snapshot,
             SessionSeed::Stored => {
-                if let Some(account) = self.account() {
+                if let Some(account) = stored {
                     return account;
                 }
                 if let Ok(loaded) = self.persist.load_session().await {
@@ -132,10 +140,14 @@ impl Backend for GrammersBackend {
     type Control = GrammersControl;
 
     fn use_account(&self, account: SessionSnapshot) {
-        *self
-            .account
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(account);
+        *self.account() = AccountState {
+            snapshot: Some(account),
+            checkpoint: None,
+        };
+    }
+
+    fn record_update_state(&self, state: UpdateCheckpoint) {
+        self.account().checkpoint = Some(state.0);
     }
 
     fn credentials(&self) -> &CredentialSlot {
@@ -147,7 +159,11 @@ impl Backend for GrammersBackend {
         // the snapshot and stay pinned until core's first `retain_peers` on
         // this instance.
         let creds = self.slot.wait().await;
-        let snapshot = self.snapshot(seed.session).await;
+        let (stored, resume) = {
+            let account = self.account();
+            (account.snapshot.clone(), account.checkpoint.clone())
+        };
+        let snapshot = self.snapshot(seed.session, stored).await;
         let session =
             Arc::new(AbyssSession::from_snapshot(snapshot).map_err(|_| BackendError::Transient)?);
         let SenderPool {
@@ -165,10 +181,7 @@ impl Backend for GrammersBackend {
                 auto_cache_peers: true,
             },
         );
-        let stream = client
-            .stream_updates(updates, UpdatesConfiguration { catch_up: false })
-            .await
-            .map_err(|_| BackendError::Transient)?;
+        let stream = feed::Feed::new(client.clone(), Arc::clone(&session), updates, resume);
         Ok(Instance {
             client: GrammersClient {
                 calls: Calls::new(client, Arc::clone(&session)),
@@ -271,6 +284,10 @@ impl Client for GrammersClient {
         limit: u32,
     ) -> Result<DialogsPage, BackendError> {
         self.calls.dialogs(cursor, limit).await
+    }
+
+    async fn notify_settings(&self, target: NotifyTarget) -> Result<Option<i64>, BackendError> {
+        self.calls.notify_settings(target).await
     }
 
     async fn chat_folders(&self) -> Result<Vec<ChatFolder>, BackendError> {

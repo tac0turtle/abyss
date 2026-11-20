@@ -151,6 +151,29 @@ pub(super) async fn setup(mock: &Arc<Mock>) -> Calls<Arc<Mock>> {
 }
 
 #[tokio::test(start_paused = true)]
+async fn notify_settings_retries_transient_errors_and_short_flood_waits() {
+    use crate::backend::{NotifyScope, NotifyTarget};
+
+    for target in [
+        NotifyTarget::Scope(NotifyScope::Groups),
+        NotifyTarget::Peer(ANN),
+    ] {
+        let reply = tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
+            mute_until: Some(120),
+            ..super::notify_settings_raw()
+        });
+        let mock = Mock::with(vec![io(), flood(3), Ok(reply.to_bytes())]);
+        let calls = setup(&mock).await;
+        let start = tokio::time::Instant::now();
+        assert_eq!(calls.notify_settings(target).await.unwrap(), Some(120));
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn read_class_sleeps_short_floods_at_most_twice() {
     let mock = Mock::with(vec![flood(3), flood(3), Ok(history_reply(&[1, 2]))]);
     let calls = setup(&mock).await;

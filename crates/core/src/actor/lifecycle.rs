@@ -66,6 +66,7 @@ pub(super) enum Reason {
     Migrated,
     NoBaseline,
     BootOverflow,
+    GapSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,10 +424,11 @@ impl<B: Backend> Actor<B> {
                 self.after_retire(after).await;
             }
             (Ok(Step::SignedOut { remote, retired }), _) => {
-                self.after_remote_logout(remote, retired);
+                self.after_remote_logout(remote, retired).await;
             }
             (Err(_), Phase::LoggingOut(LogoutStage::Remote)) => {
-                self.after_remote_logout(RemoteLogout::Failed(UserError::Internal), None);
+                self.after_remote_logout(RemoteLogout::Failed(UserError::Internal), None)
+                    .await;
             }
             (Ok(Step::Deleted(done)), _) => self.finish_logout(done).await,
             (Err(_), Phase::LoggingOut(LogoutStage::Local)) => {
@@ -508,6 +510,9 @@ impl<B: Backend> Actor<B> {
             return;
         };
         let after = self.after_for(reason);
+        if after == After::Rebuild {
+            self.begin_catch_up();
+        }
         for (thread, dir) in self.begin_retire() {
             // The UI keeps its window across a rebuild: tell it the loads it
             // waits on are gone, so its backoff and Retry take over (rounds
@@ -554,6 +559,7 @@ impl<B: Backend> Actor<B> {
     pub(super) fn begin_retire(&mut self) -> Vec<(ThreadKey, HistoryDir)> {
         self.cgen = ClientGen(self.cgen.0 + 1);
         self.boot = None;
+        self.notices.retire(self.badges.now());
         self.life.timeouts.clear();
         self.history_busy.clear();
         self.dialogs_busy = false;

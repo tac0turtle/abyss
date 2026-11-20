@@ -34,6 +34,22 @@ pub use local::{
 #[cfg(any(test, feature = "fake"))]
 pub use memory::{FaultControl, FaultyStore, MemoryStore, StoreOp};
 
+/// Keychain identity for each installation regime. Each has its own app root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeychainNamespace {
+    Bare,
+    Bundle,
+}
+
+impl KeychainNamespace {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bare => "dev.abyss.bare",
+            Self::Bundle => "dev.abyss.bundle",
+        }
+    }
+}
+
 /// Which secret an operation targets. Each maps to one Keychain item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SecretItem {
@@ -41,12 +57,11 @@ pub enum SecretItem {
     Session,
     /// Raw 32-byte SQLCipher key of the message cache.
     CacheKey,
-    /// The entered API credentials (`dev.abyss.apicreds`, plan section 17.1).
+    /// The entered API credentials (`<namespace>.apicreds`, plan section 17.1).
     /// Survives logout; deleted only by `ForgetStoredCredentials`.
     ApiCredentials,
-    /// Present while a logout has begun and not finished deleting (review
-    /// round 15, A): startup resumes the logout before using the session.
-    /// One byte, the remote result so far.
+    /// The durable logout state. Startup resumes an interrupted erasure or
+    /// clears deferred system notifications when the center is available.
     LogoutPending,
 }
 
@@ -114,23 +129,6 @@ pub trait SecretStore: Send + 'static {
     fn get(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError>;
     fn set(&self, item: SecretItem, secret: &[u8]) -> Result<(), StoreError>;
     fn delete(&self, item: SecretItem) -> Result<(), StoreError>;
-
-    /// Whether legacy secrets exist. Keychain overrides this with metadata
-    /// queries that cannot display an authentication prompt. An error is
-    /// unknown, never proof that there are no secrets to migrate.
-    fn has_items(&self) -> Result<bool, StoreError> {
-        for item in [
-            SecretItem::Session,
-            SecretItem::CacheKey,
-            SecretItem::ApiCredentials,
-            SecretItem::LogoutPending,
-        ] {
-            if self.get(item)?.is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
 
     /// Tests: the gate that keeps a paused clock still while this store's
     /// thread works (`clock_gate`).

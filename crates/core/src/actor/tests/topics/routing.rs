@@ -72,7 +72,7 @@ async fn for_a_chat_of_unknown_status() {
     let stranger = forum(4242);
     let mut m = text_message(stranger, 7, "who?");
     m.thread.topic = Some(tid(3));
-    h.fake.push_update(Update::NewMessage(m)).await;
+    h.fake.push_update(Update::NewMessage(m.into())).await;
     let seen = events_for(&mut h, Duration::from_secs(5)).await;
     assert!(seen.is_empty(), "{seen:?}");
     assert!(peer_calls(&h).is_empty(), "nothing to fence or refresh");

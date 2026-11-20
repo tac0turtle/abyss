@@ -123,7 +123,16 @@ fn on_surface(t: &Theme, d: Depth, out: &mut Vec<Pair>) {
     let (fill, badge_ink) = t.badge(d);
     out.extend([
         pair(format!("text {d:?}"), text(ink, 1., s), AA),
-        pair(format!("quiet text {d:?}"), text(ink, QUIET, s), AA),
+        pair(
+            format!("quiet text {d:?}"),
+            text(ink, t.quiet_opacity(), s),
+            AA,
+        ),
+        pair(
+            format!("row focus ring {d:?}"),
+            contrast(t.focus_on(d), s),
+            NON_TEXT,
+        ),
         pair(
             format!("row mark {d:?}"),
             contrast(t.row_mark(d), s),
@@ -193,24 +202,93 @@ fn chrome(t: &Theme, out: &mut Vec<Pair>) {
     out.extend([
         pair("button text", contrast(t.on_accent, t.accent), AA),
         pair("button", contrast(t.accent, n), NON_TEXT),
+        pair(
+            "primary focus ring",
+            contrast(t.on_accent, t.accent),
+            NON_TEXT,
+        ),
+        pair("secondary focus ring", contrast(t.text, n), NON_TEXT),
+        pair("field focus ring", contrast(input, field), NON_TEXT),
         pair("hovered tab", text(t.text, 1., tab), AA),
-        pair("hovered quiet tab", text(t.text, QUIET, tab), AA),
+        pair(
+            "hovered quiet tab",
+            text(t.text, t.quiet_opacity(), tab),
+            AA,
+        ),
         pair("rail rule", contrast(t.accent, n), NON_TEXT),
         pair("hovered rail rule", contrast(t.accent, tab), NON_TEXT),
         pair("hovered menu entry", text(t.text, 1., menu), AA),
+        pair("hovered menu focus ring", contrast(t.text, menu), NON_TEXT),
+        pair("hovered tab focus ring", contrast(t.text, tab), NON_TEXT),
+        pair(
+            "focused pill text and fill",
+            contrast(t.accent, t.on_accent),
+            AA,
+        ),
         pair("input text", text(input, 1., field), AA),
         pair(
             "input placeholder",
             text(input, PLACEHOLDER, field),
             NON_TEXT,
         ),
-        pair("input counter", text(input, QUIET, field), AA),
+        pair("input counter", text(input, t.quiet_opacity(), field), AA),
         pair(
             "selected input text",
             text(input, 1., over(faded(input, SELECTION), field)),
             AA,
         ),
     ]);
+}
+
+fn increased_contrast_rules(t: &Theme, out: &mut Vec<Pair>) {
+    let n = t.surface(Depth::NOW);
+    let field = over(t.incoming, n);
+    out.extend([
+        pair(
+            "settings and menu outline",
+            contrast(over(t.line(t.text), n), n),
+            NON_TEXT,
+        ),
+        pair(
+            "rail outline",
+            contrast(over(t.rule(t.text, 0.08), n), n),
+            NON_TEXT,
+        ),
+        pair(
+            "archive outline",
+            contrast(over(t.rule(t.text, 0.4), n), n),
+            NON_TEXT,
+        ),
+        pair(
+            "input outline",
+            contrast(over(t.line(t.on_incoming), field), field),
+            NON_TEXT,
+        ),
+    ]);
+    for depth in depths() {
+        let ground = t.surface(depth);
+        let ink = t.text_on(depth);
+        out.push(pair(
+            "unread rule",
+            contrast(over(t.line(ink), ground), ground),
+            NON_TEXT,
+        ));
+        for side in sides() {
+            let bubble = over(t.bubble(side), ground);
+            let ink = t.bubble_ink(side);
+            let header = over(faded(ink, HEADER_WASH), bubble);
+            out.push(pair(
+                "media outline",
+                contrast(over(t.line(ink), bubble), bubble),
+                NON_TEXT,
+            ));
+            out.push(pair(
+                "sender outline",
+                contrast(over(t.line(ink), header), header),
+                NON_TEXT,
+            ));
+        }
+    }
 }
 
 fn every_pair(t: &Theme, mode: Mode) -> Vec<Pair> {
@@ -222,6 +300,9 @@ fn every_pair(t: &Theme, mode: Mode) -> Vec<Pair> {
         }
     }
     chrome(t, &mut out);
+    if t.has_increased_contrast() {
+        increased_contrast_rules(t, &mut out);
+    }
     out
 }
 
@@ -231,13 +312,37 @@ fn every_pair(t: &Theme, mode: Mode) -> Vec<Pair> {
 fn every_pair_reads_in_every_theme_on_offer() {
     let mut failures = Vec::new();
     for (name, mode, theme) in every_theme() {
-        for p in every_pair(&theme, mode) {
-            if p.ratio < p.floor {
-                failures.push(format!("{name}: {} {:.3} < {}", p.what, p.ratio, p.floor));
+        for variant in [theme, theme.increased_contrast()] {
+            for p in every_pair(&variant, mode) {
+                if p.ratio < p.floor {
+                    let increased = variant.has_increased_contrast();
+                    failures.push(format!(
+                        "{name} (increase contrast {increased}): {} {:.3} < {}",
+                        p.what, p.ratio, p.floor
+                    ));
+                }
             }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn settings_sample_outlines_contrast_with_every_fill() {
+    let tints = Tint::all().collect::<Vec<_>>();
+    let mut fills = every_theme()
+        .into_iter()
+        .map(|(_, _, theme)| theme.accent)
+        .collect::<Vec<_>>();
+    for hue in Hue::all() {
+        for &tint in &tints {
+            let choice = Choice { hue, tint };
+            fills.extend([swatch(choice), tint_swatch(choice)]);
+        }
+    }
+    for fill in fills {
+        assert!(contrast(Theme::sample_outline(fill), fill) >= NON_TEXT);
+    }
 }
 
 /// The roles are named for what they paint, and under abyss each one is the

@@ -6,7 +6,7 @@
 //! - **The clock** is the badge clock: it advances at every dialogs and
 //!   `peer_dialogs` dispatch, so a snapshot's stamp is when it was sent.
 //!   Cached chats are the oldest source (stamp zero).
-//! - **Snapshots.** A field (kind, folder, read state) takes a snapshot's
+//! - **Snapshots.** A field (kind, folder, mute, read state) takes a snapshot's
 //!   value only if the snapshot was dispatched after the field's accepted
 //!   stamp; then the stamp moves to the snapshot's. Otherwise the current
 //!   value is kept, whatever the source: an older dialogs page can't revert
@@ -15,7 +15,7 @@
 //!   (stage 2 plan, section 17.6.1). The pointer only rises: whichever
 //!   value is kept, its pointer is the higher of the two, since any
 //!   snapshot proves the server's pointer was at least that high.
-//! - **Live changes** (a folder move, a read, a counted message) stamp the
+//! - **Live changes** (a folder move, a mute change, a read, a counted message) stamp the
 //!   field with the clock's value now: a snapshot dispatched before them
 //!   can't revert them, one dispatched after them is authoritative.
 //! - **Kind while fenced** is held at what core knew before the fence; the
@@ -37,20 +37,21 @@ use std::collections::{HashMap, HashSet};
 use crate::model::{ChatId, ChatKind, ChatSummary, MsgId, PeerFolder, ReadState};
 use crate::store::{BadgeSeq, ForumStatus, with_status};
 
+use super::PeerMute;
+
 /// Live moves of unlisted chats remembered for the page that lists them.
 pub(super) const MAX_UNLISTED: usize = super::MAX_DIALOGS;
 
 /// What [`super::Dialogs::guard`] made of a dialog snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Guarded {
-    /// Apply it: no folder it states lost to a newer one.
+    /// Apply it: no folder or mute it states lost to a newer one.
     Apply,
     /// Apply it (newer fields kept over it), then fetch the first page
-    /// again: it disagreed with a newer folder, perhaps a live move the
-    /// server may not have taken.
+    /// again: it disagreed with a newer folder or mute.
     ApplyAndRefetch,
     /// Drop it and fetch the first page again: it was dispatched before an
-    /// unlisted chat's live move whose record was evicted.
+    /// unlisted chat's update whose record was evicted.
     Discard,
 }
 
@@ -60,6 +61,7 @@ pub(super) struct Current {
     pub(super) kind: ChatKind,
     pub(super) folder: PeerFolder,
     pub(super) read: ReadState,
+    pub(super) mute: Option<i64>,
 }
 
 /// One chat's accepted stamps.
@@ -68,6 +70,7 @@ struct Accepted {
     kind: BadgeSeq,
     folder: BadgeSeq,
     unread: BadgeSeq,
+    mute: BadgeSeq,
     /// For a chat that isn't listed: the values its stamps vouch for, until
     /// a page admits it as a row.
     unlisted: Option<Unlisted>,
@@ -81,6 +84,7 @@ struct Unlisted {
     kind: Option<ChatKind>,
     folder: Option<PeerFolder>,
     read: Option<ReadState>,
+    mute: Option<PeerMute>,
     /// The highest id a landed read proved, and the clock then (only an
     /// eviction's cutoff: it stamps no field).
     landed: Option<(MsgId, BadgeSeq)>,
@@ -89,12 +93,30 @@ struct Unlisted {
 }
 
 impl Accepted {
+    fn guard_mute(&mut self, chat: &mut ChatSummary, seq: BadgeSeq, now: Option<Current>) -> bool {
+        if seq > self.mute {
+            self.mute = seq;
+            if let Some(kept) = self.unlisted.as_mut() {
+                kept.mute = Some(PeerMute::of(chat.muted_until));
+            }
+        } else if let Some(newer) = now
+            .map(|c| c.mute)
+            .or(self.unlisted.and_then(|u| u.mute).map(PeerMute::until))
+        {
+            let conflict = chat.muted_until != newer;
+            chat.muted_until = newer;
+            return conflict;
+        }
+        false
+    }
+
     /// The newest stamp it holds (an eviction's cutoff).
     fn newest(&self) -> BadgeSeq {
         let landed = self.unlisted.and_then(|u| u.landed).map(|(_, at)| at);
         self.kind
             .max(self.folder)
             .max(self.unread)
+            .max(self.mute)
             .max(landed.unwrap_or_default())
     }
 }
@@ -140,6 +162,7 @@ impl Fields {
                 self.remember(chat.id);
             }
             let row = self.rows.entry(chat.id).or_default();
+            conflict |= row.guard_mute(chat, seq, now);
             let kept = row.unlisted;
             // What this snapshot sets, for an unlisted chat's record.
             let (mut kind, mut folder, mut read) = (None, None, None);
@@ -206,6 +229,27 @@ impl Fields {
         }
     }
 
+    pub(super) fn mute_changed(&mut self, chat: ChatId, now: BadgeSeq, unlisted: Option<PeerMute>) {
+        if unlisted.is_some() && !self.has_record(chat) {
+            self.make_room(1, &[chat]);
+            self.remember(chat);
+        }
+        let row = self.rows.entry(chat).or_default();
+        row.mute = row.mute.max(now);
+        if let (Some(kept), Some(mute)) = (row.unlisted.as_mut(), unlisted) {
+            kept.mute = Some(mute);
+        }
+    }
+
+    pub(super) fn unlisted_mute(&self, chat: ChatId) -> Option<PeerMute> {
+        self.rows.get(&chat)?.unlisted?.mute
+    }
+
+    pub(super) fn accepts_mute_snapshot(&self, chat: ChatId, stamp: BadgeSeq) -> bool {
+        self.evicted_through.is_none_or(|evicted| stamp > evicted)
+            && self.rows.get(&chat).is_none_or(|row| stamp > row.mute)
+    }
+
     fn has_record(&self, chat: ChatId) -> bool {
         self.rows.get(&chat).is_some_and(|r| r.unlisted.is_some())
     }
@@ -222,6 +266,7 @@ impl Fields {
             kind: None,
             folder: None,
             read: None,
+            mute: None,
             landed: None,
             order,
         });

@@ -160,15 +160,21 @@ impl<B: Backend> Actor<B> {
     /// light refresh re-checks it: its topic-headed messages are only
     /// `ChatOnly`.
     pub(super) fn route_live(&mut self, m: Message) -> (Route, Message) {
+        let (route, m) = self.route_message(m);
+        if let Route::ChatOnly(chat) | Route::ForumSuspected(chat) = route {
+            self.windows.lose_continuity(chat);
+        }
+        (route, m)
+    }
+
+    /// Classifies a message without touching its chat's cache continuity.
+    fn route_message(&self, m: Message) -> (Route, Message) {
         let status = self.forum_status(m.thread.chat);
         let (mut route, m) = normalize(m, status);
         if let Route::ForumSuspected(chat) = route
             && self.fences.is_suspect(chat)
         {
             route = Route::ChatOnly(chat);
-        }
-        if let Route::ChatOnly(chat) | Route::ForumSuspected(chat) = route {
-            self.windows.lose_continuity(chat);
         }
         (route, m)
     }

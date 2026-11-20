@@ -5,7 +5,7 @@ use grammers_client::tl;
 
 use super::{
     basic_group, bold, channel, community, dialog, folder, message, peer_channel, peer_chat,
-    peer_user, reply_header, service, text_url, user, users,
+    peer_user, reply_header, service, spoiler, text_url, user, users,
 };
 use crate::backend::grammers::map::lists::{self, DialogsParts, MAX_DELETED_IDS, MessagesParts};
 use crate::backend::grammers::map::message::{self as msg, media_kind, reply_and_topic, rich};
@@ -17,7 +17,9 @@ use crate::model::{
     Body, ChatId, ChatKind, InvalidTopicId, MediaKind, MsgId, PeerFolder, PeerKind, Preview,
     ThreadKey, TopicId,
 };
-use crate::rich_text::{LinkTarget, MAX_ENTITIES, MAX_TEXT_BYTES, MAX_URL_BYTES, Style};
+use crate::rich_text::{
+    LinkTarget, MAX_ENTITIES, MAX_LINKS, MAX_TEXT_BYTES, MAX_URL_BYTES, SPOILER_EXCERPT, Style,
+};
 use crate::sanitize::MAX_SERVICE_BYTES;
 
 fn uid(id: i64) -> ChatId {
@@ -112,6 +114,98 @@ fn too_many_entities_degrade_to_plain() {
     let rt = rich(&"x".repeat(MAX_ENTITIES + 1), Some(&entities));
     assert_eq!(rt.runs().len(), 1);
     assert_eq!(rt.runs()[0].style, Style::default());
+}
+
+/// A wire message whose spoiler hides `SECRET`, padded by `extra` entities that
+/// push it past one formatting budget or another.
+const SECRET: &str = "hunter2-sentinel";
+
+fn secret_text(pad: usize) -> (String, i32) {
+    let start = i32::try_from("pre ".len()).unwrap();
+    (format!("pre {SECRET} post{}", " x".repeat(pad)), start)
+}
+
+fn assert_secret_hidden(rt: &crate::rich_text::RichText) {
+    let excerpt = rt.excerpt();
+    assert!(!excerpt.contains(SECRET), "revealed: {excerpt}");
+    assert!(excerpt.contains(SPOILER_EXCERPT));
+}
+
+#[test]
+fn over_budget_wire_messages_keep_their_spoilers() {
+    let len = i32::try_from(SECRET.len()).unwrap();
+    // Too many entities: the spoiler is found among them.
+    let (text, start) = secret_text(MAX_ENTITIES + 2);
+    let mut entities: Vec<_> = (0..=MAX_ENTITIES)
+        .map(|i| bold(i32::try_from(i + 40).unwrap(), 1))
+        .collect();
+    entities.insert(7, spoiler(start, len));
+    assert_secret_hidden(&rich(&text, Some(&entities)));
+
+    // Too many links: the spoiler outlives them.
+    let mut entities: Vec<_> = (0..=MAX_LINKS)
+        .map(|i| text_url(i32::try_from(i + 40).unwrap(), 1, "https://e.org/x"))
+        .collect();
+    entities.push(spoiler(start, len));
+    let rt = rich(&text, Some(&entities));
+    assert!(rt.links().is_empty());
+    assert_secret_hidden(&rt);
+
+    // An oversized text keeps the spoiler inside the part it keeps.
+    let long = format!("{text}{}", "y".repeat(MAX_TEXT_BYTES));
+    let rt = rich(&long, Some(&[bold(0, 3), spoiler(start, len)]));
+    assert_eq!(rt.text().len(), MAX_TEXT_BYTES);
+    assert_secret_hidden(&rt);
+}
+
+#[test]
+fn a_wire_message_with_too_many_spoilers_is_hidden_whole() {
+    let text = format!("{SECRET}{}", "z".repeat(MAX_ENTITIES));
+    let entities: Vec<_> = (0..=MAX_ENTITIES)
+        .map(|i| spoiler(i32::try_from(i).unwrap(), 1))
+        .collect();
+    let rt = rich(&text, Some(&entities));
+    assert_eq!(rt.text(), text);
+    assert_eq!(rt.excerpt(), SPOILER_EXCERPT);
+}
+
+/// Review A33: the mapper keeps a bounded prefix of the spoiler entities, and
+/// the resolver skips empty and out-of-range ones, so skipped entities in the
+/// prefix must not let a valid one past it go unnoticed: the raw count decides.
+#[test]
+fn skipped_spoilers_in_the_kept_prefix_never_unhide_a_later_one() {
+    let len = i32::try_from(SECRET.len()).unwrap();
+    let (text, start) = secret_text(MAX_ENTITIES + 2);
+    let pad = i32::try_from(text.len() - 2 * MAX_ENTITIES).unwrap();
+
+    // Two empty spoilers, 255 valid ones, then the secret: one past the limit.
+    let mut entities: Vec<_> = (0..2).map(|_| spoiler(0, 0)).collect();
+    entities.extend((0..MAX_ENTITIES - 1).map(|i| spoiler(pad + i32::try_from(i).unwrap(), 1)));
+    entities.push(spoiler(start, len));
+    assert_eq!(entities.len(), MAX_ENTITIES + 2);
+    let rt = rich(&text, Some(&entities));
+    assert_secret_hidden(&rt);
+    assert_eq!(
+        rt.excerpt(),
+        SPOILER_EXCERPT,
+        "overflow hides the whole text"
+    );
+
+    // Out-of-range ones in front of valid ones.
+    let mut entities: Vec<_> = (0..MAX_ENTITIES)
+        .map(|_| spoiler(i32::MAX / 2, 3))
+        .collect();
+    entities.push(spoiler(start, len));
+    entities.push(spoiler(start, len));
+    assert_secret_hidden(&rich(&text, Some(&entities)));
+
+    // At the limit, every spoiler is kept and resolved: only the secret hides.
+    let mut entities: Vec<_> = (0..MAX_ENTITIES - 1).map(|_| spoiler(0, 0)).collect();
+    entities.push(spoiler(start, len));
+    entities.push(bold(0, 1));
+    let rt = rich(&text, Some(&entities));
+    assert_secret_hidden(&rt);
+    assert_ne!(rt.excerpt(), SPOILER_EXCERPT);
 }
 
 #[test]
@@ -1134,7 +1228,9 @@ fn live_updates_map_to_domain_updates() {
         pts: 1,
         pts_count: 1,
     });
-    assert!(matches!(lists::update(&new, &dir), Some(Update::NewMessage(m)) if m.id == MsgId(1)));
+    assert!(
+        matches!(lists::update(&new, &dir), Some(Update::NewMessage(m)) if m.message.id == MsgId(1))
+    );
     let mut edited = message(peer_channel(10), 2, "fixed");
     edited.edit_date = Some(5);
     let edit = U::EditChannelMessage(tl::types::UpdateEditChannelMessage {
@@ -1392,7 +1488,7 @@ fn muted_follows_mute_until_and_contacts_their_flag() {
     let out = lists::dialogs(&parts(&dialogs, &[], &users, &[]), &dir, 100);
     assert_eq!(
         (out.chats[0].muted_until, out.chats[1].muted_until),
-        (2_000, 1_000),
+        (Some(2_000), Some(1_000)),
         "the date is kept"
     );
     assert!(out.chats[0].muted_at(1_500) && !out.chats[1].muted_at(1_500));
@@ -1599,5 +1695,67 @@ fn edits_for_a_replaced_folder_or_past_the_bounds_are_refused() {
     assert_eq!(
         edited(&many, &create, Some(input_user(5)), None),
         Err(EditError::Limit)
+    );
+}
+
+#[test]
+fn notification_updates_preserve_wire_flags_and_ignore_other_scopes() {
+    use crate::backend::{NotifyScope, NotifyTarget};
+    use tl::enums::NotifyPeer;
+    let dir = Directory::default();
+    let settings = |peer, until| {
+        let update = tl::types::UpdateNotifySettings {
+            peer,
+            notify_settings: tl::types::PeerNotifySettings {
+                mute_until: until,
+                ..super::notify_settings_raw()
+            }
+            .into(),
+        };
+        lists::update(&update.into(), &dir)
+    };
+    let peer = || tl::types::NotifyPeer { peer: peer_user(7) }.into();
+    assert!(
+        matches!(settings(peer(), Some(0)), Some(Update::NotifySettings {
+        target: NotifyTarget::Peer(chat), until: Some(0),
+    }) if chat == uid(7))
+    );
+    assert!(matches!(
+        settings(peer(), None),
+        Some(Update::NotifySettings { until: None, .. })
+    ));
+    assert!(matches!(
+        settings(NotifyPeer::NotifyUsers, Some(600)),
+        Some(Update::NotifySettings {
+            target: NotifyTarget::Scope(NotifyScope::Users),
+            until: Some(600),
+        })
+    ));
+    assert!(matches!(
+        settings(NotifyPeer::NotifyChats, Some(800)),
+        Some(Update::NotifySettings {
+            target: NotifyTarget::Scope(NotifyScope::Groups),
+            until: Some(800),
+        })
+    ));
+    assert!(settings(NotifyPeer::NotifyBroadcasts, Some(600)).is_none());
+    let topic = tl::types::NotifyForumTopic {
+        peer: peer_channel(9),
+        top_msg_id: 8,
+    };
+    assert!(settings(topic.into(), Some(600)).is_none());
+    let raw = tl::types::Message {
+        silent: true,
+        mentioned: true,
+        ..message(peer_user(7), 1, "body")
+    };
+    let new = tl::types::UpdateNewMessage {
+        message: raw.into(),
+        pts: 3,
+        pts_count: 1,
+    };
+    assert!(
+        matches!(lists::update(&new.into(), &dir), Some(Update::NewMessage(m))
+        if m.silent && m.mentioned)
     );
 }

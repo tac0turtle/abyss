@@ -44,6 +44,7 @@ pub(crate) enum CacheCmd {
     /// Every cached message of a chat (its forum flag changed, so its
     /// thread keys changed meaning).
     DeleteChat(ChatId),
+    PurgeHistory(Option<ChatId>, Reply<()>),
     DeleteUnscoped(Vec<MsgId>),
     Touch(ChatId),
     Chats(Reply<Vec<ChatSummary>>),
@@ -145,6 +146,10 @@ impl CacheHandle {
 
     pub async fn chats(&self) -> Result<Vec<ChatSummary>, WorkerError> {
         self.ask(CacheCmd::Chats).await
+    }
+
+    pub(crate) async fn purge_history(&self, chat: Option<ChatId>) -> Result<(), WorkerError> {
+        self.ask(|reply| CacheCmd::PurgeHistory(chat, reply)).await
     }
 
     pub async fn tail(&self, thread: ThreadKey, limit: u32) -> Result<Vec<Message>, WorkerError> {
@@ -358,6 +363,7 @@ fn handle(cache: &mut Cache, cmd: CacheCmd) {
         CacheCmd::Delete(chat, ids) => drop(cache.delete_messages(chat, &ids)),
         CacheCmd::DeleteUnscoped(ids) => drop(cache.delete_unscoped(&ids)),
         CacheCmd::DeleteChat(chat) => drop(cache.delete_chat_messages(chat)),
+        CacheCmd::PurgeHistory(chat, reply) => drop(reply.send(cache.purge_history(chat))),
         CacheCmd::Touch(chat) => drop(cache.touch(chat)),
         CacheCmd::Chats(reply) => drop(reply.send(cache.chats())),
         CacheCmd::Tail {

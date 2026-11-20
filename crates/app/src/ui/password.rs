@@ -26,12 +26,14 @@ use gpui::{
 use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) use self::secret::Filter;
-use self::secret::{BULLET, MaskedEdit, Overflow, bullets};
+pub(super) use self::secret::bullets;
+use self::secret::{BULLET, MaskedEdit, Overflow};
 use self::secure_input::SecureInputGuard;
 use super::text_input::{
     Backspace, Cancel, Delete, End, Home, KEY_CONTEXT, Left, Paste, Right, SelectAll, SelectLeft,
     SelectRight, Submit,
 };
+use super::{a11y, theme::Themes};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PasswordEvent {
@@ -51,6 +53,7 @@ pub(crate) struct PasswordInput {
     focus_handle: FocusHandle,
     edit: MaskedEdit,
     reveal: Reveal,
+    label: &'static str,
     placeholder: SharedString,
     /// The shaped bullets from the last paint.
     last_line: Option<ShapedLine>,
@@ -68,6 +71,7 @@ impl PasswordInput {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         Self::with_filter(
             Filter::Password,
+            super::copy::PASSWORD_LABEL,
             super::copy::PASSWORD_PLACEHOLDER,
             window,
             cx,
@@ -78,6 +82,7 @@ impl PasswordInput {
     pub(crate) fn api_hash(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         Self::with_filter(
             Filter::ApiHash,
+            super::copy::onboarding::API_HASH_LABEL,
             super::copy::onboarding::API_HASH_PLACEHOLDER,
             window,
             cx,
@@ -86,11 +91,12 @@ impl PasswordInput {
 
     fn with_filter(
         filter: Filter,
+        label: &'static str,
         placeholder: &'static str,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let focus_handle = cx.focus_handle();
+        let focus_handle = cx.focus_handle().tab_stop(true);
         let subscriptions = [
             cx.on_focus(&focus_handle, window, |this, window, _| {
                 this.sync_secure_input(window);
@@ -106,6 +112,7 @@ impl PasswordInput {
             focus_handle,
             edit: MaskedEdit::new(filter),
             reveal: Reveal::Hidden,
+            label,
             placeholder: placeholder.into(),
             last_line: None,
             last_bounds: None,
@@ -150,6 +157,13 @@ impl PasswordInput {
         self.edit.copy()
     }
 
+    /// Fills the field as typing would, without needing it on screen.
+    #[cfg(all(test, feature = "fake"))]
+    pub(crate) fn fill(&mut self, text: &str, cx: &mut Context<'_, Self>) {
+        assert!(self.edit.replace(None, text).is_ok(), "the text fits");
+        cx.notify();
+    }
+
     /// Hands the secret over and wipes the field.
     #[cfg(test)]
     pub(crate) fn take_secret(&mut self, cx: &mut Context<'_, Self>) -> Zeroizing<Vec<u8>> {
@@ -158,9 +172,11 @@ impl PasswordInput {
         secret
     }
 
-    /// Wipes the field.
+    /// Wipes the field, and hides it again: an empty field never comes back
+    /// already revealed for the next text (review N59).
     pub(crate) fn clear(&mut self, cx: &mut Context<'_, Self>) {
         self.edit.clear();
+        self.reveal = Reveal::Hidden;
         cx.notify();
     }
 
@@ -653,8 +669,16 @@ impl Element for PasswordElement {
 }
 
 impl Render for PasswordInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let len = window.is_a11y_active().then(|| self.edit.len());
+        let field = a11y::secure_field(
+            div(),
+            self.label,
+            self.placeholder.clone(),
+            len,
+            a11y::Selection::new(self.edit.selected(), self.edit.reversed()),
+        );
+        a11y::field_frame(field, &Themes::of(window, cx))
             .flex()
             .w_full()
             .key_context(KEY_CONTEXT)

@@ -30,14 +30,13 @@ use abyss_core::model::{ChatId, ThreadKey};
 use abyss_core::store::ViewGen;
 use gpui::{
     AnyWindowHandle, AppContext, HeadlessAppContext, Modifiers, MouseMoveEvent, PlatformInput,
-    ScrollDelta, ScrollEvent, Window, WindowHandle, point, px, size,
+    ScrollDelta, ScrollEvent, WindowHandle, point, px, size,
 };
 
-use super::{Harness, link};
+use super::{Harness, started_fixture};
 use crate::chat::list::{Shown, Tab};
 use crate::chat::{demo, format};
 use crate::shell::Root;
-use crate::shell::session::Started;
 use crate::ui::theme::colourway::Colourway;
 use crate::ui::theme::{self, Mode, Settings, Stores, Themes};
 
@@ -84,12 +83,7 @@ impl Shot {
                 Stores::default(),
             ));
         });
-        let (commands, events, harness) = link();
-        let started = Started {
-            commands,
-            events,
-            fake: None,
-        };
+        let (started, harness) = started_fixture();
         let root = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
             cx.new(|cx| Root::with_started(Ok(started), window, cx))
         })?;
@@ -183,8 +177,8 @@ impl Shot {
     }
 
     fn toggle_appearance(&mut self) -> Result<()> {
-        self.root.update(&mut self.cx, |root, _: &mut Window, cx| {
-            root.toggle_appearance(cx);
+        self.root.update(&mut self.cx, |root, window, cx| {
+            root.toggle_appearance(window, cx);
         })?;
         self.cx.run_until_parked();
         Ok(())

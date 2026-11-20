@@ -102,7 +102,8 @@ fn summary(n: i64, now: i64) -> ChatSummary {
                 ..
             }
         ),
-        muted_until: if n % 4 == 3 { i64::from(i32::MAX) } else { 0 },
+        muted_until: Some(if n % 4 == 3 { i64::from(i32::MAX) } else { 0 }),
+        scope_muted_until: 0,
         // Every sixth chat is archived, so the demo has an archive to open.
         folder: if n > 3 && n % 6 == 5 {
             PeerFolder::Archive

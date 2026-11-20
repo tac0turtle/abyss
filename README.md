@@ -32,6 +32,14 @@ scripts/bundle.sh --debug
 open target/bundle/debug/abyss.app
 ```
 
+The bundle runs in the App Sandbox, so its files (the message cache, theme,
+colourway and preferences) live in the container,
+`~/Library/Containers/dev.abyss/Data/Library/Application Support/dev.abyss`.
+`cargo dev` and `cargo run` start a bare binary that is not sandboxed and
+keep theirs in `~/Library/Application Support/dev.abyss`. The bundle and
+bare binary keep separate sessions, caches and Keychain items. Sign in
+separately in each installation you use.
+
 Follow
 [Connecting abyss to Telegram](docs/connecting.md). You need your own
 `api_id` and `api_hash` from my.telegram.org; the guide walks through it.

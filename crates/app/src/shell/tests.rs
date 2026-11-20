@@ -21,6 +21,8 @@ use crate::launch::LaunchError;
 struct Sent {
     commands: Vec<Command>,
     full: bool,
+    /// Refuses (as a full queue would) just the commands this accepts.
+    refuse: Option<fn(&Command) -> bool>,
 }
 
 /// The command half of the double.
@@ -35,7 +37,7 @@ struct TestEvents(mpsc::UnboundedReceiver<Event>);
 impl CoreLink for TestLink {
     fn send(&self, cmd: Command) -> Result<(), SendError> {
         let mut sent = self.sent.borrow_mut();
-        if sent.full {
+        if sent.full || sent.refuse.is_some_and(|refuse| refuse(&cmd)) {
             return Err(SendError::Full(cmd));
         }
         sent.commands.push(cmd);
@@ -65,7 +67,7 @@ impl EventSource for TestEvents {
         reason = "only the fake-backed tests send commands and acks"
     )
 )]
-struct Harness {
+pub(crate) struct Harness {
     events: mpsc::UnboundedSender<Event>,
     sent: Rc<RefCell<Sent>>,
     ack: Option<oneshot::Sender<ShutdownReport>>,
@@ -87,6 +89,17 @@ fn link() -> (Box<dyn CoreLink>, Box<dyn EventSource>, Harness) {
     (Box::new(link), Box::new(TestEvents(events)), harness)
 }
 
+#[cfg(feature = "fake")]
+pub(crate) fn started_fixture() -> (super::session::Started, Harness) {
+    let (commands, events, harness) = link();
+    let started = super::session::Started {
+        commands,
+        events,
+        fake: None,
+    };
+    (started, harness)
+}
+
 fn closing(root: &Entity<Root>, cx: &mut VisualTestContext) -> Option<Closing> {
     root.read_with(cx, |root, _| match &root.state {
         State::Running(s) => Some(s.closing),
@@ -97,7 +110,7 @@ fn closing(root: &Entity<Root>, cx: &mut VisualTestContext) -> Option<Closing> {
 #[gpui::test]
 fn launch_errors_show_the_error_screen_and_close_freely(cx: &mut TestAppContext) {
     let error = LaunchError::FakeNotBuilt;
-    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(error), window, cx));
+    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(error), None, window, cx));
     cx.run_until_parked();
     root.read_with(cx, |root, _| {
         assert!(matches!(
@@ -149,13 +162,13 @@ fn appearance_choice_rethemes_the_window_and_reset_restores_it(cx: &mut TestAppC
 
     in_abyss(cx);
     let error = LaunchError::FakeNotBuilt;
-    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(error), window, cx));
+    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(error), None, window, cx));
     cx.run_until_parked();
     let showing = cx.update(|window, _| Mode::of(window));
     let before = cx.update(|window, cx| Themes::of(window, cx));
     assert_eq!(cx.update(|_, cx| Themes::settings(cx)), Settings::default());
 
-    root.update(cx, Root::toggle_appearance);
+    root.update_in(cx, Root::toggle_appearance);
     cx.run_until_parked();
     root.read_with(cx, |root, _| assert!(root.appearance_open));
 
@@ -172,30 +185,49 @@ fn appearance_choice_rethemes_the_window_and_reset_restores_it(cx: &mut TestAppC
     cx.run_until_parked();
     assert_eq!(cx.update(|window, cx| Themes::of(window, cx)), before);
 
-    root.update(cx, Root::toggle_appearance);
+    root.update_in(cx, Root::toggle_appearance);
     root.read_with(cx, |root, _| assert!(!root.appearance_open));
+}
+
+fn click_setting(cx: &mut VisualTestContext, id: &'static str) {
+    use gpui::Modifiers;
+    let panel = cx.debug_bounds("settings-panel").unwrap();
+    let bounds = cx.debug_bounds(id).unwrap();
+    let delta = if bounds.bottom() > panel.bottom() {
+        panel.bottom() - bounds.bottom() - gpui::px(4.)
+    } else if bounds.top() < panel.top() {
+        panel.top() - bounds.top() + gpui::px(4.)
+    } else {
+        gpui::px(0.)
+    };
+    if delta != gpui::px(0.) {
+        let position = panel.center();
+        cx.simulate_mouse_move(position, None, Modifiers::none());
+        cx.simulate_event(gpui::ScrollEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), delta)),
+            ..gpui::ScrollEvent::default()
+        });
+        cx.run_until_parked();
+    }
+    let at = cx.debug_bounds(id).unwrap().center();
+    cx.simulate_mouse_move(at, None, Modifiers::none());
+    cx.simulate_click(at, Modifiers::none());
+    cx.run_until_parked();
 }
 
 /// The picker switches colourways by click; abyss's hues and Reset belong
 /// to abyss alone, and Reset never leaves it.
 #[gpui::test]
 fn colourway_picker_switches_and_reset_stays_in_abyss(cx: &mut TestAppContext) {
-    use gpui::Modifiers;
-
     use crate::ui::theme::{Choice, Colourway, Hue, Mode, Settings, Theme, Themes, Tint};
 
     in_abyss(cx);
-    let (root, cx) =
-        cx.add_window_view(|window, cx| Root::new(Err(LaunchError::FakeNotBuilt), window, cx));
-    root.update(cx, Root::toggle_appearance);
+    let (root, cx) = cx
+        .add_window_view(|window, cx| Root::new(Err(LaunchError::FakeNotBuilt), None, window, cx));
+    root.update_in(cx, Root::toggle_appearance);
     cx.run_until_parked();
     let showing = cx.update(|window, _| Mode::of(window));
-    let click = |cx: &mut VisualTestContext, id: &'static str| {
-        let at = cx.debug_bounds(id).unwrap().center();
-        cx.simulate_mouse_move(at, None, Modifiers::none());
-        cx.simulate_click(at, Modifiers::none());
-        cx.run_until_parked();
-    };
     let shown = |cx: &mut VisualTestContext| cx.update(|window, cx| Themes::of(window, cx));
     assert_eq!(cx.update(|_, cx| Themes::colourway(cx)), Colourway::Abyss);
     assert!(
@@ -215,7 +247,7 @@ fn colourway_picker_switches_and_reset_stays_in_abyss(cx: &mut TestAppContext) {
         .into_iter()
         .filter(|c| *c != Colourway::Abyss);
     for colourway in flat {
-        click(cx, super::appearance::colourway_id(colourway));
+        click_setting(cx, super::appearance::colourway_id(colourway));
         assert_eq!(cx.update(|_, cx| Themes::colourway(cx)), colourway);
         assert_eq!(shown(cx), Theme::new(showing, colourway, hues));
         assert_eq!(
@@ -227,21 +259,21 @@ fn colourway_picker_switches_and_reset_stays_in_abyss(cx: &mut TestAppContext) {
     }
 
     // An accent recolours a flat colourway; its Reset clears only that.
-    click(cx, "colourway-ultramarine");
+    click_setting(cx, "colourway-ultramarine");
     let accented = hues.with_accent(Hue::all().nth(20));
     cx.update(|_, cx| Themes::set(accented, cx));
     cx.run_until_parked();
     let plain = Theme::new(showing, Colourway::Ultramarine, hues);
     assert_ne!(shown(cx).accent, plain.accent, "recoloured");
-    click(cx, "appearance-reset");
+    click_setting(cx, "appearance-reset");
     assert_eq!(cx.update(|_, cx| Themes::settings(cx)), hues);
     assert_eq!(shown(cx), plain);
 
     // abyss's Reset puts its hues back and keeps the accent.
     cx.update(|_, cx| Themes::set(accented, cx));
-    click(cx, "colourway-abyss");
+    click_setting(cx, "colourway-abyss");
     assert_eq!(shown(cx), Theme::new(showing, Colourway::Abyss, hues));
-    click(cx, "appearance-reset");
+    click_setting(cx, "appearance-reset");
     assert_eq!(cx.update(|_, cx| Themes::colourway(cx)), Colourway::Abyss);
     let after = Settings::default().with_accent(accented.accent);
     assert_eq!(cx.update(|_, cx| Themes::settings(cx)), after);
@@ -252,9 +284,9 @@ fn colourway_picker_switches_and_reset_stays_in_abyss(cx: &mut TestAppContext) {
 fn settings_stays_open_inside_and_closes_on_a_backdrop_click(cx: &mut TestAppContext) {
     use gpui::{Modifiers, point, px};
 
-    let (root, cx) =
-        cx.add_window_view(|window, cx| Root::new(Err(LaunchError::FakeNotBuilt), window, cx));
-    root.update(cx, Root::toggle_appearance);
+    let (root, cx) = cx
+        .add_window_view(|window, cx| Root::new(Err(LaunchError::FakeNotBuilt), None, window, cx));
+    root.update_in(cx, Root::toggle_appearance);
     cx.run_until_parked();
     let panel = cx.debug_bounds("settings-panel").unwrap();
     // Blank padding inside the card must not bubble to the backdrop.
@@ -280,22 +312,21 @@ mod fake {
 
     use super::*;
     use crate::shell::auth::AuthView;
-    use crate::shell::session::Started;
     use crate::ui::text_input;
 
+    mod closing;
     mod folder_menu;
     mod forum;
+    mod notifications;
+    mod overlay_focus;
+    mod overlays;
     mod quit;
+    mod rows;
     mod tabs;
 
     fn open(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {
         cx.update(|cx| cx.bind_keys(text_input::key_bindings()));
-        let (commands, events, harness) = link();
-        let started = Started {
-            commands,
-            events,
-            fake: None,
-        };
+        let (started, harness) = started_fixture();
         let (root, cx) =
             cx.add_window_view(|window, cx| Root::with_started(Ok(started), window, cx));
         cx.run_until_parked();

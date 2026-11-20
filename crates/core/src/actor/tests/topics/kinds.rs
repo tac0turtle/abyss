@@ -82,7 +82,9 @@ async fn a_forum_that_leaves_the_chat_list_stays_a_forum() {
     h.fake.incoming(whole, "General, no header").await.unwrap();
     // Updates apply in order: chat 1's message comes after it.
     h.fake
-        .push_update(Update::NewMessage(text_message(chat(1), 6, "barrier")))
+        .push_update(Update::NewMessage(
+            text_message(chat(1), 6, "barrier").into(),
+        ))
         .await;
     let (_, skipped) = h
         .until(|e| matches!(e, Event::History { thread, dir: HistoryDir::Newer, .. } if *thread == ThreadKey::whole(chat(1))))

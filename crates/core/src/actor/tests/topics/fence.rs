@@ -106,9 +106,8 @@ async fn a_chat_beyond_page_one_becomes_a_forum() {
     h.until(|e| matches!(e, Event::ThreadInvalidated(t) if *t == whole(s)))
         .await;
     h.send(Command::LoadOlder(whole(s))).await;
-    h.fake
-        .push_update(Update::NewMessage(text_message(s, 61, "while fenced")))
-        .await;
+    let message = text_message(s, 61, "while fenced").into();
+    h.fake.push_update(Update::NewMessage(message)).await;
     let fenced = events_for(&mut h, Duration::from_secs(5)).await;
     assert!(
         !has(&fenced, |e| matches!(e, Event::History { .. })),
@@ -227,7 +226,7 @@ async fn a_failing_check_is_abandoned_then_rechecked_on_refresh() {
     // Suspect: a topic-headed message doesn't start another fence.
     let mut m = text_message(s, 61, "topic-headed");
     m.thread.topic = Some(tid(7));
-    h.fake.push_update(Update::NewMessage(m)).await;
+    h.fake.push_update(Update::NewMessage(m.into())).await;
     events_for(&mut h, Duration::from_secs(10)).await;
     assert_eq!(peer_calls_with(&h, s).len(), 4, "not fenced again");
     // The light refresh checks it again, and the change goes through.

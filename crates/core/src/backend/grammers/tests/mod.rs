@@ -346,3 +346,7 @@ pub(super) fn text_url(offset: i32, length: i32, url: &str) -> tl::enums::Messag
         url: url.to_owned(),
     })
 }
+
+pub(super) fn spoiler(offset: i32, length: i32) -> tl::enums::MessageEntity {
+    tl::enums::MessageEntity::Spoiler(tl::types::MessageEntitySpoiler { offset, length })
+}

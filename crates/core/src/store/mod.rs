@@ -12,6 +12,7 @@ pub use badge::{
     BadgeSeq, Badges, CURSOR_SLOTS, KIND_SLOTS, MAX_PEER_DIALOGS, PEER_CALL_INTERVAL,
     PEER_REFRESH_INTERVAL, PeerBatch, PeerScheduler, Reserved, SHOWN_SLOTS,
 };
+pub(crate) use dialogs::PeerMute;
 pub use dialogs::{Appended, Bump, Dialogs, Guarded, Last, MAX_DIALOGS, Rest, Unread, bump_moves};
 pub use fence::{Completed, FENCE_FAILURES, Fenced, KindChecks, Settled, Verdict};
 pub use limits::{AUTO_REFRESH_COOLDOWN, AutoRefresh, NotBefore, Refresh};

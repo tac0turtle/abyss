@@ -55,6 +55,8 @@ pub(crate) const HAVE_CREDENTIALS: &str = "I have my api_id and api_hash";
 pub(crate) const ENTRY_TITLE: &str = "Enter your API credentials";
 pub(crate) const ENTRY_DETAIL: &str = "Paste them from my.telegram.org. They are saved on this Mac \
                                        once Telegram has accepted them.";
+pub(crate) const API_ID_LABEL: &str = "API ID";
+pub(crate) const API_HASH_LABEL: &str = "API hash";
 pub(crate) const API_ID_PLACEHOLDER: &str = "api_id (digits)";
 pub(crate) const API_HASH_PLACEHOLDER: &str = "api_hash (32 characters)";
 pub(crate) const REVEAL: &str = "Show";

@@ -7,6 +7,52 @@ use super::*;
 use crate::api::WindowState;
 use crate::backend::BackendError;
 
+#[tokio::test(start_paused = true)]
+async fn a_full_command_queue_preserves_the_forum_and_one_slot_opens_both_views() {
+    let a = forum(100);
+    let b = forum(200);
+    let mut script = FakeScript::demo(1, 1);
+    add_big_forum(&mut script, a, 80);
+    add_big_forum(&mut script, b, 80);
+    let mut h = online(script).await;
+    open_forum(&mut h, a).await;
+
+    let thread = topic_key(b, 5);
+    let epoch = h.events.observer().get();
+    let open_b = || crate::actor::Stamped {
+        epoch,
+        cmd: Command::OpenForumTopic {
+            chat: b,
+            topic: tid(5),
+        },
+    };
+    let slots = h.cmd.max_capacity();
+    let full = h.cmd.try_reserve_many(slots).unwrap();
+    assert!(matches!(
+        h.cmd.try_send(open_b()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+    ));
+    drop(full);
+    h.send(Command::LoadTopics(a)).await;
+    h.until(|e| matches!(e, Event::TopicsAppended { chat, .. } if *chat == a))
+        .await;
+    assert_eq!(page_calls(&h, a), 2, "A is still the shown forum");
+    assert_eq!(page_calls(&h, b), 0);
+
+    let remaining = h.cmd.try_reserve_many(slots - 1).unwrap();
+    h.cmd.try_send(open_b()).unwrap();
+    drop(remaining);
+    let reset_b = |e: &Event| matches!(e, Event::TopicsReset { chat, .. } if *chat == b);
+    if !reconciled(&mut h, thread).await.iter().any(reset_b) {
+        h.until(reset_b).await;
+    }
+    assert_eq!(page_calls(&h, b), 1);
+    h.send(Command::LoadTopics(a)).await;
+    topics_ended(&mut h, a).await;
+    assert_eq!(page_calls(&h, a), 2, "B replaced A as the shown forum");
+    h.stop().await;
+}
+
 /// Opened beyond page one, the topic is fetched by id.
 #[tokio::test(start_paused = true)]
 async fn the_open_topic_beyond_page_one_is_fetched_by_id() {

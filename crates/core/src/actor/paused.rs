@@ -98,7 +98,9 @@ impl<B: Backend> Actor<B> {
                 self.history_ended(thread, HistoryDir::Tail, Some(UserError::Busy))
                     .await;
             }
-            Command::OpenForum(chat) | Command::LoadTopics(chat) => {
+            Command::OpenForum(chat)
+            | Command::OpenForumTopic { chat, .. }
+            | Command::LoadTopics(chat) => {
                 self.load_ended(LoadTarget::Topics(chat), Some(UserError::Busy))
                     .await;
             }

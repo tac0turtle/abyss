@@ -69,7 +69,7 @@ async fn start(script: FakeScript) -> Fixture {
         })
         .await
         .unwrap();
-    assert!(matches!(updates.next().await, Ok(StreamItem::Baseline)));
+    assert!(matches!(updates.next().await, Ok(StreamItem::Baseline(_))));
     Fixture {
         client: Arc::new(client),
         updates,
@@ -340,7 +340,8 @@ async fn deleting_a_topic_deletes_its_messages() {
 async fn created_and_pinned_topics_lead_and_emit_updates() {
     let mut f = start(script(TopicOrder::Created)).await;
     let id = f.fake.create_topic(FORUM, "New topic").await.unwrap();
-    let Update::NewMessage(root) = f.update().await else {
+    let Update::NewMessage(crate::backend::NewMessage { message: root, .. }) = f.update().await
+    else {
         panic!("a creation message");
     };
     assert_eq!(
@@ -372,7 +373,7 @@ async fn created_and_pinned_topics_lead_and_emit_updates() {
         Update::TopicsPinned { chat: FORUM }
     ));
     let message = f.fake.incoming(thread(9), "hello").await.unwrap();
-    assert!(matches!(f.update().await, Update::NewMessage(m) if m == message));
+    assert!(matches!(f.update().await, Update::NewMessage(m) if m.message == message));
     assert_eq!(f.by_id(9).await.unwrap().topic.last_id, Some(message.id));
 }
 

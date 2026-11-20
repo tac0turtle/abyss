@@ -150,11 +150,31 @@ pub(crate) fn reply_and_topic(
 }
 
 /// Text plus entities, within the formatting budget (plan section 6).
-/// Over-budget input is rendered plain without converting its entities.
+/// Over-budget input is rendered without its formatting, but never without its
+/// spoilers: only those entities are converted (at most one more than the
+/// budget, which hides the whole text), so nothing unbounded is allocated and
+/// nothing hidden is revealed.
 pub(crate) fn rich(text: &str, entities: Option<&[tl::enums::MessageEntity]>) -> RichText {
     let entities = entities.unwrap_or_default();
-    if entities.is_empty() || text.len() > MAX_TEXT_BYTES || entities.len() > MAX_ENTITIES {
+    if entities.is_empty() {
         return RichText::plain(text);
+    }
+    if text.len() > MAX_TEXT_BYTES || entities.len() > MAX_ENTITIES {
+        let spoilers: Vec<RawEntity> = entities
+            .iter()
+            .filter(|e| matches!(e, tl::enums::MessageEntity::Spoiler(_)))
+            .take(MAX_ENTITIES + 1)
+            .map(raw_entity)
+            .collect();
+        // The resolver skips empty and out-of-range spoilers before it counts
+        // against its limit, so a kept prefix holding some could pass while a
+        // valid spoiler beyond it was discarded here and its text shown. The
+        // raw count is the only count that sees every entity: past the limit
+        // the spoilers cannot be established (review A33).
+        if spoilers.len() > MAX_ENTITIES {
+            return RichText::all_hidden(text);
+        }
+        return RichText::from_entities(text, &spoilers);
     }
     let raw: Vec<RawEntity> = entities.iter().map(raw_entity).collect();
     RichText::from_entities(text, &raw)
