@@ -1,7 +1,5 @@
 # Stage 3 task 0: spike results
 
-> The throwaway spike code these findings cite (`spikes/`) stays on the branch `t3/stage-3-spikes-research` and is not merged.
-
 Status: **done except the three checks that need a person at an unlocked screen** (section 5). Evidence for [stage-3.md](stage-3.md) (draft v0.2) sections 2, 3.3, 3.4, 4.1 and task 0. The spike code is in `spikes/` and ships nothing: it is its own cargo workspace (`spikes/Cargo.toml`), so the app workspace at the repository root never builds it.
 
 Environment: macOS 27.2.1 (build 26B131), Darwin 27.2.0, arm64, Xcode 27.2, rustc 1.98.1. Everything is ad-hoc signed (`codesign --sign -`); the machine has no Apple Developer membership. zed/gpui pinned at `917559da`, `accesskit` 0.24.1, `accesskit_macos` 0.26.3, `objc2` 0.6.5, `objc2-user-notifications` 0.3.2.
